@@ -86,30 +86,44 @@ If LPOT does not behave as expected:
 2. Check for any error messages printed in the terminal during execution.
 3. Ensure all command-line arguments are correctly specified according to the usage guide.
 
-## Verion
-v1.0: Official Release
-v1.1: Fixed an issue where the program would stop due to exceeding the Capabilities area.
-v1.2: Standardized the logging system across programs to address inconsistencies and corrected error display and handling methods. Enhace configscan some functions.
-     **configscan will fix many times in the future.
-v1.3: Configscan fix again.
-v1.4: Fix Configscan to avoid timer impact.(Need fix for other network adapters, so it will fix many times)
-      Enhaced Configscan to add ignore_bits.txt to avoid timers impact.
-      Fix systemd to /lpot/reboot.sh due to change setting without systemd reload
-      Fix lpotscan error log cannot write into reboot.log issue
-v1.5: Fix lpotscan log will append in reboot.log more times.[lpot]
-      Add configscan_log.sh to analyze configscan log and record into reboot.log[lpot]
-      Fix install.sh to correct configscan_log.sh location
-      Fix lpotscan wrong codec on yaml process
-      Add -s to determind wait driver ready time.[lpot]
-v1.6: Fix stability and buff overflow issue and optimization signal process, etc. on lpot.c
-      Enhance config space scan tool
-      Fix lpotscan bugs and remove unused module
-      Enhance configscan and lpotscan on ignore bits
-      Add lpotscan -scan to check system USB device to ignore parameter.
-      Fix above issue again(#20250801)
-      Add "-r" to clear lpot
+v1.0:
+  - Official Release
 
-For further assistance, contact the software support team provided by your vendor.
+v1.1:
+  - Fixed an issue where the program would stop due to exceeding the Capabilities area.
+
+v1.2:
+  - Standardized the logging system across programs to address inconsistencies.
+  - Corrected error display and handling methods.
+  - Enhanced configscan functions.
+  - Note: configscan will receive many fixes in the future.
+
+v1.3:
+  - Configscan fix again.
+
+v1.4:
+  - Fix Configscan to avoid timer impact. (More fixes needed for other network adapters.)
+  - Enhanced Configscan: added ignore_bits.txt to reduce timer impact.
+  - Fixed systemd call to `/lpot/reboot.sh` due to settings changed without systemd reload.
+  - Fixed issue where `lpotscan` error log could not write into `reboot.log`.
+
+v1.5:
+  - Fixed issue where `lpotscan` logs were appended multiple times in `reboot.log`. [lpot]
+  - Added `configscan_log.sh` to analyze logs and write to `reboot.log`. [lpot]
+  - Fixed `install.sh` to correct `configscan_log.sh` path.
+  - Fixed wrong codec handling in `lpotscan` YAML processing.
+  - Added `-s` option to determine wait time for driver readiness. [lpot]
+
+v1.6:
+  - Fixed stability and buffer overflow issues.
+  - Optimized signal handling in `lpot.c`.
+  - Enhanced config space scan tool.
+  - Fixed `lpotscan` bugs and removed unused modules.
+  - Improved `configscan` and `lpotscan` ignore bits logic.
+  - Added `-scan` option to check system USB devices for ignore parameter.
+  - Fixed repeated issues (ref: #20250801).
+  - Added `-r` option to clear lpot state.
+
 
 ---
 
