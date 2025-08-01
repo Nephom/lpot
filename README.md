@@ -35,13 +35,13 @@ lpot -t <hours> -d <seconds> -s <seconds> -p
 Where:
 - `-t`: Specifies the number of hours after which the system should reboot. (Example: `-t 24`)
 - `-d`: Sets the delay in seconds before each scheduled reboot starts. This helps distribute load over time. (Example: `-d 300`)
-- `-s`: Sets the waiting time to do system reboot. (Default: 300 seconds)
+- `-s`: Sets the waiting time to wait devices ready. (Default: 300 seconds)
 - `-p`: If this flag is used, LPOT will monitor the system for any errors during the process and halt further reboots if an error is detected.
 
 ## Example
 To schedule the system to reboot every 24 hours with a 5-minute delay and wait 60 seconds to reboot after compared, stopping in case of an error, you would use:
 ```bash
-lpot -t 24 -d 300 -s 60 -p (I don't recommand you to enable -p)
+lpot -t 24 -d 60 -s 300 -p (I don't recommand you to enable -p)
 ```
 
 ## Re-run
