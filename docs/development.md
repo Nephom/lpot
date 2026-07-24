@@ -3,8 +3,6 @@
 ## Repository Layout
 
 - `main.go`: executable and implementation.
-- `main_test.go`: unit tests for security helpers and interruptible control
-  flow.
 - `go.mod`: Go module metadata.
 - `docs/`: operational, architectural, function, and development documentation.
 - `.claude/`: project workflow templates and commands.
@@ -12,25 +10,29 @@
 Runtime binaries, logs, archives, timestamps, and CodeGraph databases are
 excluded by `.gitignore`.
 
-## Checks Before a Pull Request
+## Linux Checks Before a Pull Request
 
 ```bash
+GOOS=linux GOARCH=amd64 go build -o lpot_integrated .
+go vet ./...
+git diff --check
 ```
+
+Run these commands on Linux. The supported target is Linux and the project does
+not require or document macOS compilation or testing.
 
 Use `gofmt` on files being modified. The current legacy `main.go` may contain
 pre-existing formatting differences; avoid unrelated whole-file formatting
 changes unless that is the explicit goal of the change.
 
-## Testing Boundaries
+## Validation Boundaries
 
-Unit tests must not modify the host's PCI state, reboot the machine, change
-SELinux kernel state, or write outside temporary directories. Use dependency
-injection or package-level runners for system commands and use `-g` for manual
-end-to-end checks.
+Validation must not modify PCI state, reboot an unrelated machine, change
+SELinux kernel state unexpectedly, or write outside the intended runtime
+directories. Use `-g` for manual end-to-end checks before enabling reboot mode.
 
-Hardware validation is separate from unit tests. Before a real reboot run,
-confirm the endpoint report with `-classify`, review `/lpot/pcie_filter.txt`,
-and verify that the target host is safe to reboot.
+Before a real reboot run, confirm the endpoint report with `-classify`, review
+`/lpot/pcie_filter.txt`, and verify that the target host is safe to reboot.
 
 ## Issue Tracking
 

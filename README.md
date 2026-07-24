@@ -38,13 +38,23 @@ enabled. Use it only on a disposable or explicitly reserved test system.
 - `systemd` for reboot persistence during a normal run.
 - A test host whose reboot can be interrupted or observed safely.
 
-The repository is expected to build on other Unix-like systems for development,
-but the executable's hardware and service operations are Linux-specific.
+The project targets Linux only. Build and validate it on the Linux test host or
+in a Linux build environment; macOS and other local development environments
+are outside the supported build matrix.
 
-## Build and Test
+## Linux Build
 
 ```bash
-go test ./...
+GOOS=linux GOARCH=amd64 go build -o lpot_integrated .
+```
+
+Run the build command on Linux. The executable depends on Linux sysfs, PCI
+utilities, systemd, and root-only operations, so macOS is not a development or
+validation target for this project.
+
+On the Linux build host, optional static checks can be run with:
+
+```bash
 go vet ./...
 go build -o lpot_integrated .
 ```
@@ -136,10 +146,9 @@ runtime logs can contain host-specific hardware information.
 
 ## Review Notes and Known Limitations
 
-The current implementation passes `go test ./...` and `go vet ./...`. The
-source includes tests for secure file writes, SELinux symlink refusal,
-interruptible waits, and shell argument quoting. Before production use,
-validate the full reboot workflow on the intended Linux hardware.
+The implementation is intended to be reviewed and validated on Linux. Before
+production use, validate the full reboot workflow on the intended Linux
+hardware. macOS validation is deliberately not part of this project workflow.
 
 Technical documentation is organized under [`docs/`](docs/README.md). Ongoing
 changes, known parser limitations, security history, and the planned remote
