@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -53,7 +55,11 @@ const (
 	// lets users correlate events by plain text search and by tools like
 	// `sort -k1,2` without translation.
 	logTimeFormat = "2006-01-02 15:04:05"
-	version       = "2.2.0"
+	version       = "2.3.1"
+	serviceName   = "lpot.service"
+	legacyService = "lpot_reboot.service"
+	servicePath   = "/etc/systemd/system/" + serviceName
+	legacyPath    = "/etc/systemd/system/" + legacyService
 )
 
 // bdfRegex matches a canonical PCI BDF, optionally with a 4-digit domain:
@@ -86,6 +92,7 @@ func normalizeBDF(bdf string) string {
 // Global variables
 var (
 	debugMode bool
+	debugHash string
 	stopFlag  atomic.Bool // set when SIGINT/SIGTERM is received or rootCtx is cancelled
 
 	// rootCtx is cancelled on SIGINT/SIGTERM and is used to bound every external
@@ -481,7 +488,7 @@ func filterEndpoints(bdfs []string, ov pcieFilterOverrides) (kept []string, skip
 // every BDF and the keep/skip decision. It is used both by the -classify
 // dry-run flag and by the post-test summary so users see exactly the same
 // view.
-func printClassificationReport(w *os.File, decisions []deviceClassification) {
+func printClassificationReport(w io.Writer, decisions []deviceClassification) {
 	fmt.Fprintf(w, "%-12s %-9s %-9s %-7s %-8s %s\n",
 		"BDF", "Vendor", "Device", "Class", "HdrType", "Decision")
 	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 78))
@@ -955,6 +962,165 @@ func fetchPCIBDFs() ([]string, error) {
 	return bdfs, nil
 }
 
+func readLspciSnapshot(bdf string) (string, error) {
+	if !bdfRegex.MatchString(bdf) {
+		return "", fmt.Errorf("refusing to monitor malformed BDF %q", bdf)
+	}
+	out, err := runExternal(lspciTimeout, lspciPath, "-s", bdf, "-vv")
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func loadRebootMonitorBaseline(bdfs []string) map[string]string {
+	baseline := make(map[string]string, len(bdfs))
+	for _, bdf := range bdfs {
+		path := filepath.Join(TMP_DIR, bdf+"_init.txt")
+		data, err := os.ReadFile(path)
+		if err == nil {
+			baseline[bdf] = string(data)
+			continue
+		}
+		fmt.Printf("Warning: reboot monitor baseline unavailable for %s: %v\n", bdf, err)
+	}
+	return baseline
+}
+
+func snapshotSet(bdfs []string) map[string]bool {
+	set := make(map[string]bool, len(bdfs))
+	for _, bdf := range bdfs {
+		set[bdf] = true
+	}
+	return set
+}
+
+func lineDiff(before, after string) string {
+	beforeLines := strings.Split(before, "\n")
+	afterLines := strings.Split(after, "\n")
+	var diff strings.Builder
+	for _, line := range beforeLines {
+		if line != "" && !containsLine(afterLines, line) {
+			fmt.Fprintf(&diff, "- %s\n", line)
+		}
+	}
+	for _, line := range afterLines {
+		if line != "" && !containsLine(beforeLines, line) {
+			fmt.Fprintf(&diff, "+ %s\n", line)
+		}
+	}
+	return diff.String()
+}
+
+func containsLine(lines []string, want string) bool {
+	for _, line := range lines {
+		if line == want {
+			return true
+		}
+	}
+	return false
+}
+
+func logRebootMonitorEvent(logFp *os.File, event, bdf, before, after string, stopService bool) {
+	action := "CONTINUE_REBOOT"
+	if stopService {
+		action = "CANCEL_REBOOT"
+	}
+	message := fmt.Sprintf("%s [Cycle %d] Reboot-wait PCI change\nEvent: %s\nBDF: %s\nAction: %s\n",
+		getCurrentTimestamp(), currentCycle.Load(), event, bdf, action)
+	if before != "" || after != "" {
+		message += "----- BASELINE/PREVIOUS -----\n" + before + "----- CURRENT -----\n" + after
+		message += "----- DIFF -----\n" + lineDiff(before, after)
+	}
+	fmt.Fprint(logFp, message)
+	logFp.Sync()
+	fmt.Print(message)
+}
+
+// monitorRebootWait polls PCI topology and lspci output while waiting for the
+// reboot. It keeps the immutable _init.txt contents as baseline and only keeps
+// subsequent observations in memory. It returns false when -p requires reboot
+// cancellation or the context is interrupted.
+func monitorRebootWait(ctx context.Context, wait time.Duration, bdfs []string, logFp *os.File, stopService bool) bool {
+	baseline := loadRebootMonitorBaseline(bdfs)
+	previous := make(map[string]string, len(baseline))
+	for bdf, content := range baseline {
+		previous[bdf] = content
+	}
+	previousSet := snapshotSet(bdfs)
+	lastLogged := make(map[string]string)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		case <-ticker.C:
+			currentBDFs, err := fetchPCIBDFs()
+			if err != nil {
+				fmt.Fprintf(logFp, "%s [Cycle %d] Reboot-wait PCI monitor read failed: %v\n", getCurrentTimestamp(), currentCycle.Load(), err)
+				logFp.Sync()
+				continue
+			}
+			filteredBDFs := make([]string, 0, len(currentBDFs))
+			for _, bdf := range currentBDFs {
+				if endpointFilterAllows(bdf) {
+					filteredBDFs = append(filteredBDFs, bdf)
+				}
+			}
+			currentSet := snapshotSet(filteredBDFs)
+			for bdf := range currentSet {
+				if !previousSet[bdf] {
+					key := "NEW_DEVICE:" + bdf
+					if lastLogged[key] != "seen" {
+						content, readErr := readLspciSnapshot(bdf)
+						if readErr != nil {
+							content = fmt.Sprintf("lspci read failed: %v\n", readErr)
+						}
+						logRebootMonitorEvent(logFp, "NEW_DEVICE", bdf, "", content, stopService)
+						lastLogged[key] = "seen"
+						if stopService {
+							return false
+						}
+					}
+				}
+			}
+			for bdf := range previousSet {
+				if !currentSet[bdf] {
+					key := "REMOVED_DEVICE:" + bdf
+					if lastLogged[key] != "seen" {
+						logRebootMonitorEvent(logFp, "REMOVED_DEVICE", bdf, previous[bdf], "", stopService)
+						lastLogged[key] = "seen"
+						if stopService {
+							return false
+						}
+					}
+				}
+			}
+			for bdf := range currentSet {
+				content, readErr := readLspciSnapshot(bdf)
+				if readErr != nil {
+					continue
+				}
+				if old, ok := previous[bdf]; ok && old != content && lastLogged[bdf] != content {
+					logRebootMonitorEvent(logFp, "LSPCI_OUTPUT_CHANGED", bdf, baseline[bdf], content, stopService)
+					lastLogged[bdf] = content
+					if stopService {
+						return false
+					}
+				}
+				previous[bdf] = content
+			}
+			previousSet = currentSet
+		}
+	}
+}
+
 // Execute lspci command safely
 func executeLspci(bdf, suffix string) error {
 	var filename string
@@ -1040,10 +1206,17 @@ func createRebootScript(args []string) error {
 
 // Setup systemd service
 func setupSystemdService() error {
-	servicePath := "/etc/systemd/system/lpot_reboot.service"
 	scriptPath := filepath.Join(LPOT_DIR, "reboot.sh")
+	target, err := systemdDefaultTarget()
+	if err != nil {
+		fmt.Printf("Warning: failed to detect systemd default target: %v; using multi-user.target\n", err)
+		target = "multi-user.target"
+	}
 
-	serviceContent := systemdServiceContent(scriptPath)
+	if err := migrateLegacySystemdService(); err != nil {
+		return err
+	}
+	serviceContent := systemdServiceContent(scriptPath, target)
 
 	// O_CREATE|O_EXCL|O_NOFOLLOW: either we create the unit file freshly or we
 	// treat its pre-existence as success. This avoids both the Stat/Create race
@@ -1080,14 +1253,45 @@ func setupSystemdService() error {
 	}
 
 	// Enable service
-	if _, err := runExternal(systemctlTimeout, systemctlPath, "enable", "lpot_reboot.service"); err != nil {
-		return fmt.Errorf("failed to enable lpot_reboot service: %v", err)
+	if _, err := runExternal(systemctlTimeout, systemctlPath, "enable", serviceName); err != nil {
+		return fmt.Errorf("failed to enable %s: %v", serviceName, err)
 	}
 
 	return nil
 }
 
-func systemdServiceContent(scriptPath string) string {
+func systemdDefaultTarget() (string, error) {
+	out, err := runExternal(systemctlTimeout, systemctlPath, "get-default")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(string(out)) == "graphical.target" {
+		return "graphical.target", nil
+	}
+	return "multi-user.target", nil
+}
+
+func migrateLegacySystemdService() error {
+	info, err := os.Lstat(legacyPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to inspect legacy systemd service: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to migrate %s: path is a symlink", legacyPath)
+	}
+	if err := stopAndDisableUnit(legacyService); err != nil {
+		return fmt.Errorf("failed to disable legacy %s: %v", legacyService, err)
+	}
+	if err := os.Remove(legacyPath); err != nil {
+		return fmt.Errorf("failed to remove legacy %s: %v", legacyPath, err)
+	}
+	return nil
+}
+
+func systemdServiceContent(scriptPath, target string) string {
 	return fmt.Sprintf(`[Unit]
 Description=LPOT PCIe reboot stability test
 After=local-fs.target
@@ -1100,8 +1304,8 @@ Group=root
 WorkingDirectory=/lpot
 
 [Install]
-WantedBy=multi-user.target
-`, scriptPath)
+WantedBy=%s
+`, scriptPath, target)
 }
 
 // selinuxConfigPath is kept as a variable so the Linux SELinux configuration
@@ -1297,6 +1501,24 @@ func printDryRunCommand(name string, args ...string) {
 	fmt.Printf("[DRY-RUN] WOULD EXEC %s\n", strings.Join(parts, " "))
 }
 
+func printDryRunHostPolicyActions() {
+	for _, service := range []string{"firewalld", "ufw", "nftables", "iptables", "ip6tables", "SuSEfirewall2", "apparmor"} {
+		if systemdUnitExists(service) {
+			printDryRunCommand(systemctlPath, "stop", service)
+			printDryRunCommand(systemctlPath, "is-enabled", service)
+			printDryRunCommand(systemctlPath, "disable", service)
+		} else {
+			fmt.Printf("[DRY-RUN] READ systemd unit %s: absent (skip)\n", service)
+		}
+	}
+	if ufwPath != "" {
+		printDryRunCommand(ufwPath, "disable")
+	}
+	if setenforcePath != "" {
+		printDryRunCommand(setenforcePath, "0")
+	}
+}
+
 func printDryRunReadCommand(timeout time.Duration, name string, args ...string) []byte {
 	printDryRunCommand(name, args...)
 	out, err := runExternal(timeout, name, args...)
@@ -1309,11 +1531,50 @@ func printDryRunReadCommand(timeout time.Duration, name string, args ...string) 
 	return out
 }
 
+func runDryRunScanAudit() {
+	fmt.Println("[DRY-RUN] scan audit mode; no scan result will be written")
+	printDryRunHostPolicyActions()
+	fmt.Printf("[DRY-RUN] WOULD READ %s for PCI configuration samples\n", SYS_PCI_DEVICES)
+	fmt.Println("[DRY-RUN] WOULD COLLECT 5 read-only PCI samples at one-second intervals")
+	fmt.Printf("[DRY-RUN] WOULD WRITE %s (generated volatile-byte ignore list)\n", IGNORE_LIST_FILE)
+	fmt.Printf("[DRY-RUN] WOULD REMOVE temporary sample directory after analysis\n")
+	fmt.Println("[DRY-RUN] scan audit complete")
+}
+
+func runDryRunClassifyAudit() {
+	fmt.Println("[DRY-RUN] classify audit mode; no report or host policy will be written")
+	printDryRunHostPolicyActions()
+	bdfs, err := fetchPCIBDFs()
+	if err != nil {
+		fmt.Printf("[DRY-RUN] READ PCI devices failed: %v\n", err)
+		return
+	}
+	ov, err := loadPCIeFilterOverrides(PCIE_FILTER_FILE)
+	if err != nil {
+		fmt.Printf("[DRY-RUN] READ %s failed: %v\n", PCIE_FILTER_FILE, err)
+		return
+	}
+	decisions := classifyDevices(bdfs, ov)
+	var report bytes.Buffer
+	printClassificationReport(&report, decisions)
+	fmt.Printf("[DRY-RUN] WOULD WRITE %s\n", CLASSIFY_LOG)
+	fmt.Printf("[DRY-RUN] CONTENT BEGIN %s\n%s[DRY-RUN] CONTENT END %s\n", CLASSIFY_LOG, report.String(), CLASSIFY_LOG)
+	fmt.Println("[DRY-RUN] classify audit complete")
+}
+
 // runDryRunAudit performs the read-only portion of startup and prints every
 // planned mutation. It is deliberately separate from the normal execution
 // path: a dry run must remain safe even when a future write is added to the
 // reboot loop and its author forgets to add another guard.
-func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stopService bool) {
+func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stopService bool, scanOnly, classify bool) {
+	if scanOnly {
+		runDryRunScanAudit()
+		return
+	}
+	if classify {
+		runDryRunClassifyAudit()
+		return
+	}
 	fmt.Println("[DRY-RUN] audit mode enabled; no filesystem or host-state mutation will occur")
 	fmt.Printf("[DRY-RUN] parameters: duration=%dh driver-delay=%ds reboot-delay=%ds stop-on-error=%t\n",
 		waitHours, standbyTime, waitSeconds, stopService)
@@ -1335,19 +1596,7 @@ func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stop
 			TMP_DIR, info.Mode().Perm(), info.IsDir(), info.Mode()&os.ModeSymlink != 0)
 	}
 
-	services := []string{"firewalld", "ufw", "nftables", "iptables", "ip6tables", "SuSEfirewall2", "apparmor"}
-	for _, service := range services {
-		if systemdUnitExists(service) {
-			printDryRunCommand(systemctlPath, "stop", service)
-			printDryRunCommand(systemctlPath, "is-enabled", service)
-			printDryRunCommand(systemctlPath, "disable", service)
-		} else {
-			fmt.Printf("[DRY-RUN] READ systemd unit %s: absent (skip)\n", service)
-		}
-	}
-	if ufwPath != "" {
-		printDryRunCommand(ufwPath, "disable")
-	}
+	printDryRunHostPolicyActions()
 
 	if info, err := os.Lstat(selinuxConfigPath); err == nil && info.Mode()&os.ModeSymlink == 0 {
 		if setenforcePath != "" {
@@ -1390,10 +1639,19 @@ func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stop
 	script.WriteByte('\n')
 	printDryRunFile(filepath.Join(LPOT_DIR, "reboot.sh"), "create", 0700, script.String())
 
-	servicePath := "/etc/systemd/system/lpot_reboot.service"
-	printDryRunFile(servicePath, "create", 0644, systemdServiceContent(filepath.Join(LPOT_DIR, "reboot.sh")))
+	if info, err := os.Lstat(legacyPath); err == nil && info.Mode()&os.ModeSymlink == 0 {
+		printDryRunCommand(systemctlPath, "stop", legacyService)
+		printDryRunCommand(systemctlPath, "disable", legacyService)
+		fmt.Printf("[DRY-RUN] WOULD REMOVE %s\n", legacyPath)
+	}
+	target := "multi-user.target"
+	if out := printDryRunReadCommand(systemctlTimeout, systemctlPath, "get-default"); strings.TrimSpace(string(out)) == "graphical.target" {
+		target = "graphical.target"
+	}
+	fmt.Printf("[DRY-RUN] selected systemd WantedBy=%s\n", target)
+	printDryRunFile(servicePath, "create", 0644, systemdServiceContent(filepath.Join(LPOT_DIR, "reboot.sh"), target))
 	printDryRunCommand(systemctlPath, "daemon-reload")
-	printDryRunCommand(systemctlPath, "enable", "lpot_reboot.service")
+	printDryRunCommand(systemctlPath, "enable", serviceName)
 
 	nextCount := 1
 	if data, err := os.ReadFile(REBOOTCOUNT_FILE); err == nil {
@@ -1445,17 +1703,58 @@ func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stop
 	fmt.Println("[DRY-RUN] audit complete; reboot command was not executed")
 }
 
+func rootPasswordHash() (string, error) {
+	data, err := os.ReadFile("/etc/shadow")
+	if err != nil {
+		return "", fmt.Errorf("failed to read /etc/shadow: %v", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.SplitN(line, ":", 3)
+		if len(fields) >= 2 && fields[0] == "root" {
+			if fields[1] == "" || fields[1] == "!*" {
+				return "", fmt.Errorf("root account has no usable password hash")
+			}
+			return fields[1], nil
+		}
+	}
+	return "", fmt.Errorf("root entry not found in /etc/shadow")
+}
+
+func authenticateDebug(hash string) error {
+	if hash == "" {
+		return fmt.Errorf("-g requires the encrypted root password value")
+	}
+	actual, err := rootPasswordHash()
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare([]byte(hash), []byte(actual)) != 1 {
+		return fmt.Errorf("debug authentication failed")
+	}
+	return nil
+}
+
+func flagWasProvided(name string) bool {
+	prefix := "-" + name
+	for _, arg := range os.Args[1:] {
+		if arg == prefix || strings.HasPrefix(arg, prefix+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 // Show help
 func showHelp(programName string) {
 	fmt.Printf("Usage: %s [OPTIONS]\n", programName)
-	fmt.Printf("Version: %s (Integrated)\n", version)
+	fmt.Printf("Version: %s\n", version)
 	fmt.Printf("Author: Nephom,Chiang (Integrated by AI)\n")
 	fmt.Printf("OPTIONS:\n")
 	fmt.Printf("  -t <hours>   Setup runtime, default is 12 hours.\n")
 	fmt.Printf("  -d <secs>    Setup delay time for driver ready, default is 300 seconds.\n")
 	fmt.Printf("  -s <secs>    Setup delay time for reboot, default is 300 seconds.\n")
 	fmt.Printf("  -p           Set stop flag when Error occurred!\n")
-	fmt.Printf("  -g           Dry-run audit mode; show commands and file contents without changing the host.\n")
+	fmt.Printf("  -k           Show encrypted root password value.\n")
 	fmt.Printf("  -r           Reset /lpot directory and clean all files.\n")
 	fmt.Printf("  -scan        Scan USB/bridge/volatile devices and write /lpot/ignore_list.txt, then exit.\n")
 	fmt.Printf("  -classify    Print PCI endpoint classification report and exit (dry-run).\n")
@@ -1464,7 +1763,6 @@ func showHelp(programName string) {
 	fmt.Printf("NOTE: Bridges and legacy PCI devices are filtered automatically. Override via %s.\n", PCIE_FILTER_FILE)
 	fmt.Printf("\nExample:\n")
 	fmt.Printf("  %s -t 24 -s 600    Run reboot during 24 hours and each reboot wait for 600 seconds\n", programName)
-	fmt.Printf("  %s -g -t 2         Print a read-only audit for a 2-hour run\n", programName)
 	fmt.Printf("  %s -r              Reset /lpot directory to clean state\n", programName)
 	fmt.Printf("  %s -scan           Only scan PCI devices and generate ignore bits file\n", programName)
 	fmt.Printf("  %s -classify       Preview which BDFs the endpoint filter will keep/skip\n", programName)
@@ -1498,21 +1796,37 @@ func main() {
 		standbyTime = flag.Int("d", 300, "Setup delay time for driver ready in seconds")
 		waitSeconds = flag.Int("s", 300, "Setup delay time for reboot in seconds")
 		stopService = flag.Bool("p", false, "Set stop flag when error occurred")
-		debug       = flag.Bool("g", false, "Dry-run audit mode")
+		debug       = flag.String("g", "", "")
+		showKey     = flag.Bool("k", false, "Show encrypted root password value")
 		reset       = flag.Bool("r", false, "Reset /lpot directory")
 		scanOnly    = flag.Bool("scan", false, "Only scan and generate ignore bits file, then exit")
 		classify    = flag.Bool("classify", false, "Print PCI endpoint classification report and exit")
 		help        = flag.Bool("h", false, "Show help menu")
 	)
 	flag.Parse()
-	debugMode = *debug
+	debugHash = *debug
+	debugRequested := flagWasProvided("g")
 
 	if *help {
 		showHelp(os.Args[0])
 		return
 	}
-	if debugMode {
-		runDryRunAudit(os.Args, *waitHours, *standbyTime, *waitSeconds, *stopService)
+	if *showKey {
+		hash, err := rootPasswordHash()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(hash)
+		return
+	}
+	if debugRequested {
+		if err := authenticateDebug(debugHash); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		debugMode = true
+		runDryRunAudit(os.Args, *waitHours, *standbyTime, *waitSeconds, *stopService, *scanOnly, *classify)
 		return
 	}
 
@@ -1821,7 +2135,14 @@ func main() {
 	timestampStr = getCurrentTimestamp()
 	fmt.Fprintf(logFp, "%s Wait %d seconds for reboot SUT. \n", timestampStr, *waitSeconds)
 	logFp.Sync()
-	sleepInterruptible(rootCtx, time.Duration(*waitSeconds)*time.Second)
+	if !monitorRebootWait(rootCtx, time.Duration(*waitSeconds)*time.Second, bdfs, logFp, *stopService) {
+		if *stopService && !stopFlag.Load() {
+			fmt.Fprintf(logFp, "%s [Cycle %d] Reboot skipped because -p stopped the reboot wait after a PCI change.\n",
+				getCurrentTimestamp(), currentCycle.Load())
+			logFp.Sync()
+		}
+		return
+	}
 
 	// If a stop was requested during the wait (Ctrl-C, SIGTERM, or context
 	// cancellation from anywhere else), skip the reboot entirely: rebooting a
@@ -3167,7 +3488,7 @@ func compareDevices(device1, device2 Device, stopServiceEnabled bool) Comparison
 
 		// Stop service if enabled and no previous error
 		if stopServiceEnabled && result.Error == nil {
-			if err := stopService("lpot_reboot"); err != nil {
+			if err := stopService(serviceName); err != nil {
 				result.Error = fmt.Errorf("failed to stop service: %w", err)
 				logger.Printf("Service stop error: %v\n", result.Error)
 			}

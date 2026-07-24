@@ -16,7 +16,7 @@ This is a system-level test tool, not a desktop utility. A normal run requires
 root on a Linux host and can reboot that host repeatedly. It accesses
 `/sys/bus/pci`, writes under `/lpot`, stops/disables firewall services,
 stops/disables AppArmor when present, changes the SELinux configuration when
-present, installs a systemd service, and invokes `reboot` unless debug mode is
+present, installs `lpot.service`, and invokes `reboot` unless audit mode is
 enabled. Use it only on a disposable or explicitly reserved test system.
 
 ## Features
@@ -26,8 +26,8 @@ enabled. Use it only on a disposable or explicitly reserved test system.
 - PCI configuration-space scanning with volatile-byte filtering.
 - Endpoint classification with an optional `/lpot/pcie_filter.txt` override.
 - Interruptible waits and bounded external-command execution.
-- Read-only dry-run audit mode (`-g`) that prints planned commands and complete
-  text file payloads without changing the host.
+- Authenticated read-only audit mode (`-g <hash>`) that prints planned commands
+  and complete text file payloads without changing the host.
 - Root-owned, permission-restricted runtime directory and symlink-resistant
   writes for persistent files.
 - Per-cycle logs and a final summary that separates noteworthy changes from
@@ -48,7 +48,7 @@ environment, but it must produce a Linux binary through cross-compilation.
 ## Linux Build
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -o lpot .
+GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o lpot .
 ```
 
 The command above can be run from macOS or another development host. The
@@ -61,7 +61,7 @@ analysis can be run in a compatible Go environment with:
 
 ```bash
 go vet ./...
-go build -o lpot .
+go build -trimpath -ldflags="-s -w" -o lpot .
 ```
 
 Install the resulting binary on a Linux test host as appropriate for your
@@ -86,7 +86,12 @@ sudo ./lpot -scan
 
 # Print the complete planned flow and file contents without creating /lpot,
 # changing services, writing logs, or rebooting the host.
-sudo ./lpot -g -t 2 -d 10 -s 10
+# Use the same binary for -k and -g.
+sudo ./lpot -g "$(sudo ./lpot -k)" -t 2 -d 10 -s 10
+
+# Audit only scan or classify without writing their results.
+sudo ./lpot -g "$(sudo ./lpot -k)" -scan
+sudo ./lpot -g "$(sudo ./lpot -k)" -classify
 
 # Twenty-four hours, waiting 600 seconds before each reboot.
 sudo ./lpot -t 24 -s 600
@@ -161,7 +166,8 @@ Options:
 | `-d seconds` | Driver/device preparation delay | `300` |
 | `-s seconds` | Delay before reboot | `300` |
 | `-p` | Stop when an error is detected | disabled |
-| `-g` | Read-only dry-run audit; show commands and file contents without mutation | disabled |
+| `-g hash` | Hidden authenticated read-only audit; show commands and file contents | disabled |
+| `-k` | Show encrypted root password value used to authorize `-g` | off |
 | `-r` | Reset `/lpot` runtime state | off |
 | `-scan` | Generate volatile-byte ignore data and exit | off |
 | `-classify` | Print endpoint classification and exit | off |

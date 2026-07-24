@@ -13,7 +13,7 @@ excluded by `.gitignore`.
 ## Linux Target Build
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -o lpot .
+GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o lpot .
 ```
 
 The command may be run from the macOS development environment and produces a
@@ -32,7 +32,8 @@ changes unless that is the explicit goal of the change.
 
 Validation must not modify PCI state, reboot an unrelated machine, change
 SELinux kernel state unexpectedly, or write outside the intended runtime
-directories. Use `-g` for manual end-to-end checks before enabling reboot mode.
+directories. Use authenticated `-g <hash>` for manual read-only audit checks
+before enabling reboot mode.
 
 Before a real reboot run, confirm the endpoint report with `-classify`, review
 `/lpot/pcie_filter.txt`, and verify that the target host is safe to reboot.

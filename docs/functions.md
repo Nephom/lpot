@@ -8,8 +8,9 @@ reference.
 
 - `main`: validates the host, parses flags, initializes state, executes one
   reboot cycle, and schedules the next cycle through systemd.
-- `runDryRunAudit`: performs read-only host inspection and prints all planned
-  commands, mutations, and known file contents without writing anything.
+- `runDryRunAudit`: authenticates a hidden `-g <hash>` request and performs
+  read-only host inspection, printing all planned commands, mutations, and
+  known file contents without writing anything.
 - `setupSignalHandlers`: turns SIGINT/SIGTERM into `stopFlag` and context
   cancellation.
 - `sleepInterruptible`: waits for a duration while responding to context
@@ -31,7 +32,9 @@ reference.
 - `createRebootScript`: creates the reboot script once, rejects symlinks, and
   quotes every executable/argument independently.
 - `setupSystemdService`: creates the systemd unit once and rejects a symlink at
-  the service path.
+   the service path.
+- `monitorRebootWait`: compares `/lpot/tmp/<BDF>_init.txt` baselines with
+  in-memory polling snapshots during the reboot wait.
 - `disableSELinux`: best-effort SELinux configuration update with symlink refusal.
 - `disableFirewall`: stops/disables common RHEL, SLES, and Ubuntu firewall
   services and invokes `ufw disable` when available.

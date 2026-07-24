@@ -4,7 +4,7 @@
 
 LPOT is a Linux system-level test tool. A normal run requires root, writes
 under `/lpot`, stops/disables firewall services, stops/disables AppArmor when
-present, changes SELinux settings when present, installs `lpot_reboot.service`,
+present, changes SELinux settings when present, installs `lpot.service`,
 and invokes `reboot`. Run it only on a reserved laboratory host. Use `-g`
 while validating command-line behavior because it performs a read-only audit
 and never changes the host or invokes the reboot command.
@@ -22,7 +22,7 @@ and never changes the host or invokes the reboot command.
 ## Build and Validation
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -o lpot .
+GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o lpot .
 ```
 
 The runtime preparation is distribution-aware across RHEL, SLES, and Ubuntu.
@@ -37,12 +37,14 @@ stopped/disabled aborts before the reboot service is created:
 
 An absent service is normal for a given distribution and is not an error.
 
-`-g` is a read-only audit mode. It does not create `/lpot`, write logs or
+`-g <hash>` is an authenticated read-only audit mode. Use `./lpot -k` to print
+the encrypted root password value accepted by `-g`. It does not create `/lpot`, write logs or
 snapshots, modify service/SELinux state, create temporary files, or reboot. It
 does inspect the host and prints planned commands plus complete contents for
 known text files such as the reboot script, systemd unit, and SELinux config.
 Read-only command output, including `lspci`, is printed between explicit output
-delimiters.
+delimiters. The `-k` and `-g` invocations must use the same binary; a failed
+command substitution must not be replaced with an empty authentication value.
 
 ## Command-Line Modes
 
@@ -50,7 +52,9 @@ delimiters.
 sudo ./lpot -h
 sudo ./lpot -classify
 sudo ./lpot -scan
-sudo ./lpot -g -t 2 -d 10 -s 10
+sudo ./lpot -g "$(sudo ./lpot -k)" -t 2 -d 10 -s 10
+sudo ./lpot -g "$(sudo ./lpot -k)" -scan
+sudo ./lpot -g "$(sudo ./lpot -k)" -classify
 sudo ./lpot -t 24 -s 600
 sudo ./lpot -p
 sudo ./lpot -r
@@ -62,7 +66,8 @@ sudo ./lpot -r
 | `-d seconds` | Driver/device preparation delay | `300` |
 | `-s seconds` | Delay before reboot | `300` |
 | `-p` | Stop after a comparison error | disabled |
-| `-g` | Read-only dry-run audit; show commands and file contents without mutation | disabled |
+| `-g hash` | Hidden authenticated read-only audit; show commands and file contents | disabled |
+| `-k` | Show encrypted root password value used to authorize `-g` | off |
 | `-r` | Reset `/lpot` state | off |
 | `-scan` | Scan USB/bridge/volatile devices into `ignore_list.txt` and exit | off |
 | `-classify` | List external PCIe endpoints and write a report | off |
