@@ -14,8 +14,6 @@ import (
 	"io"
 	"io/fs"
 	"log"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -60,7 +58,7 @@ const (
 	// lets users correlate events by plain text search and by tools like
 	// `sort -k1,2` without translation.
 	logTimeFormat = "2006-01-02 15:04:05"
-	version       = "2.5.0"
+	version       = "2.6.0"
 	serviceName   = "lpot.service"
 	legacyService = "lpot_reboot.service"
 	servicePath   = "/etc/systemd/system/" + serviceName
@@ -152,63 +150,6 @@ type cycleChange struct {
 	Time       time.Time
 	Reason     string
 	Noteworthy bool
-}
-
-type resultReport struct {
-	SchemaVersion    int               `json:"schema_version"`
-	Version          string            `json:"version"`
-	RunID            string            `json:"run_id"`
-	Status           string            `json:"status"`
-	Checkpoint       bool              `json:"checkpoint"`
-	Message          string            `json:"message"`
-	StartedAt        string            `json:"started_at,omitempty"`
-	UpdatedAt        string            `json:"updated_at"`
-	FinishedAt       string            `json:"finished_at,omitempty"`
-	TotalCycles      int               `json:"total_cycles"`
-	CompletedCycles  int               `json:"completed_cycles"`
-	SuccessfulCycles int               `json:"successful_cycles"`
-	FailedCycles     int               `json:"failed_cycles"`
-	Checks           resultChecks      `json:"checks"`
-	Cycles           []resultCycle     `json:"cycles"`
-	Problems         []resultProblem   `json:"problems"`
-	Artifacts        map[string]string `json:"artifacts"`
-}
-
-type resultChecks struct {
-	Topology    resultCheck `json:"topology"`
-	LSPCI       resultCheck `json:"lspci"`
-	ConfigSpace resultCheck `json:"config_space"`
-	ConfigNoise resultCheck `json:"config_noise"`
-	RebootWait  resultCheck `json:"reboot_wait"`
-}
-
-type resultCheck struct {
-	Status        string `json:"status"`
-	ChangedCycles int    `json:"changed_cycles,omitempty"`
-	Noteworthy    int    `json:"noteworthy_changes,omitempty"`
-	BenignChanges int    `json:"benign_changes,omitempty"`
-	Message       string `json:"message,omitempty"`
-}
-
-type resultCycle struct {
-	Number      int             `json:"number"`
-	StartedAt   string          `json:"started_at,omitempty"`
-	FinishedAt  string          `json:"finished_at,omitempty"`
-	Status      string          `json:"status"`
-	Topology    string          `json:"topology"`
-	LSPCI       string          `json:"lspci"`
-	ConfigSpace string          `json:"config_space"`
-	Events      []resultProblem `json:"events,omitempty"`
-}
-
-type resultProblem struct {
-	Severity   string `json:"severity"`
-	Category   string `json:"category"`
-	Cycle      int    `json:"cycle,omitempty"`
-	Timestamp  string `json:"timestamp,omitempty"`
-	BDF        string `json:"bdf,omitempty"`
-	Message    string `json:"message"`
-	DetailsLog string `json:"details_log,omitempty"`
 }
 
 // recordCycleChange appends a noteworthy change record (topology / lspci) for
@@ -700,14 +641,6 @@ func ensureRoot() {
 	}
 }
 
-func fatalOperation(operation string, err error, suggestion string) {
-	fmt.Fprintf(os.Stderr, "%s: %v\n", operation, err)
-	if suggestion != "" {
-		fmt.Fprintf(os.Stderr, "Suggestion: %s\n", suggestion)
-	}
-	os.Exit(1)
-}
-
 // secureLpotDir ensures LPOT_DIR exists as a real directory owned by root and
 // not reachable through a symlink. The directory is readable/traversable by
 // non-root users for operational inspection, while files that control reboot
@@ -759,62 +692,6 @@ func secureLpotDir() error {
 		return fmt.Errorf("chmod %s: %w", TMP_DIR, err)
 	}
 	return nil
-}
-
-// openSecureAppend opens path for append-only writing with O_NOFOLLOW, so an
-// attacker who can drop a symlink at path cannot redirect log writes to a
-// target file elsewhere (e.g. /etc/shadow).
-func openSecureAppend(path string, perm os.FileMode) (*os.File, error) {
-	if err := verifyRootRegularFileIfPresent(path); err != nil {
-		return nil, err
-	}
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode().Perm() != perm.Perm() {
-			if err := os.Chmod(path, perm); err != nil {
-				return nil, fmt.Errorf("set mode on %s: %w", path, err)
-			}
-		}
-	}
-	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW, perm)
-}
-
-// openSecureCreateExcl creates path with O_EXCL|O_NOFOLLOW, returning
-// os.ErrExist if the file already exists. This closes the standard Stat+Create
-// TOCTOU window used by reboot-script / systemd-unit setup.
-func openSecureCreateExcl(path string, perm os.FileMode) (*os.File, error) {
-	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, perm)
-}
-
-// writeFileNoFollow writes data to path, creating or truncating the file
-// without following symlinks. If path is an existing symlink the OpenFile
-// syscall fails with ELOOP, which prevents a symlink planted at path from
-// redirecting the write to an attacker-chosen target. This is the drop-in
-// replacement for os.WriteFile / os.Create in every place that writes to a
-// path under /lpot, /tmp or /etc.
-func writeFileNoFollow(path string, data []byte, perm os.FileMode) error {
-	if err := verifyRootRegularFileIfPresent(path); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, perm)
-	if err != nil {
-		return err
-	}
-	if _, werr := f.Write(data); werr != nil {
-		f.Close()
-		return werr
-	}
-	if err := f.Chmod(perm); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
-}
-
-// shellQuote returns a single-quoted POSIX shell word. Reboot script arguments
-// originate from os.Args, so each argument must be quoted independently rather
-// than joined into an unescaped command line.
-func shellQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 // sleepInterruptible blocks until d elapses or ctx is cancelled. It returns
@@ -1337,228 +1214,32 @@ func createRebootScript(args []string) error {
 	return nil
 }
 
-func verifyRootRegularFileIfPresent(path string) error {
-	info, err := os.Lstat(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("inspect %s: %w", path, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("refusing to use %s: expected a regular file", path)
-	}
-	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid != 0 {
-		return fmt.Errorf("refusing to use %s: owner must be root, found uid %d", path, st.Uid)
-	}
-	return nil
-}
-
-// Setup systemd service
-func setupSystemdService() error {
-	scriptPath := filepath.Join(LPOT_DIR, "reboot.sh")
-	target, err := systemdDefaultTarget()
-	if err != nil {
-		fmt.Printf("Warning: failed to detect systemd default target: %v; using multi-user.target\n", err)
-		target = "multi-user.target"
-	}
-
-	if err := migrateLegacySystemdService(); err != nil {
-		return err
-	}
-	serviceContent := systemdServiceContent(scriptPath, target)
-
-	if err := verifyRootRegularFileIfPresent(servicePath); err != nil {
-		return err
-	}
-	if err := writeFileNoFollow(servicePath, []byte(serviceContent), 0644); err != nil {
-		return fmt.Errorf("write systemd service file %s: %w", servicePath, err)
-	}
-	if err := os.Chmod(servicePath, 0644); err != nil {
-		return fmt.Errorf("set systemd service mode on %s: %w", servicePath, err)
-	}
-
-	// Reload systemd daemon
-	if _, err := runExternal(systemctlTimeout, systemctlPath, "daemon-reload"); err != nil {
-		return fmt.Errorf("failed to reload systemd daemon: %v", err)
-	}
-
-	// Enable service
-	if _, err := runExternal(systemctlTimeout, systemctlPath, "enable", serviceName); err != nil {
-		return fmt.Errorf("failed to enable %s: %v", serviceName, err)
-	}
-
-	return nil
-}
-
-func systemdDefaultTarget() (string, error) {
-	out, err := runExternal(systemctlTimeout, systemctlPath, "get-default")
-	if err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(string(out)) == "graphical.target" {
-		return "graphical.target", nil
-	}
-	return "multi-user.target", nil
-}
-
-func migrateLegacySystemdService() error {
-	info, err := os.Lstat(legacyPath)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("failed to inspect legacy systemd service: %v", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing to migrate %s: path is a symlink", legacyPath)
-	}
-	if err := stopAndDisableUnit(legacyService); err != nil {
-		return fmt.Errorf("failed to disable legacy %s: %v", legacyService, err)
-	}
-	if err := os.Remove(legacyPath); err != nil {
-		return fmt.Errorf("failed to remove legacy %s: %v", legacyPath, err)
-	}
-	return nil
-}
-
-func systemdServiceContent(scriptPath, target string) string {
-	return fmt.Sprintf(`[Unit]
-Description=LPOT PCIe reboot stability test
-After=local-fs.target
-
-[Service]
-ExecStart=%s
-Restart=no
-User=root
-Group=root
-WorkingDirectory=/lpot
-
-[Install]
-WantedBy=%s
-`, scriptPath, target)
-}
-
-// selinuxConfigPath is kept as a variable so the Linux SELinux configuration
-// path is explicit and easy to inspect in diagnostics.
-var (
-	selinuxConfigPath = "/etc/selinux/config"
-)
-
 // disableSELinux best-effort puts SELinux into permissive mode immediately and
 // disabled mode across the next reboot. It is safe on distributions without
 // SELinux: a missing config file is treated as "not installed". The config
 // rewrite handles enforcing, permissive, and whitespace variants.
-func disableSELinux() error {
-	info, err := os.Lstat(selinuxConfigPath)
-	if err != nil {
-		// Missing config is normal on Ubuntu installations without SELinux and
-		// on systems where SELinux was not installed.
-		return nil
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing to modify %s: path is a symlink", selinuxConfigPath)
-	}
-
-	// Temporarily switch the running kernel into permissive mode. The command
-	// is absent on non-SELinux systems, so there is nothing to do in that case.
-	if setenforcePath != "" {
-		if _, err := runExternal(systemctlTimeout, setenforcePath, "0"); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: setenforce 0 failed: %v\n", err)
-		}
-	}
-
-	data, err := os.ReadFile(selinuxConfigPath)
-	if err != nil {
-		return fmt.Errorf("failed to read %s: %w", selinuxConfigPath, err)
-	}
-	lines := strings.Split(string(data), "\n")
-	found := false
-	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "SELINUX=") {
-			lines[i] = "SELINUX=disabled"
-			found = true
-		}
-	}
-	if !found {
-		lines = append(lines, "SELINUX=disabled")
-	}
-	content := strings.Join(lines, "\n")
-	if err := writeFileNoFollow(selinuxConfigPath, []byte(content), 0644); err != nil {
-		return fmt.Errorf("failed to update %s: %w", selinuxConfigPath, err)
-	}
-	return nil
-}
+// disableSELinux is implemented in systemd.go.
 
 // systemdUnitExists distinguishes a missing optional unit from a unit that is
 // installed but currently inactive. The latter must still be disabled for the
 // next reboot.
-func systemdUnitExists(unit string) bool {
-	out, err := runExternal(systemctlTimeout, systemctlPath, "cat", unit)
-	return err == nil && len(bytes.TrimSpace(out)) > 0
-}
+// systemdUnitExists is implemented in systemd.go.
 
 // stopAndDisableUnit stops an installed unit and disables it when it is enabled.
 // Missing units are normal across RHEL, SLES, and Ubuntu and return nil.
-func stopAndDisableUnit(unit string) error {
-	if !systemdUnitExists(unit) {
-		return nil
-	}
-	if _, err := runExternal(systemctlTimeout, systemctlPath, "stop", unit); err != nil {
-		return fmt.Errorf("failed to stop %s: %w", unit, err)
-	}
-	if state, err := runExternal(systemctlTimeout, systemctlPath, "is-enabled", unit); err == nil && strings.TrimSpace(string(state)) == "enabled" {
-		if _, err := runExternal(systemctlTimeout, systemctlPath, "disable", unit); err != nil {
-			return fmt.Errorf("failed to disable %s: %w", unit, err)
-		}
-	}
-	return nil
-}
+// stopAndDisableUnit is implemented in systemd.go.
 
 // disableFirewall stops and disables firewall services used by RHEL, SLES,
 // and Ubuntu families. Missing services are expected and never abort the test.
 // The explicit service list also covers older SLES installations that still
 // expose SuSEfirewall2 rather than firewalld/nftables.
-func disableFirewall() error {
-	services := []string{
-		"firewalld",
-		"ufw",
-		"nftables",
-		"iptables",
-		"ip6tables",
-		"SuSEfirewall2",
-	}
-	for _, service := range services {
-		if err := stopAndDisableUnit(service); err != nil {
-			return err
-		}
-	}
-	if ufwPath != "" {
-		if _, err := runExternal(systemctlTimeout, ufwPath, "disable"); err != nil {
-			return fmt.Errorf("failed to disable ufw: %w", err)
-		}
-	}
-	return nil
-}
+// disableFirewall is implemented in systemd.go.
 
 // disableAppArmor stops and disables Ubuntu's AppArmor service. RHEL and SLES
 // normally do not install it, so a missing unit is intentionally harmless.
-func disableAppArmor() error {
-	return stopAndDisableUnit("apparmor")
-}
+// disableAppArmor is implemented in systemd.go.
 
-func prepareHostPolicies() error {
-	if err := disableFirewall(); err != nil {
-		return fmt.Errorf("disable firewall: %w", err)
-	}
-	if err := disableAppArmor(); err != nil {
-		return fmt.Errorf("disable AppArmor: %w", err)
-	}
-	if err := disableSELinux(); err != nil {
-		return fmt.Errorf("configure SELinux: %w", err)
-	}
-	return nil
-}
+// prepareHostPolicies is implemented in systemd.go.
 
 // Reset lpot directory
 func resetLpotDirectory() error {
@@ -3841,121 +3522,6 @@ func writeFilteredDevicesSection(logFile *os.File) {
 	fmt.Fprintf(logFile, "  Total filtered: %d device(s)\n", len(snap))
 }
 
-type configResultChange struct {
-	cycle     int
-	timestamp string
-	device    string
-	offset    string
-	before    string
-	after     string
-}
-
-func lineTimestamp(line string) string {
-	fields := strings.Fields(line)
-	if len(fields) >= 2 {
-		if _, err := time.Parse(logTimeFormat, fields[0]+" "+fields[1]); err == nil {
-			return fields[0] + " " + fields[1]
-		}
-	}
-	return ""
-}
-
-func lineCycleNumber(line string) int {
-	marker := "Cycle "
-	start := strings.Index(line, marker)
-	if start < 0 {
-		return 0
-	}
-	value := strings.TrimSpace(line[start+len(marker):])
-	value = strings.TrimSuffix(value, "]")
-	fields := strings.Fields(value)
-	if len(fields) == 0 {
-		return 0
-	}
-	value = fields[0]
-	n, _ := strconv.Atoi(value)
-	return n
-}
-
-func parseBDFAfterMarker(line, marker string) string {
-	index := strings.Index(line, marker)
-	if index < 0 {
-		return ""
-	}
-	value := strings.TrimSpace(line[index+len(marker):])
-	if fields := strings.Fields(value); len(fields) > 0 {
-		return strings.TrimSuffix(fields[0], ":")
-	}
-	return ""
-}
-
-func parseConfigResultChanges() []configResultChange {
-	data, err := os.ReadFile(CONFIG_CHANGES_LOG)
-	if err != nil {
-		return nil
-	}
-	var changes []configResultChange
-	cycle := 0
-	timestamp := ""
-	device := ""
-	for _, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" {
-			continue
-		}
-		if n := lineCycleNumber(line); n > 0 {
-			cycle = n
-		}
-		if ts := lineTimestamp(line); ts != "" {
-			timestamp = ts
-		}
-		if strings.Contains(line, "Device:") && strings.Contains(line, "config space change detected") {
-			device = parseBDFAfterMarker(line, "Device:")
-			continue
-		}
-		if !strings.Contains(line, "Value at offset") || device == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		offset := ""
-		before := ""
-		after := ""
-		for i, field := range fields {
-			switch field {
-			case "offset":
-				if i+1 < len(fields) {
-					offset = fields[i+1]
-				}
-			case "from":
-				if i+1 < len(fields) {
-					before = fields[i+1]
-				}
-			case "to":
-				if i+1 < len(fields) {
-					after = fields[i+1]
-				}
-			}
-		}
-		if offset != "" {
-			changes = append(changes, configResultChange{cycle, timestamp, device, offset, before, after})
-		}
-	}
-	return changes
-}
-
-func latestTestSession(data []byte) []byte {
-	marker := []byte("#########Start to test#########")
-	markerAt := bytes.LastIndex(data, marker)
-	if markerAt < 0 {
-		return data
-	}
-	startAt := bytes.LastIndex(data[:markerAt], []byte("===== Cycle "))
-	if startAt < 0 {
-		return data[markerAt:]
-	}
-	return data[startAt:]
-}
-
 func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 	var startedAt time.Time
 	totalCycles := 0
@@ -4153,22 +3719,6 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 	return result
 }
 
-func formatRatio(ratio float64) string { return fmt.Sprintf("%.0f%% of cycles", ratio*100) }
-
-func resultStatus(changes int) string {
-	if changes > 0 {
-		return "FAIL"
-	}
-	return "PASS"
-}
-
-func resultInfoStatus(changes int) string {
-	if changes > 0 {
-		return "INFO"
-	}
-	return "PASS"
-}
-
 func writeResultReportWithStatus(checkpoint bool, statusOverride string) error {
 	result := buildResultReport(checkpoint, statusOverride)
 	data, err := json.MarshalIndent(result, "", "  ")
@@ -4253,109 +3803,6 @@ function render(d) {
 document.getElementById('severity').addEventListener('change',()=>window.current&&render(window.current));
 fetch('/api/result',{cache:'no-store'}).then(r=>r.json()).then(d=>{window.current=d;render(d)}).catch(e=>{document.getElementById('reason').textContent='Unable to load /lpot/result.json: '+e});
 </script></body></html>`
-
-func dashboardLogPath(name string) string {
-	switch name {
-	case "result":
-		return RESULT_FILE
-	case "summary":
-		return REBOOT_LOG
-	case "lspci":
-		return LPOTSCAN_LOG
-	case "config_space":
-		return CONFIG_CHANGES_LOG
-	default:
-		return ""
-	}
-}
-
-func startDashboard() error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, dashboardHTML)
-	})
-	mux.HandleFunc("/api/result", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		data, err := os.ReadFile(RESULT_FILE)
-		if os.IsNotExist(err) {
-			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprint(w, `{"status":"EMPTY","message":"No LPOT result is available. Run a normal test with -t first."}`)
-			return
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Write(data)
-	})
-	mux.HandleFunc("/api/log", func(w http.ResponseWriter, r *http.Request) {
-		path := dashboardLogPath(r.URL.Query().Get("name"))
-		if path == "" {
-			http.NotFound(w, r)
-			return
-		}
-		data, err := os.ReadFile(path)
-		if os.IsNotExist(err) {
-			http.NotFound(w, r)
-			return
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if r.URL.Query().Get("name") == "result" {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		} else {
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		}
-		w.Write(data)
-	})
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return fmt.Errorf("start dashboard listener: %w", err)
-	}
-	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	url := "http://" + listener.Addr().String()
-	fmt.Printf("LPOT dashboard listening at %s\n", url)
-	go openDashboardBrowser(url)
-	errs := make(chan error, 1)
-	go func() { errs <- server.Serve(listener) }()
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
-	select {
-	case <-signals:
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return server.Shutdown(ctx)
-	case err := <-errs:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return fmt.Errorf("dashboard server stopped: %w", err)
-	}
-}
-
-func openDashboardBrowser(url string) {
-	for _, path := range []string{"/usr/bin/xdg-open", "/bin/xdg-open"} {
-		if _, err := os.Stat(path); err != nil {
-			continue
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := exec.CommandContext(ctx, path, url).Run()
-		cancel()
-		if err == nil {
-			return
-		}
-	}
-	fmt.Fprintln(os.Stderr, "Suggestion: open the dashboard URL manually because xdg-open was unavailable or failed.")
-}
 
 // generateFinalSummary generates the final test summary and appends to reboot.log
 func generateFinalSummary() {

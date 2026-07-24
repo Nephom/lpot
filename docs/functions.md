@@ -4,6 +4,10 @@ This is a focused guide to the functions that define the program's behavior.
 It is not generated API documentation; the source remains the authoritative
 reference.
 
+The implementation is intentionally still `package main`; the files are split
+by responsibility first so behavior can be verified before introducing
+`internal/` packages.
+
 ## Lifecycle and Signals
 
 - `main`: validates the host, parses flags, initializes state, executes one

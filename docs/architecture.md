@@ -2,9 +2,19 @@
 
 ## Scope
 
-The executable is a single Go package (`package main`) with no third-party Go
-dependencies. It coordinates Linux sysfs, `lspci`, PCI configuration files,
-systemd, and reboot persistence.
+The executable remains a single Go package (`package main`) with no third-party
+Go dependencies, split across responsibility-focused files. It coordinates
+Linux sysfs, `lspci`, PCI configuration files, systemd, and reboot persistence.
+
+Current file boundaries are:
+
+- `main.go`: CLI parsing, startup, reboot-cycle orchestration, PCI comparison.
+- `result_types.go` and `result_helpers.go`: structured result data and log
+  aggregation helpers.
+- `dashboard.go`: loopback HTTP server, fixed artifact allowlist, and browser
+  launcher.
+- `systemd.go`: systemd service, host policy preparation, and SELinux handling.
+- `runtime.go`: root-owned runtime file checks, safe writes, and shell quoting.
 
 ## Startup Flow
 

@@ -3,6 +3,10 @@
 ## Repository Layout
 
 - `main.go`: executable and implementation.
+- `result_types.go`, `result_helpers.go`: structured report model and parsing.
+- `dashboard.go`: local read-only dashboard server.
+- `systemd.go`: systemd and host policy integration.
+- `runtime.go`: secure runtime file primitives and operator error reporting.
 - `go.mod`: Go module metadata.
 - `docs/`: operational, architectural, function, and development documentation.
 
