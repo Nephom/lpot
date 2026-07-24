@@ -386,7 +386,11 @@ func loadPCIeFilterOverrides(path string) (pcieFilterOverrides, error) {
 			// Bare BDF (no sign) is treated as include for convenience.
 			sign = '+'
 		}
-		bdf := normalizeBDF(strings.Fields(line)[0])
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		bdf := normalizeBDF(fields[0])
 		if !shortBDFRegex.MatchString(bdf) && !bdfRegex.MatchString(bdf) {
 			continue
 		}
@@ -533,6 +537,8 @@ var (
 	systemctlPath     string
 	rebootPath        string
 	configScanLogPath string
+	setenforcePath    string
+	ufwPath           string
 )
 
 // trustedBinDirs is the allow-list of system directories in which the standard
@@ -582,6 +588,10 @@ func resolveBinaries() error {
 			break
 		}
 	}
+	// These commands are optional and are handled as best-effort controls for
+	// distributions where the corresponding security facility is installed.
+	setenforcePath, _ = exec.LookPath("setenforce")
+	ufwPath, _ = exec.LookPath("ufw")
 	return nil
 }
 
@@ -627,8 +637,20 @@ func secureLpotDir() error {
 			return fmt.Errorf("chmod %s to 0700: %w", LPOT_DIR, err)
 		}
 	}
-	if err := os.MkdirAll(TMP_DIR, 0700); err != nil {
-		return fmt.Errorf("create %s: %w", TMP_DIR, err)
+	tmpInfo, err := os.Lstat(TMP_DIR)
+	if err == nil {
+		if tmpInfo.Mode()&os.ModeSymlink != 0 || !tmpInfo.IsDir() {
+			return fmt.Errorf("%s must be a real directory", TMP_DIR)
+		}
+	} else if os.IsNotExist(err) {
+		if err := os.MkdirAll(TMP_DIR, 0700); err != nil {
+			return fmt.Errorf("create %s: %w", TMP_DIR, err)
+		}
+	} else {
+		return fmt.Errorf("stat %s: %w", TMP_DIR, err)
+	}
+	if err := os.Chmod(TMP_DIR, 0700); err != nil {
+		return fmt.Errorf("chmod %s: %w", TMP_DIR, err)
 	}
 	return nil
 }
@@ -1073,46 +1095,112 @@ WantedBy=graphical.target
 	return nil
 }
 
-// selinuxConfigPath and setenforceRunner are package-level variables so tests
-// can redirect the path into a temp directory and stub out the kernel-level
-// setenforce(8) call. Production always points at the real /etc location.
+// selinuxConfigPath is kept as a variable so the Linux SELinux configuration
+// path is explicit and easy to inspect in diagnostics.
 var (
 	selinuxConfigPath = "/etc/selinux/config"
-	setenforceRunner  = func() { _ = exec.Command("setenforce", "0").Run() }
 )
 
-// disableSELinux best-effort puts SELinux into permissive+disabled across a
-// reboot. It is intentionally safe to call on non-SELinux distributions: when
-// /etc/selinux/config is absent the function returns silently. If the path is
-// a symlink we refuse to modify it to avoid being redirected into an unrelated
-// system file.
-func disableSELinux() {
+// disableSELinux best-effort puts SELinux into permissive mode immediately and
+// disabled mode across the next reboot. It is safe on distributions without
+// SELinux: a missing config file is treated as "not installed". The config
+// rewrite handles enforcing, permissive, and whitespace variants.
+func disableSELinux() error {
 	info, err := os.Lstat(selinuxConfigPath)
 	if err != nil {
-		// Missing config is the expected state on systems without SELinux
-		// (Debian/Ubuntu/Arch default, Alpine, most embedded Linux). Any other
-		// stat error is also treated as "nothing to do": we have no safe way
-		// to proceed without knowing what is at the path.
-		return
+		// Missing config is normal on Ubuntu installations without SELinux and
+		// on systems where SELinux was not installed.
+		return nil
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		fmt.Fprintf(os.Stderr, "Refusing to modify %s: path is a symlink\n", selinuxConfigPath)
-		return
+		return fmt.Errorf("refusing to modify %s: path is a symlink", selinuxConfigPath)
 	}
 
-	// Temporarily switch the running kernel into permissive mode. The binary
-	// is absent on non-SELinux systems; Run() simply returns an error that we
-	// deliberately ignore so the caller behaves identically either way.
-	setenforceRunner()
+	// Temporarily switch the running kernel into permissive mode. The command
+	// is absent on non-SELinux systems, so there is nothing to do in that case.
+	if setenforcePath != "" {
+		if _, err := runExternal(systemctlTimeout, setenforcePath, "0"); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: setenforce 0 failed: %v\n", err)
+		}
+	}
 
 	data, err := os.ReadFile(selinuxConfigPath)
 	if err != nil {
-		return
+		return fmt.Errorf("failed to read %s: %w", selinuxConfigPath, err)
 	}
-	content := strings.ReplaceAll(string(data), "SELINUX=enforcing", "SELINUX=disabled")
+	lines := strings.Split(string(data), "\n")
+	found := false
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "SELINUX=") {
+			lines[i] = "SELINUX=disabled"
+			found = true
+		}
+	}
+	if !found {
+		lines = append(lines, "SELINUX=disabled")
+	}
+	content := strings.Join(lines, "\n")
 	if err := writeFileNoFollow(selinuxConfigPath, []byte(content), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to update %s: %v\n", selinuxConfigPath, err)
+		return fmt.Errorf("failed to update %s: %w", selinuxConfigPath, err)
 	}
+	return nil
+}
+
+// systemdUnitExists distinguishes a missing optional unit from a unit that is
+// installed but currently inactive. The latter must still be disabled for the
+// next reboot.
+func systemdUnitExists(unit string) bool {
+	out, err := runExternal(systemctlTimeout, systemctlPath, "cat", unit)
+	return err == nil && len(bytes.TrimSpace(out)) > 0
+}
+
+// stopAndDisableUnit stops an installed unit and disables it when it is enabled.
+// Missing units are normal across RHEL, SLES, and Ubuntu and return nil.
+func stopAndDisableUnit(unit string) error {
+	if !systemdUnitExists(unit) {
+		return nil
+	}
+	if _, err := runExternal(systemctlTimeout, systemctlPath, "stop", unit); err != nil {
+		return fmt.Errorf("failed to stop %s: %w", unit, err)
+	}
+	if state, err := runExternal(systemctlTimeout, systemctlPath, "is-enabled", unit); err == nil && strings.TrimSpace(string(state)) == "enabled" {
+		if _, err := runExternal(systemctlTimeout, systemctlPath, "disable", unit); err != nil {
+			return fmt.Errorf("failed to disable %s: %w", unit, err)
+		}
+	}
+	return nil
+}
+
+// disableFirewall stops and disables firewall services used by RHEL, SLES,
+// and Ubuntu families. Missing services are expected and never abort the test.
+// The explicit service list also covers older SLES installations that still
+// expose SuSEfirewall2 rather than firewalld/nftables.
+func disableFirewall() error {
+	services := []string{
+		"firewalld",
+		"ufw",
+		"nftables",
+		"iptables",
+		"ip6tables",
+		"SuSEfirewall2",
+	}
+	for _, service := range services {
+		if err := stopAndDisableUnit(service); err != nil {
+			return err
+		}
+	}
+	if ufwPath != "" {
+		if _, err := runExternal(systemctlTimeout, ufwPath, "disable"); err != nil {
+			return fmt.Errorf("failed to disable ufw: %w", err)
+		}
+	}
+	return nil
+}
+
+// disableAppArmor stops and disables Ubuntu's AppArmor service. RHEL and SLES
+// normally do not install it, so a missing unit is intentionally harmless.
+func disableAppArmor() error {
+	return stopAndDisableUnit("apparmor")
 }
 
 // Reset lpot directory
@@ -1287,8 +1375,21 @@ func main() {
 			*waitHours, *waitSeconds, *standbyTime, *stopService)
 	}
 
-	// Disable SELinux
-	disableSELinux()
+	// The test host is dedicated lab hardware. Disable host firewall and
+	// mandatory access-control services before installing the reboot service so
+	// the PCI test is not blocked by distro-specific policy.
+	if err := disableFirewall(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to disable firewall: %v\n", err)
+		os.Exit(1)
+	}
+	if err := disableAppArmor(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to disable AppArmor: %v\n", err)
+		os.Exit(1)
+	}
+	if err := disableSELinux(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to configure SELinux: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Create reboot script if not exists
 	if err := createRebootScript(os.Args); err != nil {
@@ -2605,9 +2706,15 @@ func analyzeStableConfig(samples []map[string][]byte) map[string]StableConfig {
 			if majorityCount >= stableThreshold {
 				stableData[i] = majorityVal
 			} else {
-				// Unstable: timer noise. Flag and keep the first sample as placeholder.
+				// Unstable: timer noise. Keep an available sample as a placeholder;
+				// device config files can legitimately have different lengths.
 				unstable[i] = true
-				stableData[i] = deviceSamples[0][i]
+				for _, sample := range deviceSamples {
+					if len(sample) > i {
+						stableData[i] = sample[i]
+						break
+					}
+				}
 			}
 		}
 
@@ -2636,7 +2743,8 @@ func loadIgnoreList(filePath string) (map[string]bool, error) {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		rawLine := scanner.Text()
+		line := strings.TrimSpace(rawLine)
 
 		// Skip empty lines and comments
 		if len(line) == 0 || strings.HasPrefix(line, "#") {
@@ -2698,7 +2806,8 @@ func parseDeviceFile(filePath string, ignoreSet map[string]bool) (Device, error)
 	isDevLnk := false
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		rawLine := scanner.Text()
+		line := strings.TrimSpace(rawLine)
 
 		// Extract device ID from the first line
 		if currentDevice.DeviceID == "" && len(line) >= 7 {
@@ -2709,10 +2818,13 @@ func parseDeviceFile(filePath string, ignoreSet map[string]bool) (Device, error)
 			} else {
 				currentDevice.DeviceID = line[:7]
 			}
-			remainingDesc := strings.TrimSpace(line[7:])
+			remainingDesc := ""
+			if len(fields) > 0 {
+				remainingDesc = strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
+			}
 
 			// Check if this device should be ignored
-			if ignoreSet[currentDevice.DeviceID] {
+			if ignoreSet[normalizeBDF(currentDevice.DeviceID)] {
 				return currentDevice, fmt.Errorf("device %s is in ignore list", currentDevice.DeviceID)
 			}
 
@@ -2749,8 +2861,8 @@ func parseDeviceFile(filePath string, ignoreSet map[string]bool) (Device, error)
 			}
 
 			// Handle continuation lines (indented with tab)
-			if strings.HasPrefix(line, "\t") && currentFieldName != "" {
-				currentFieldValue.WriteString(" " + strings.TrimSpace(line))
+			if strings.HasPrefix(rawLine, "\t") && currentFieldName != "" {
+				currentFieldValue.WriteString(" " + strings.TrimSpace(rawLine))
 				continue
 			}
 

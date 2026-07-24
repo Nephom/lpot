@@ -1,8 +1,8 @@
-# LPOT Integrated
+# LPOT
 
-LPOT Integrated is a Go implementation of a Linux PCIe reboot-stability test
-tool. It combines the original LPOT, `configscan`, and `lpotscan` workflow into
-one executable and is maintained as an integrated version of
+LPOT is a Go implementation of a Linux PCIe reboot-stability test tool. It
+combines the original LPOT, `configscan`, and `lpotscan` workflow into one
+executable and is maintained as an integrated version of
 [Nephom/lpot](https://github.com/Nephom/lpot).
 
 The tool records PCI topology, `lspci` output, and PCI configuration-space
@@ -14,7 +14,8 @@ explicit per-device overrides.
 
 This is a system-level test tool, not a desktop utility. A normal run requires
 root on a Linux host and can reboot that host repeatedly. It accesses
-`/sys/bus/pci`, writes under `/lpot`, modifies the SELinux configuration when
+`/sys/bus/pci`, writes under `/lpot`, stops/disables firewall services,
+stops/disables AppArmor when present, changes the SELinux configuration when
 present, installs a systemd service, and invokes `reboot` unless debug mode is
 enabled. Use it only on a disposable or explicitly reserved test system.
 
@@ -36,6 +37,7 @@ enabled. Use it only on a disposable or explicitly reserved test system.
 - Go 1.19 or newer for building.
 - `lspci` from the `pciutils` package.
 - `systemd` for reboot persistence during a normal run.
+- A root-owned lab host where firewall, SELinux, and AppArmor can be disabled.
 - A test host whose reboot can be interrupted or observed safely.
 
 The project targets Linux only. macOS may be used as the local development
@@ -92,6 +94,59 @@ sudo ./lpot -p
 # Reset the runtime directory. Review the target host before using this.
 sudo ./lpot -r
 ```
+
+## Runtime Flow
+
+The normal execution path is shown below. The same binary is restarted by
+systemd after each reboot, so the cycle returns to startup until the timestamp
+expires or the operator stops it.
+
+```mermaid
+flowchart TD
+    A[Start lpot as root] --> B[Resolve lspci systemctl reboot]
+    B --> C[Create or verify /lpot]
+    C --> D[Parse command-line options]
+    D -->|help reset scan classify| E[Run special mode and exit]
+    D --> F[Stop and disable firewall services]
+    F --> G[Stop and disable AppArmor if present]
+    G --> H[Set SELinux permissive now and disabled on reboot]
+    H --> I[Create reboot.sh and systemd service]
+    I --> J[Increment reboot counter]
+    J --> K[Discover PCI BDFs]
+    K --> L[Classify endpoints and apply pcie_filter.txt]
+    L --> M[Wait for drivers]
+    M --> N[Scan volatile config bytes if needed]
+    N --> O[Capture lspci and PCI config snapshots]
+    O --> P[Compare topology, lspci, and config space]
+    P --> Q[Write cycle summary]
+    Q --> R{Debug mode or stop requested?}
+    R -->|debug| S[Log reboot skipped]
+    R -->|stop| T[Exit without reboot]
+    R -->|no| U[Wait before reboot]
+    U --> V[Reboot host]
+    V --> W[systemd starts /lpot/reboot.sh after boot]
+    W --> A
+```
+
+## Host Policy Preparation
+
+On normal runs the program performs distribution-aware host preparation.
+Missing services are expected and do not abort the run; an installed service
+that cannot be stopped/disabled aborts the run before the reboot service is
+created:
+
+- RHEL: `firewalld`, `nftables`, `iptables`, and SELinux are handled when
+  installed.
+- SLES: `firewalld`, `nftables`, `iptables`, and legacy `SuSEfirewall2` are
+  handled when installed; SELinux is handled if installed.
+- Ubuntu: `ufw`, `nftables`, `iptables`, and AppArmor are handled when
+  installed; SELinux is handled if installed.
+
+Firewall units are stopped and disabled. `ufw disable` is also invoked when
+available. AppArmor is stopped and disabled when its service exists. SELinux is
+set to permissive for the current boot and `SELINUX=disabled` is written to
+`/etc/selinux/config` for subsequent boots. This behavior is intended only for
+dedicated laboratory machines.
 
 Options:
 

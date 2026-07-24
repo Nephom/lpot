@@ -31,6 +31,9 @@ reference.
 - `setupSystemdService`: creates the systemd unit once and rejects a symlink at
   the service path.
 - `disableSELinux`: best-effort SELinux configuration update with symlink refusal.
+- `disableFirewall`: stops/disables common RHEL, SLES, and Ubuntu firewall
+  services and invokes `ufw disable` when available.
+- `disableAppArmor`: stops/disables the Ubuntu AppArmor service when present.
 
 ## PCI Discovery and Filtering
 

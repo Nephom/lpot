@@ -15,8 +15,10 @@ systemd, and reboot persistence.
    directory with mode `0700`.
 5. Flags are parsed and special modes (`-h`, `-r`, `-scan`, `-classify`) exit
    before the reboot loop.
-6. Normal mode prepares the reboot script and systemd service, then records the
-   cycle state under `/lpot`.
+6. Normal mode stops/disables common firewall services and AppArmor when
+   present, sets SELinux permissive for the current boot and disabled for the
+   next boot, then prepares the reboot script and systemd service.
+7. The cycle state is recorded under `/lpot`.
 
 ## Reboot Cycle
 
@@ -49,7 +51,8 @@ next boot. Creation uses `O_EXCL|O_NOFOLLOW`; pre-existing symlinks are rejected
 
 ## Known Limitations
 
-The raw configuration parser has a known first-device-header edge case in
-`splitDevices()`. A future parser should process headers line by line rather
-than relying on the current byte separator. A remote host manager, report
-collector, and dashboard are also planned but are not part of this executable.
+The executable assumes `lspci`, systemd, and the Linux PCI sysfs interface are
+available. Optional distro components may be absent, but an installed firewall
+or mandatory-access-control service that cannot be stopped causes startup to
+abort. A remote host manager, report collector, and dashboard are not part of
+this executable.

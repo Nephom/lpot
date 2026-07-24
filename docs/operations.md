@@ -2,11 +2,12 @@
 
 ## Safety
 
-LPOT Integrated is a Linux system-level test tool. A normal run requires root,
-writes under `/lpot`, installs `lpot_reboot.service`, changes SELinux settings
-when present, and invokes `reboot`. Run it only on a reserved test host. Use
-`-g` while validating command-line behavior because debug mode never invokes
-the reboot command.
+LPOT is a Linux system-level test tool. A normal run requires root, writes
+under `/lpot`, stops/disables firewall services, stops/disables AppArmor when
+present, changes SELinux settings when present, installs `lpot_reboot.service`,
+and invokes `reboot`. Run it only on a reserved laboratory host. Use `-g`
+while validating command-line behavior because debug mode never invokes the
+reboot command.
 
 ## Requirements
 
@@ -14,12 +15,27 @@ the reboot command.
 - Go 1.19 or newer for building.
 - `lspci` from `pciutils`.
 - `systemd` for persistence across reboots.
+- Permission to disable firewall and mandatory access-control services on the
+  dedicated test host.
 - A test host where repeated reboots are expected and safe.
 
 ## Build and Validation
 
 ```bash
+GOOS=linux GOARCH=amd64 go build -o lpot .
 ```
+
+The runtime preparation is distribution-aware across RHEL, SLES, and Ubuntu.
+Missing optional services are ignored, but a detected service that cannot be
+stopped/disabled aborts before the reboot service is created:
+
+- Firewall services: `firewalld`, `ufw`, `nftables`, `iptables`, `ip6tables`,
+  and legacy `SuSEfirewall2` are stopped and disabled when present.
+- AppArmor: the `apparmor` service is stopped and disabled when present.
+- SELinux: `setenforce 0` is attempted immediately, and
+  `/etc/selinux/config` is set to `SELINUX=disabled` for the next boot.
+
+An absent service is normal for a given distribution and is not an error.
 
 ## Command-Line Modes
 
