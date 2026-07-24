@@ -1,3 +1,3 @@
-module lpot_integrated
+module lpot
 
 go 1.19

@@ -13,7 +13,7 @@ excluded by `.gitignore`.
 ## Linux Target Build
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -o lpot_integrated .
+GOOS=linux GOARCH=amd64 go build -o lpot .
 ```
 
 The command may be run from the macOS development environment and produces a

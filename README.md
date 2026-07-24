@@ -44,7 +44,7 @@ environment, but it must produce a Linux binary through cross-compilation.
 ## Linux Build
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -o lpot_integrated .
+GOOS=linux GOARCH=amd64 go build -o lpot .
 ```
 
 The command above can be run from macOS or another development host. The
@@ -57,7 +57,7 @@ analysis can be run in a compatible Go environment with:
 
 ```bash
 go vet ./...
-go build -o lpot_integrated .
+go build -o lpot .
 ```
 
 Install the resulting binary on a Linux test host as appropriate for your
@@ -68,29 +68,29 @@ environment. The default `.gitignore` excludes generated reports and artifacts.
 Always inspect the help output from the exact binary being tested:
 
 ```bash
-sudo ./lpot_integrated -h
+sudo ./lpot -h
 ```
 
 Common commands:
 
 ```bash
 # Dry-run endpoint classification; does not start a reboot test.
-sudo ./lpot_integrated -classify
+sudo ./lpot -classify
 
 # Generate the volatile PCI configuration-byte ignore list and exit.
-sudo ./lpot_integrated -scan
+sudo ./lpot -scan
 
 # Two-hour debug run; debug mode does not invoke reboot.
-sudo ./lpot_integrated -g -t 2
+sudo ./lpot -g -t 2
 
 # Twenty-four hours, waiting 600 seconds before each reboot.
-sudo ./lpot_integrated -t 24 -s 600
+sudo ./lpot -t 24 -s 600
 
 # Stop after a detected comparison error.
-sudo ./lpot_integrated -p
+sudo ./lpot -p
 
 # Reset the runtime directory. Review the target host before using this.
-sudo ./lpot_integrated -r
+sudo ./lpot -r
 ```
 
 Options:

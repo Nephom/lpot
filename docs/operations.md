@@ -24,13 +24,13 @@ the reboot command.
 ## Command-Line Modes
 
 ```bash
-sudo ./lpot_integrated -h
-sudo ./lpot_integrated -classify
-sudo ./lpot_integrated -scan
-sudo ./lpot_integrated -g -t 2
-sudo ./lpot_integrated -t 24 -s 600
-sudo ./lpot_integrated -p
-sudo ./lpot_integrated -r
+sudo ./lpot -h
+sudo ./lpot -classify
+sudo ./lpot -scan
+sudo ./lpot -g -t 2
+sudo ./lpot -t 24 -s 600
+sudo ./lpot -p
+sudo ./lpot -r
 ```
 
 | Option | Description | Default |

@@ -591,7 +591,7 @@ func resolveBinaries() error {
 // later with a partially-initialised state.
 func ensureRoot() {
 	if os.Geteuid() != 0 {
-		fmt.Fprintln(os.Stderr, "lpot_integrated must be run as root (effective uid 0).")
+		fmt.Fprintln(os.Stderr, "lpot must be run as root (effective uid 0).")
 		os.Exit(1)
 	}
 }
@@ -1152,7 +1152,7 @@ func resetLpotDirectory() {
 		return nil
 	})
 
-	fmt.Println("Reset completed. You can now run lpot_integrated with normal parameters.")
+	fmt.Println("Reset completed. You can now run lpot with normal parameters.")
 }
 
 // Show help
