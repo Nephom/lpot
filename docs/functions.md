@@ -8,6 +8,8 @@ reference.
 
 - `main`: validates the host, parses flags, initializes state, executes one
   reboot cycle, and schedules the next cycle through systemd.
+- `runDryRunAudit`: performs read-only host inspection and prints all planned
+  commands, mutations, and known file contents without writing anything.
 - `setupSignalHandlers`: turns SIGINT/SIGTERM into `stopFlag` and context
   cancellation.
 - `sleepInterruptible`: waits for a duration while responding to context

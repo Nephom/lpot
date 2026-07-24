@@ -53,6 +53,7 @@ const (
 	// lets users correlate events by plain text search and by tools like
 	// `sort -k1,2` without translation.
 	logTimeFormat = "2006-01-02 15:04:05"
+	version       = "2.2.0"
 )
 
 // bdfRegex matches a canonical PCI BDF, optionally with a 4-digit domain:
@@ -110,8 +111,8 @@ var (
 	// legacy code path keep working unchanged. skippedDevicesGlobal records
 	// the BDFs that were filtered out, with their classification reason, so
 	// the final summary can list them in a dedicated section.
-	endpointFilterSet     map[string]bool
-	skippedDevicesGlobal  []deviceClassification
+	endpointFilterSet    map[string]bool
+	skippedDevicesGlobal []deviceClassification
 
 	// Statistics tracking
 	testStartTime                   time.Time
@@ -608,7 +609,7 @@ func ensureRoot() {
 
 // secureLpotDir ensures LPOT_DIR exists as a real directory owned by root and
 // not reachable through a symlink. Permissions are tightened to 0700 so that
-	// only root can read the accumulated logs and ignore_list.txt.
+// only root can read the accumulated logs and ignore_list.txt.
 func secureLpotDir() error {
 	info, err := os.Lstat(LPOT_DIR)
 	if err != nil {
@@ -1042,20 +1043,7 @@ func setupSystemdService() error {
 	servicePath := "/etc/systemd/system/lpot_reboot.service"
 	scriptPath := filepath.Join(LPOT_DIR, "reboot.sh")
 
-	serviceContent := fmt.Sprintf(`[Unit]
-Description=The systemd setup file for PCIE check
-After=graphical.target
-
-[Service]
-ExecStart=%s
-Restart=no
-User=root
-Group=root
-WorkingDirectory=/lpot
-
-[Install]
-WantedBy=graphical.target
-`, scriptPath)
+	serviceContent := systemdServiceContent(scriptPath)
 
 	// O_CREATE|O_EXCL|O_NOFOLLOW: either we create the unit file freshly or we
 	// treat its pre-existence as success. This avoids both the Stat/Create race
@@ -1071,16 +1059,19 @@ WantedBy=graphical.target
 			if info.Mode()&os.ModeSymlink != 0 {
 				return fmt.Errorf("refusing to use %s: path is a symlink", servicePath)
 			}
-			return nil
+			// The unit may exist but still need daemon-reload/enable. Continue
+			// through the common systemd activation path below.
+		} else {
+			return fmt.Errorf("failed to create systemd service file: %v", err)
 		}
-		return fmt.Errorf("failed to create systemd service file: %v", err)
-	}
-	if _, err := f.WriteString(serviceContent); err != nil {
-		f.Close()
-		return fmt.Errorf("failed to write systemd service file: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("failed to close systemd service file: %v", err)
+	} else {
+		if _, err := f.WriteString(serviceContent); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to write systemd service file: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("failed to close systemd service file: %v", err)
+		}
 	}
 
 	// Reload systemd daemon
@@ -1094,6 +1085,23 @@ WantedBy=graphical.target
 	}
 
 	return nil
+}
+
+func systemdServiceContent(scriptPath string) string {
+	return fmt.Sprintf(`[Unit]
+Description=LPOT PCIe reboot stability test
+After=local-fs.target
+
+[Service]
+ExecStart=%s
+Restart=no
+User=root
+Group=root
+WorkingDirectory=/lpot
+
+[Install]
+WantedBy=multi-user.target
+`, scriptPath)
 }
 
 // selinuxConfigPath is kept as a variable so the Linux SELinux configuration
@@ -1257,17 +1265,197 @@ func resetLpotDirectory() {
 	fmt.Println("Reset completed. You can now run lpot with normal parameters.")
 }
 
+// printDryRunFile reports a complete text payload without opening the target
+// for writing. It intentionally reads an existing regular file only to make
+// the audit output explain whether the normal O_EXCL/write path would create,
+// skip, or replace it.
+func printDryRunFile(path, action string, mode os.FileMode, content string) {
+	state := "WOULD CREATE"
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			state = "WOULD REFUSE (symlink exists)"
+		} else {
+			state = "WOULD USE EXISTING"
+			if action == "replace" {
+				state = "WOULD REPLACE"
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		state = fmt.Sprintf("WOULD INSPECT (stat failed: %v)", err)
+	}
+
+	fmt.Printf("[DRY-RUN] %s %s mode=%#o\n", state, path, mode.Perm())
+	fmt.Printf("[DRY-RUN] CONTENT BEGIN %s\n%s[DRY-RUN] CONTENT END %s\n", path, content, path)
+}
+
+func printDryRunCommand(name string, args ...string) {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, name)
+	for _, arg := range args {
+		parts = append(parts, shellQuote(arg))
+	}
+	fmt.Printf("[DRY-RUN] WOULD EXEC %s\n", strings.Join(parts, " "))
+}
+
+func printDryRunReadCommand(timeout time.Duration, name string, args ...string) []byte {
+	printDryRunCommand(name, args...)
+	out, err := runExternal(timeout, name, args...)
+	if err != nil {
+		fmt.Printf("[DRY-RUN] READ COMMAND FAILED: %v\n", err)
+		return nil
+	}
+	fmt.Printf("[DRY-RUN] COMMAND OUTPUT BEGIN %s\n%s[DRY-RUN] COMMAND OUTPUT END %s\n",
+		name, string(out), name)
+	return out
+}
+
+// runDryRunAudit performs the read-only portion of startup and prints every
+// planned mutation. It is deliberately separate from the normal execution
+// path: a dry run must remain safe even when a future write is added to the
+// reboot loop and its author forgets to add another guard.
+func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stopService bool) {
+	fmt.Println("[DRY-RUN] audit mode enabled; no filesystem or host-state mutation will occur")
+	fmt.Printf("[DRY-RUN] parameters: duration=%dh driver-delay=%ds reboot-delay=%ds stop-on-error=%t\n",
+		waitHours, standbyTime, waitSeconds, stopService)
+
+	if info, err := os.Lstat(LPOT_DIR); err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("[DRY-RUN] WOULD MKDIR %s mode=0700\n", LPOT_DIR)
+		} else {
+			fmt.Printf("[DRY-RUN] READ %s failed: %v\n", LPOT_DIR, err)
+		}
+	} else {
+		fmt.Printf("[DRY-RUN] READ %s exists mode=%#o directory=%t symlink=%t\n",
+			LPOT_DIR, info.Mode().Perm(), info.IsDir(), info.Mode()&os.ModeSymlink != 0)
+	}
+	if info, err := os.Lstat(TMP_DIR); err != nil && os.IsNotExist(err) {
+		fmt.Printf("[DRY-RUN] WOULD MKDIR %s mode=0700\n", TMP_DIR)
+	} else if err == nil {
+		fmt.Printf("[DRY-RUN] READ %s exists mode=%#o directory=%t symlink=%t\n",
+			TMP_DIR, info.Mode().Perm(), info.IsDir(), info.Mode()&os.ModeSymlink != 0)
+	}
+
+	services := []string{"firewalld", "ufw", "nftables", "iptables", "ip6tables", "SuSEfirewall2", "apparmor"}
+	for _, service := range services {
+		if systemdUnitExists(service) {
+			printDryRunCommand(systemctlPath, "stop", service)
+			printDryRunCommand(systemctlPath, "is-enabled", service)
+			printDryRunCommand(systemctlPath, "disable", service)
+		} else {
+			fmt.Printf("[DRY-RUN] READ systemd unit %s: absent (skip)\n", service)
+		}
+	}
+	if ufwPath != "" {
+		printDryRunCommand(ufwPath, "disable")
+	}
+
+	if info, err := os.Lstat(selinuxConfigPath); err == nil && info.Mode()&os.ModeSymlink == 0 {
+		if setenforcePath != "" {
+			printDryRunCommand(setenforcePath, "0")
+		}
+		if data, readErr := os.ReadFile(selinuxConfigPath); readErr == nil {
+			lines := strings.Split(string(data), "\n")
+			found := false
+			for i, line := range lines {
+				if strings.HasPrefix(strings.TrimSpace(line), "SELINUX=") {
+					lines[i] = "SELINUX=disabled"
+					found = true
+				}
+			}
+			if !found {
+				lines = append(lines, "SELINUX=disabled")
+			}
+			printDryRunFile(selinuxConfigPath, "replace", 0644, strings.Join(lines, "\n"))
+		} else {
+			fmt.Printf("[DRY-RUN] READ %s failed: %v\n", selinuxConfigPath, readErr)
+		}
+	} else {
+		fmt.Printf("[DRY-RUN] READ %s: absent or symlink (no SELinux config write)\n", selinuxConfigPath)
+	}
+
+	executablePath, err := os.Executable()
+	if err != nil {
+		executablePath = args[0]
+		if !filepath.IsAbs(executablePath) {
+			executablePath, _ = filepath.Abs(executablePath)
+		}
+	}
+	var script strings.Builder
+	script.WriteString("#!/bin/sh\nexec ")
+	script.WriteString(shellQuote(executablePath))
+	for _, arg := range args[1:] {
+		script.WriteString(" ")
+		script.WriteString(shellQuote(arg))
+	}
+	script.WriteByte('\n')
+	printDryRunFile(filepath.Join(LPOT_DIR, "reboot.sh"), "create", 0700, script.String())
+
+	servicePath := "/etc/systemd/system/lpot_reboot.service"
+	printDryRunFile(servicePath, "create", 0644, systemdServiceContent(filepath.Join(LPOT_DIR, "reboot.sh")))
+	printDryRunCommand(systemctlPath, "daemon-reload")
+	printDryRunCommand(systemctlPath, "enable", "lpot_reboot.service")
+
+	nextCount := 1
+	if data, err := os.ReadFile(REBOOTCOUNT_FILE); err == nil {
+		if count, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil {
+			nextCount = count + 1
+		}
+	}
+	printDryRunFile(REBOOTCOUNT_FILE, "replace", 0600, fmt.Sprintf("%d\n", nextCount))
+	printDryRunFile(TIMESTAMP_FILE, "replace", 0644,
+		fmt.Sprintf("%d\n", time.Now().Add(time.Duration(waitHours)*time.Hour).Unix()))
+
+	fmt.Printf("[DRY-RUN] WOULD READ %s and discover PCI devices\n", SYS_PCI_DEVICES)
+	bdfs, err := fetchPCIBDFs()
+	if err != nil {
+		fmt.Printf("[DRY-RUN] READ PCI devices failed: %v\n", err)
+	} else {
+		overrides, filterErr := loadPCIeFilterOverrides(PCIE_FILTER_FILE)
+		if filterErr != nil {
+			overrides = pcieFilterOverrides{Include: map[string]bool{}, Exclude: map[string]bool{}}
+			fmt.Printf("[DRY-RUN] READ %s: absent/unreadable, using automatic classification\n", PCIE_FILTER_FILE)
+		}
+		kept, skipped := filterEndpoints(bdfs, overrides)
+		fmt.Printf("[DRY-RUN] PCI classification: kept=%d skipped=%d\n", len(kept), len(skipped))
+		initialOutput := printDryRunReadCommand(lspciTimeout, lspciPath, "-vv")
+		if len(initialOutput) > 0 {
+			printDryRunFile(INITIAL_PCI_DEVICES, "replace", 0644, string(initialOutput))
+		}
+		for _, bdf := range kept {
+			output := printDryRunReadCommand(lspciTimeout, lspciPath, "-s", bdf, "-vv")
+			if len(output) > 0 {
+				printDryRunFile(filepath.Join(TMP_DIR, bdf+"_init.txt"), "replace", 0644, string(output))
+				printDryRunFile(filepath.Join(TMP_DIR, bdf+".txt"), "replace", 0644, string(output))
+			} else {
+				fmt.Printf("[DRY-RUN] WOULD WRITE %s (content unavailable because read command failed)\n", filepath.Join(TMP_DIR, bdf+"_init.txt"))
+				fmt.Printf("[DRY-RUN] WOULD WRITE %s (content unavailable because read command failed)\n", filepath.Join(TMP_DIR, bdf+".txt"))
+			}
+		}
+	}
+
+	for _, path := range []string{
+		INITIAL_PCI_DEVICES, IGNORE_LIST_FILE, "/lpot/initial.bin", "/lpot/current.bin",
+		CONFIG_CHANGES_LOG, CLASSIFY_LOG, LPOTSCAN_LOG, REBOOT_LOG,
+	} {
+		fmt.Printf("[DRY-RUN] WOULD WRITE/UPDATE %s (content generated from read-only PCI scan and comparison)\n", path)
+	}
+	fmt.Printf("[DRY-RUN] WOULD REMOVE generated temporary snapshots under %s\n", TMP_DIR)
+	fmt.Printf("[DRY-RUN] WOULD WAIT %ds before reboot\n", waitSeconds)
+	printDryRunCommand(rebootPath)
+	fmt.Println("[DRY-RUN] audit complete; reboot command was not executed")
+}
+
 // Show help
 func showHelp(programName string) {
 	fmt.Printf("Usage: %s [OPTIONS]\n", programName)
-	fmt.Printf("Version: 2.1.0 (Integrated)\n")
+	fmt.Printf("Version: %s (Integrated)\n", version)
 	fmt.Printf("Author: Nephom,Chiang (Integrated by AI)\n")
 	fmt.Printf("OPTIONS:\n")
 	fmt.Printf("  -t <hours>   Setup runtime, default is 12 hours.\n")
 	fmt.Printf("  -d <secs>    Setup delay time for driver ready, default is 300 seconds.\n")
 	fmt.Printf("  -s <secs>    Setup delay time for reboot, default is 300 seconds.\n")
 	fmt.Printf("  -p           Set stop flag when Error occurred!\n")
-	fmt.Printf("  -g           Enable debug mode (disable reboot commands and show debug info).\n")
+	fmt.Printf("  -g           Dry-run audit mode; show commands and file contents without changing the host.\n")
 	fmt.Printf("  -r           Reset /lpot directory and clean all files.\n")
 	fmt.Printf("  -scan        Scan USB/bridge/volatile devices and write /lpot/ignore_list.txt, then exit.\n")
 	fmt.Printf("  -classify    Print PCI endpoint classification report and exit (dry-run).\n")
@@ -1276,7 +1464,7 @@ func showHelp(programName string) {
 	fmt.Printf("NOTE: Bridges and legacy PCI devices are filtered automatically. Override via %s.\n", PCIE_FILTER_FILE)
 	fmt.Printf("\nExample:\n")
 	fmt.Printf("  %s -t 24 -s 600    Run reboot during 24 hours and each reboot wait for 600 seconds\n", programName)
-	fmt.Printf("  %s -g -t 2         Run in debug mode for 2 hours without actual reboot\n", programName)
+	fmt.Printf("  %s -g -t 2         Print a read-only audit for a 2-hour run\n", programName)
 	fmt.Printf("  %s -r              Reset /lpot directory to clean state\n", programName)
 	fmt.Printf("  %s -scan           Only scan PCI devices and generate ignore bits file\n", programName)
 	fmt.Printf("  %s -classify       Preview which BDFs the endpoint filter will keep/skip\n", programName)
@@ -1303,33 +1491,37 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Ensure /lpot is a real root-owned directory with tight permissions. All
-	// persistent state files are addressed via absolute constants thereafter,
-	// so we no longer need to Chdir into it.
-	if err := secureLpotDir(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to secure %s: %v\n", LPOT_DIR, err)
-		os.Exit(1)
-	}
-
-	// Parse command line arguments
+	// Parse flags before touching /lpot so dry-run mode can guarantee that
+	// startup itself does not create or chmod any runtime directory.
 	var (
 		waitHours   = flag.Int("t", 12, "Setup runtime in hours")
 		standbyTime = flag.Int("d", 300, "Setup delay time for driver ready in seconds")
 		waitSeconds = flag.Int("s", 300, "Setup delay time for reboot in seconds")
 		stopService = flag.Bool("p", false, "Set stop flag when error occurred")
-		debug       = flag.Bool("g", false, "Enable debug mode")
+		debug       = flag.Bool("g", false, "Dry-run audit mode")
 		reset       = flag.Bool("r", false, "Reset /lpot directory")
 		scanOnly    = flag.Bool("scan", false, "Only scan and generate ignore bits file, then exit")
 		classify    = flag.Bool("classify", false, "Print PCI endpoint classification report and exit")
 		help        = flag.Bool("h", false, "Show help menu")
 	)
 	flag.Parse()
-
 	debugMode = *debug
 
 	if *help {
 		showHelp(os.Args[0])
 		return
+	}
+	if debugMode {
+		runDryRunAudit(os.Args, *waitHours, *standbyTime, *waitSeconds, *stopService)
+		return
+	}
+
+	// Ensure /lpot is a real root-owned directory with tight permissions. All
+	// persistent state files are addressed via absolute constants thereafter,
+	// so we no longer need to Chdir into it.
+	if err := secureLpotDir(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to secure %s: %v\n", LPOT_DIR, err)
+		os.Exit(1)
 	}
 
 	if *reset {
@@ -2070,10 +2262,10 @@ func detectVolatileBytesWithSamples() (map[string]DeviceIgnoreBits, []map[string
 
 		if len(ignoreBytes) > 0 {
 			ignoreBits[busID] = DeviceIgnoreBits{
-					BusID:           busID,
-					IgnoreBytes:     ignoreBytes,
-					IsUSBController: false,
-					IgnoreDevice:    false,
+				BusID:           busID,
+				IgnoreBytes:     ignoreBytes,
+				IsUSBController: false,
+				IgnoreDevice:    false,
 			}
 		}
 	}

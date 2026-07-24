@@ -26,6 +26,8 @@ enabled. Use it only on a disposable or explicitly reserved test system.
 - PCI configuration-space scanning with volatile-byte filtering.
 - Endpoint classification with an optional `/lpot/pcie_filter.txt` override.
 - Interruptible waits and bounded external-command execution.
+- Read-only dry-run audit mode (`-g`) that prints planned commands and complete
+  text file payloads without changing the host.
 - Root-owned, permission-restricted runtime directory and symlink-resistant
   writes for persistent files.
 - Per-cycle logs and a final summary that separates noteworthy changes from
@@ -82,8 +84,9 @@ sudo ./lpot -classify
 # Scan USB/bridge/volatile devices and write /lpot/ignore_list.txt.
 sudo ./lpot -scan
 
-# Two-hour debug cycle; setup, scan and compare, but do not invoke reboot.
-sudo ./lpot -g -t 2
+# Print the complete planned flow and file contents without creating /lpot,
+# changing services, writing logs, or rebooting the host.
+sudo ./lpot -g -t 2 -d 10 -s 10
 
 # Twenty-four hours, waiting 600 seconds before each reboot.
 sudo ./lpot -t 24 -s 600
@@ -104,32 +107,30 @@ expires or the operator stops it.
 ```mermaid
 flowchart TD
     A[Start lpot as root] --> B[Resolve lspci systemctl reboot]
-    B --> C[Create or verify /lpot]
-    C --> D[Parse command-line options]
-    D -->|help or reset| E[Run special mode and exit]
-    D -->|scan or classify| F[Prepare host policies and initialize /lpot]
-    F -->|classify| G[List external PCIe endpoints and write report]
-    F -->|scan| H[Scan USB bridge and volatile devices]
-    G --> E
-    H --> I[Write /lpot/ignore_list.txt and exit]
-    D --> J[Stop and disable firewall services]
-    J --> K[Stop and disable AppArmor if present]
-    K --> L[Set SELinux permissive now and disabled on reboot]
-    L --> M[Create reboot.sh and systemd service]
-    M --> N[Increment reboot counter]
-    N --> O[Discover PCI BDFs]
-    O --> P[Classify endpoints and apply pcie_filter.txt]
-    P --> Q[Wait -d seconds for drivers]
-    Q --> R[Scan if needed and capture lspci/config snapshots]
-    R --> S[Compare topology lspci and config space]
-    S --> T[Write cycle records and summary under /lpot]
-    T --> U{Debug mode or stop requested?}
-    U -->|debug| V[Log reboot skipped and exit]
-    U -->|stop| W[Exit without reboot]
-    U -->|normal| X[Wait -s seconds]
-    X --> Y[Reboot host]
-    Y --> Z[systemd starts /lpot/reboot.sh after boot]
-    Z --> A
+    B --> C[Parse command-line options]
+    C -->|debug audit| D[Print read-only plan and file contents]
+    C -->|help| E[Show help and exit]
+    C -->|reset| F[Reset /lpot and exit]
+    C -->|scan or classify| G[Create or verify /lpot]
+    G -->|classify| H[List external PCIe endpoints and write report]
+    G -->|scan| I[Scan USB bridge and volatile devices]
+    H --> E
+    I --> J[Write /lpot/ignore_list.txt and exit]
+    G --> K[Stop and disable firewall services]
+    K --> L[Stop and disable AppArmor if present]
+    L --> M[Set SELinux permissive now and disabled on reboot]
+    M --> N[Create reboot.sh and systemd service]
+    N --> O[Increment reboot counter]
+    O --> P[Discover PCI BDFs]
+    P --> Q[Classify endpoints and apply pcie_filter.txt]
+    Q --> R[Wait -d seconds for drivers]
+    R --> S[Scan if needed and capture lspci/config snapshots]
+    S --> T[Compare topology lspci and config space]
+    T --> U[Write cycle records and summary under /lpot]
+    U --> V[Wait -s seconds]
+    V --> W[Reboot host]
+    W --> X[systemd starts /lpot/reboot.sh after boot]
+    X --> A
 ```
 
 ## Host Policy Preparation
@@ -160,7 +161,7 @@ Options:
 | `-d seconds` | Driver/device preparation delay | `300` |
 | `-s seconds` | Delay before reboot | `300` |
 | `-p` | Stop when an error is detected | disabled |
-| `-g` | Debug mode; do not reboot | disabled |
+| `-g` | Read-only dry-run audit; show commands and file contents without mutation | disabled |
 | `-r` | Reset `/lpot` runtime state | off |
 | `-scan` | Generate volatile-byte ignore data and exit | off |
 | `-classify` | Print endpoint classification and exit | off |

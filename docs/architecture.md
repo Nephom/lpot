@@ -11,14 +11,19 @@ systemd, and reboot persistence.
 1. `main()` requires root and creates a cancellable root context.
 2. Signal handlers cancel external commands and interrupt waits.
 3. `resolveBinaries()` sanitizes `PATH` and resolves trusted system binaries.
-4. `secureLpotDir()` verifies that `/lpot` is a root-owned, non-symlink
+4. Flags are parsed before runtime initialization so `-g` can be a true
+   no-write audit mode.
+5. `secureLpotDir()` verifies that `/lpot` is a root-owned, non-symlink
    directory with mode `0700`.
-5. Flags are parsed and special modes (`-h`, `-r`, `-scan`, `-classify`) exit
+6. Special modes (`-h`, `-r`, `-scan`, `-classify`) exit
    before the reboot loop.
-6. Normal mode stops/disables common firewall services and AppArmor when
+7. `-g` runs `runDryRunAudit()`, which performs read-only inspection and prints
+   every planned mutation, command, and known text-file payload without
+   creating `/lpot` or changing the host.
+8. Normal mode stops/disables common firewall services and AppArmor when
    present, sets SELinux permissive for the current boot and disabled for the
    next boot, then prepares the reboot script and systemd service.
-7. The cycle state is recorded under `/lpot`.
+9. The cycle state is recorded under `/lpot`.
 
 ## Reboot Cycle
 

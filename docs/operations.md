@@ -6,8 +6,8 @@ LPOT is a Linux system-level test tool. A normal run requires root, writes
 under `/lpot`, stops/disables firewall services, stops/disables AppArmor when
 present, changes SELinux settings when present, installs `lpot_reboot.service`,
 and invokes `reboot`. Run it only on a reserved laboratory host. Use `-g`
-while validating command-line behavior because debug mode performs one complete
-setup/scan/compare cycle and never invokes the reboot command.
+while validating command-line behavior because it performs a read-only audit
+and never changes the host or invokes the reboot command.
 
 ## Requirements
 
@@ -37,13 +37,20 @@ stopped/disabled aborts before the reboot service is created:
 
 An absent service is normal for a given distribution and is not an error.
 
+`-g` is a read-only audit mode. It does not create `/lpot`, write logs or
+snapshots, modify service/SELinux state, create temporary files, or reboot. It
+does inspect the host and prints planned commands plus complete contents for
+known text files such as the reboot script, systemd unit, and SELinux config.
+Read-only command output, including `lspci`, is printed between explicit output
+delimiters.
+
 ## Command-Line Modes
 
 ```bash
 sudo ./lpot -h
 sudo ./lpot -classify
 sudo ./lpot -scan
-sudo ./lpot -g -t 2
+sudo ./lpot -g -t 2 -d 10 -s 10
 sudo ./lpot -t 24 -s 600
 sudo ./lpot -p
 sudo ./lpot -r
@@ -55,7 +62,7 @@ sudo ./lpot -r
 | `-d seconds` | Driver/device preparation delay | `300` |
 | `-s seconds` | Delay before reboot | `300` |
 | `-p` | Stop after a comparison error | disabled |
-| `-g` | Debug mode; skip reboot | disabled |
+| `-g` | Read-only dry-run audit; show commands and file contents without mutation | disabled |
 | `-r` | Reset `/lpot` state | off |
 | `-scan` | Scan USB/bridge/volatile devices into `ignore_list.txt` and exit | off |
 | `-classify` | List external PCIe endpoints and write a report | off |
