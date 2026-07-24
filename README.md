@@ -28,8 +28,8 @@ enabled. Use it only on a disposable or explicitly reserved test system.
 - Interruptible waits and bounded external-command execution.
 - Authenticated read-only audit mode (`-g <hash>`) that prints planned commands
   and complete text file payloads without changing the host.
-- Root-owned, permission-restricted runtime directory and symlink-resistant
-  writes for persistent files.
+- Root-owned runtime directory (`0755`) for readable reports, with
+  root-only reboot controls and symlink-resistant writes.
 - Per-cycle logs and a final summary that separates noteworthy changes from
   recurring configuration noise.
 
@@ -69,11 +69,22 @@ environment. The default `.gitignore` excludes generated reports and artifacts.
 
 ## Usage
 
+An invocation without `-t` only displays the help menu. This prevents an
+accidental reboot test when a downloaded binary is run without arguments. The
+bare `-t` form uses the default duration of 12 hours; otherwise pass an
+explicit duration such as `-t 24`.
+
 Always inspect the help output from the exact binary being tested:
 
 ```bash
 sudo ./lpot -h
 ```
+
+The first normal invocation can come from any stable location. LPOT copies the
+running executable to `/lpot/lpot` and writes `/lpot/reboot.sh` to execute that
+fixed path after reboot. The original downloaded file can be replaced or
+removed only after the test has stopped; updating the test binary requires
+running the new binary with `-t` again.
 
 Common commands:
 
@@ -93,8 +104,11 @@ sudo ./lpot -g "$(sudo ./lpot -k)" -t 2 -d 10 -s 10
 sudo ./lpot -g "$(sudo ./lpot -k)" -scan
 sudo ./lpot -g "$(sudo ./lpot -k)" -classify
 
-# Twenty-four hours, waiting 600 seconds before each reboot.
-sudo ./lpot -t 24 -s 600
+# First invocation: install the binary persistently and run for twenty-four
+# hours, waiting 600 seconds before each reboot.
+sudo -i
+cd /root
+./lpot -t 24 -s 600
 
 # Stop after a detected comparison error.
 sudo ./lpot -p
@@ -198,6 +212,7 @@ the resulting decisions before starting a reboot test.
 
 The program stores persistent state under `/lpot`:
 
+- `lpot`: installed executable used by systemd after reboot.
 - `reboot.log`: per-cycle events and final summary.
 - `rebootcount`: current reboot-cycle counter.
 - `timestamp`: test expiration timestamp.
@@ -208,6 +223,10 @@ The program stores persistent state under `/lpot`:
 - `pci_devices_classify.log`: historical `-classify` reports.
 - `pcie_filter.txt`: optional endpoint overrides.
 - `tmp/`: temporary per-device `lspci` snapshots.
+
+`/lpot` and `/lpot/tmp` are root-owned and mode `0755` so non-root operators
+can inspect reports. The reboot executable and script remain root-owned and
+mode `0700`; only root can modify reboot behavior.
 
 The `logs/` directory in this repository is intentionally ignored because
 runtime logs can contain host-specific hardware information.

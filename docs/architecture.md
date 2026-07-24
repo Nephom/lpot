@@ -8,20 +8,22 @@ systemd, and reboot persistence.
 
 ## Startup Flow
 
-1. `main()` requires root and creates a cancellable root context.
-2. Signal handlers cancel external commands and interrupt waits.
-3. `resolveBinaries()` sanitizes `PATH` and resolves trusted system binaries.
-4. Flags are parsed before runtime initialization so `-g` can be a true
-   no-write audit mode.
+1. Flags are parsed before root and Linux-tool checks. An invocation without
+   `-t` only prints help, except for explicit `-k`, `-r`, `-scan`, `-classify`,
+   or `-g` modes.
+2. `main()` requires root for operational modes and creates a cancellable root
+   context.
+3. Signal handlers cancel external commands and interrupt waits.
+4. `resolveBinaries()` sanitizes `PATH` and resolves trusted system binaries.
 5. `secureLpotDir()` verifies that `/lpot` is a root-owned, non-symlink
-   directory with mode `0700`.
-6. Special modes (`-h`, `-r`, `-scan`, `-classify`) exit
-   before the reboot loop.
-7. `-g <hash>` authenticates against root's `/etc/shadow` hash and runs a
+   directory with mode `0755`; `/lpot/tmp` has the same owner and mode.
+6. `-g <hash>` authenticates against root's `/etc/shadow` hash and runs a
    read-only audit. With `-scan` or `-classify`, only that mode is audited;
    otherwise the complete normal-run plan is printed without creating `/lpot`
    or changing the host.
-8. Normal mode stops/disables common firewall services and AppArmor when
+7. Non-audit `-scan` and `-classify` may write their reports under `/lpot`, but
+   do not change firewall, AppArmor, or SELinux policy.
+8. Normal `-t` mode stops/disables common firewall services and AppArmor when
    present, sets SELinux permissive for the current boot and disabled for the
    next boot, then prepares the reboot script and systemd service.
 9. The cycle state is recorded under `/lpot`.
@@ -42,15 +44,21 @@ During the `-s` reboot wait, `monitorRebootWait()` polls PCI topology and
 `lspci -vv` output. It uses retained `/lpot/tmp/<BDF>_init.txt` files as the
 immutable baseline and keeps later observations in memory. Changes are logged;
 `-p` cancels reboot while the default behavior continues the countdown.
+Events are emitted on state transitions, so a device that disappears and later
+returns is reported as two distinct transitions rather than being suppressed
+by a permanent per-device de-duplication key.
 
 ## Persistence Across Reboots
 
-`createRebootScript()` writes `/lpot/reboot.sh`. The script re-executes the
-current binary with individually shell-quoted arguments. The systemd unit at
+`createRebootScript()` installs the current binary at `/lpot/lpot` and writes
+`/lpot/reboot.sh`. The script re-executes that fixed binary with individually
+shell-quoted arguments, independent of the directory from which the first run
+was started. The systemd unit at
 `/etc/systemd/system/lpot.service` starts that script as root after the next
 boot. `systemctl get-default` selects `graphical.target` only when it is the
-default; all other systems use `multi-user.target`. Creation uses
-`O_EXCL|O_NOFOLLOW`; pre-existing symlinks are rejected. A legacy
+default; all other systems use `multi-user.target`. Writes use
+`O_NOFOLLOW`; pre-existing symlinks are rejected and existing root-owned
+regular files are refreshed so changed arguments and binaries take effect. A legacy
 `lpot_reboot.service` is stopped, disabled, and removed before installation.
 
 ## Data Safety Boundaries
@@ -61,6 +69,8 @@ default; all other systems use `multi-user.target`. Creation uses
   possible.
 - Runtime state is outside the repository, so test reports are not source
   files and should not be committed.
+- Fatal startup and cycle errors include an operation, the underlying cause,
+  and an operator suggestion in stderr.
 
 ## Known Limitations
 

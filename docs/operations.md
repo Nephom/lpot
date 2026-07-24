@@ -9,6 +9,11 @@ and invokes `reboot`. Run it only on a reserved laboratory host. Use `-g`
 while validating command-line behavior because it performs a read-only audit
 and never changes the host or invokes the reboot command.
 
+An invocation without `-t` only prints help. Use `-t 24` to explicitly start a
+reboot test; bare `-t` uses the default duration of 12 hours. `-scan` and
+`-classify` may write reports under `/lpot`, but do not disable host security
+policies unless normal `-t` mode is selected.
+
 ## Requirements
 
 - Linux with effective UID 0.
@@ -60,6 +65,20 @@ sudo ./lpot -p
 sudo ./lpot -r
 ```
 
+For a first normal run, use a root shell and a stable download location:
+
+```bash
+sudo -i
+cd /root
+./lpot -t 24 -s 600
+```
+
+The program copies the invoked binary to `/lpot/lpot` and creates
+`/lpot/reboot.sh`. The systemd service runs that fixed path after reboot, so
+the original current directory is irrelevant. Do not remove `/lpot/lpot`
+until the test is stopped. Run the updated binary with `-t` again when
+installing a new version.
+
 | Option | Description | Default |
 | --- | --- | --- |
 | `-t hours` | Test duration | `12` |
@@ -95,6 +114,7 @@ Use `-classify` before a reboot test to inspect every keep/skip decision.
 
 All persistent state is stored under `/lpot`:
 
+- `lpot`: installed executable used by systemd after reboot.
 - `reboot.log`: per-cycle events and final summary.
 - `rebootcount`: reboot-cycle counter.
 - `timestamp`: test expiration timestamp.
@@ -108,3 +128,7 @@ All persistent state is stored under `/lpot`:
 
 The repository's `logs/` directory is ignored because reports can contain
 host-specific hardware information.
+
+`/lpot` and `/lpot/tmp` are root-owned with mode `0755` for non-root report
+inspection. Reboot controls remain root-only: `/lpot/lpot` and
+`/lpot/reboot.sh` are mode `0700`.

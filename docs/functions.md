@@ -22,17 +22,19 @@ reference.
 - `ensureRoot`: refuses to run without effective UID 0.
 - `resolveBinaries`: sanitizes `PATH` and accepts only trusted system binary
   locations.
-- `secureLpotDir`: validates ownership, type, permissions, and symlink status
-  of `/lpot`.
+- `secureLpotDir`: validates ownership, type, `0755` permissions, and symlink
+  status of `/lpot` and `/lpot/tmp`.
 - `writeFileNoFollow`: writes with `O_NOFOLLOW` to prevent path redirection.
 - `openSecureAppend`: safely appends to an existing or newly created log.
 - `openSecureCreateExcl`: creates a file once without a Stat/Create race.
 - `shellQuote`: encodes one command-line argument as a POSIX shell word.
 - `runExternal`: applies the root context and command-specific timeout.
-- `createRebootScript`: creates the reboot script once, rejects symlinks, and
-  quotes every executable/argument independently.
-- `setupSystemdService`: creates the systemd unit once and rejects a symlink at
-   the service path.
+- `installPersistentBinary`: copies the invoked binary to `/lpot/lpot` so
+  systemd does not depend on the original download directory.
+- `createRebootScript`: refreshes the persistent reboot script, rejects unsafe
+  existing files, and quotes every argument independently.
+- `setupSystemdService`: refreshes the systemd unit and rejects unsafe existing
+  files at the service path.
 - `monitorRebootWait`: compares `/lpot/tmp/<BDF>_init.txt` baselines with
   in-memory polling snapshots during the reboot wait.
 - `disableSELinux`: best-effort SELinux configuration update with symlink refusal.

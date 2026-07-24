@@ -5,10 +5,9 @@
 - `main.go`: executable and implementation.
 - `go.mod`: Go module metadata.
 - `docs/`: operational, architectural, function, and development documentation.
-- `.claude/`: project workflow templates and commands.
 
-Runtime binaries, logs, archives, timestamps, and CodeGraph databases are
-excluded by `.gitignore`.
+Runtime binaries, logs, archives, timestamps, and local tool state are excluded
+by `.gitignore`.
 
 ## Linux Target Build
 
@@ -18,8 +17,10 @@ GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o lpot .
 
 The command may be run from the macOS development environment and produces a
 Linux `amd64` executable. The supported runtime target is Linux; macOS is not a
-runtime target. No unit-test suite is maintained for this system-level tool,
-so successful Linux-target compilation is the required local verification.
+runtime target. No full unit-test suite is maintained for this system-level
+tool. The required local verification is a successful Linux-target compilation;
+GitHub Actions also runs amd64 Linux `go vet`, formatting, and stripped-binary
+checks.
 
 Run `go vet ./...` only when a compatible Go static-analysis environment is
 available. It is not a substitute for the Linux-target build.
@@ -37,6 +38,9 @@ before enabling reboot mode.
 
 Before a real reboot run, confirm the endpoint report with `-classify`, review
 `/lpot/pcie_filter.txt`, and verify that the target host is safe to reboot.
+Run the binary from a stable location with an explicit `-t` value. The first
+normal invocation copies it to `/lpot/lpot`, which is the binary used after
+reboot.
 
 ## Issue Tracking
 

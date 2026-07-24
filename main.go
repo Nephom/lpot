@@ -31,6 +31,7 @@ import (
 // independent of the caller's working directory.
 const (
 	LPOT_DIR            = "/lpot"
+	PERSISTENT_BINARY   = "/lpot/lpot"
 	SYS_PCI_DEVICES     = "/sys/bus/pci/devices/"
 	TIMESTAMP_FILE      = "/lpot/timestamp"
 	REBOOTCOUNT_FILE    = "/lpot/rebootcount"
@@ -55,7 +56,7 @@ const (
 	// lets users correlate events by plain text search and by tools like
 	// `sort -k1,2` without translation.
 	logTimeFormat = "2006-01-02 15:04:05"
-	version       = "2.3.1"
+	version       = "2.4.0"
 	serviceName   = "lpot.service"
 	legacyService = "lpot_reboot.service"
 	servicePath   = "/etc/systemd/system/" + serviceName
@@ -557,17 +558,16 @@ var trustedBinDirs = []string{"/usr/sbin/", "/usr/bin/", "/sbin/", "/bin/"}
 // resolveBinaries locks down PATH and resolves the external tools the test
 // harness will invoke. It must run before setupSystemdService() or any loop
 // that shells out.
-func resolveBinaries() error {
+func resolveBinaries(requireRebootTools bool) error {
 	os.Setenv("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
 
-	for _, t := range []struct {
+	tools := []struct {
 		name string
 		dst  *string
 	}{
 		{"lspci", &lspciPath},
-		{"systemctl", &systemctlPath},
-		{"reboot", &rebootPath},
-	} {
+	}
+	for _, t := range tools {
 		p, err := exec.LookPath(t.name)
 		if err != nil {
 			return fmt.Errorf("required tool %q not found in PATH: %w", t.name, err)
@@ -583,6 +583,31 @@ func resolveBinaries() error {
 			return fmt.Errorf("tool %q resolved to untrusted path %q", t.name, p)
 		}
 		*t.dst = p
+	}
+	if requireRebootTools {
+		for _, t := range []struct {
+			name string
+			dst  *string
+		}{
+			{"systemctl", &systemctlPath},
+			{"reboot", &rebootPath},
+		} {
+			p, err := exec.LookPath(t.name)
+			if err != nil {
+				return fmt.Errorf("required tool %q not found in PATH: %w", t.name, err)
+			}
+			trusted := false
+			for _, d := range trustedBinDirs {
+				if strings.HasPrefix(p, d) {
+					trusted = true
+					break
+				}
+			}
+			if !trusted {
+				return fmt.Errorf("tool %q resolved to untrusted path %q", t.name, p)
+			}
+			*t.dst = p
+		}
 	}
 
 	// configscan_log.sh is a custom helper shipped alongside the binary. Only
@@ -614,16 +639,25 @@ func ensureRoot() {
 	}
 }
 
+func fatalOperation(operation string, err error, suggestion string) {
+	fmt.Fprintf(os.Stderr, "%s: %v\n", operation, err)
+	if suggestion != "" {
+		fmt.Fprintf(os.Stderr, "Suggestion: %s\n", suggestion)
+	}
+	os.Exit(1)
+}
+
 // secureLpotDir ensures LPOT_DIR exists as a real directory owned by root and
-// not reachable through a symlink. Permissions are tightened to 0700 so that
-// only root can read the accumulated logs and ignore_list.txt.
+// not reachable through a symlink. The directory is readable/traversable by
+// non-root users for operational inspection, while files that control reboot
+// execution remain root-owned and non-writable by other users.
 func secureLpotDir() error {
 	info, err := os.Lstat(LPOT_DIR)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("stat %s: %w", LPOT_DIR, err)
 		}
-		if err := os.MkdirAll(LPOT_DIR, 0700); err != nil {
+		if err := os.MkdirAll(LPOT_DIR, 0755); err != nil {
 			return fmt.Errorf("create %s: %w", LPOT_DIR, err)
 		}
 		info, err = os.Lstat(LPOT_DIR)
@@ -640,9 +674,9 @@ func secureLpotDir() error {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid != 0 {
 		return fmt.Errorf("%s must be owned by root (uid 0), found uid %d", LPOT_DIR, st.Uid)
 	}
-	if info.Mode().Perm() != 0700 {
-		if err := os.Chmod(LPOT_DIR, 0700); err != nil {
-			return fmt.Errorf("chmod %s to 0700: %w", LPOT_DIR, err)
+	if info.Mode().Perm() != 0755 {
+		if err := os.Chmod(LPOT_DIR, 0755); err != nil {
+			return fmt.Errorf("chmod %s to 0755: %w", LPOT_DIR, err)
 		}
 	}
 	tmpInfo, err := os.Lstat(TMP_DIR)
@@ -650,14 +684,17 @@ func secureLpotDir() error {
 		if tmpInfo.Mode()&os.ModeSymlink != 0 || !tmpInfo.IsDir() {
 			return fmt.Errorf("%s must be a real directory", TMP_DIR)
 		}
+		if st, ok := tmpInfo.Sys().(*syscall.Stat_t); ok && st.Uid != 0 {
+			return fmt.Errorf("%s must be owned by root (uid 0), found uid %d", TMP_DIR, st.Uid)
+		}
 	} else if os.IsNotExist(err) {
-		if err := os.MkdirAll(TMP_DIR, 0700); err != nil {
+		if err := os.MkdirAll(TMP_DIR, 0755); err != nil {
 			return fmt.Errorf("create %s: %w", TMP_DIR, err)
 		}
 	} else {
 		return fmt.Errorf("stat %s: %w", TMP_DIR, err)
 	}
-	if err := os.Chmod(TMP_DIR, 0700); err != nil {
+	if err := os.Chmod(TMP_DIR, 0755); err != nil {
 		return fmt.Errorf("chmod %s: %w", TMP_DIR, err)
 	}
 	return nil
@@ -667,6 +704,16 @@ func secureLpotDir() error {
 // attacker who can drop a symlink at path cannot redirect log writes to a
 // target file elsewhere (e.g. /etc/shadow).
 func openSecureAppend(path string, perm os.FileMode) (*os.File, error) {
+	if err := verifyRootRegularFileIfPresent(path); err != nil {
+		return nil, err
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode().Perm() != perm.Perm() {
+			if err := os.Chmod(path, perm); err != nil {
+				return nil, fmt.Errorf("set mode on %s: %w", path, err)
+			}
+		}
+	}
 	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW, perm)
 }
 
@@ -684,6 +731,9 @@ func openSecureCreateExcl(path string, perm os.FileMode) (*os.File, error) {
 // replacement for os.WriteFile / os.Create in every place that writes to a
 // path under /lpot, /tmp or /etc.
 func writeFileNoFollow(path string, data []byte, perm os.FileMode) error {
+	if err := verifyRootRegularFileIfPresent(path); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, perm)
 	if err != nil {
 		return err
@@ -691,6 +741,10 @@ func writeFileNoFollow(path string, data []byte, perm os.FileMode) error {
 	if _, werr := f.Write(data); werr != nil {
 		f.Close()
 		return werr
+	}
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		return err
 	}
 	return f.Close()
 }
@@ -834,10 +888,33 @@ func setupSignalHandlers() {
 	}()
 }
 
-// File existence check
+// fileExists reports only a usable regular file. Permission and I/O errors are
+// not silently converted into "exists", because doing so can make the next
+// stage skip required initialization and produce misleading comparisons.
 func fileExists(filename string) bool {
-	_, err := os.Stat(filename)
-	return !os.IsNotExist(err)
+	info, err := os.Stat(filename)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func installPersistentBinary(source string) error {
+	if err := verifyRootRegularFileIfPresent(PERSISTENT_BINARY); err != nil {
+		return err
+	}
+	resolved, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return fmt.Errorf("resolve executable %q: %w", source, err)
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return fmt.Errorf("read executable %q: %w", resolved, err)
+	}
+	if err := writeFileNoFollow(PERSISTENT_BINARY, data, 0755); err != nil {
+		return fmt.Errorf("install executable at %s: %w", PERSISTENT_BINARY, err)
+	}
+	if err := os.Chmod(PERSISTENT_BINARY, 0755); err != nil {
+		return fmt.Errorf("set executable mode on %s: %w", PERSISTENT_BINARY, err)
+	}
+	return nil
 }
 
 // Get current timestamp string
@@ -848,15 +925,18 @@ func getCurrentTimestamp() string {
 // Validate input parameters
 func validateInputParameters(waitHours, waitSeconds, standbyTime int) bool {
 	if waitHours < 1 || waitHours > 8760 {
-		fmt.Fprintf(os.Stderr, "Error: wait_hours must be between 1 and 8760\n")
+		fmt.Fprintf(os.Stderr, "Invalid -t value: duration must be between 1 and 8760 hours.\n")
+		fmt.Fprintln(os.Stderr, "Suggestion: use a value such as `-t 24` or bare `-t` for the 12-hour default.")
 		return false
 	}
 	if waitSeconds < 10 || waitSeconds > 3600 {
-		fmt.Fprintf(os.Stderr, "Error: wait_seconds must be between 10 and 3600\n")
+		fmt.Fprintf(os.Stderr, "Invalid -s value: reboot wait must be between 10 and 3600 seconds.\n")
+		fmt.Fprintln(os.Stderr, "Suggestion: use a value such as `-s 600`.")
 		return false
 	}
 	if standbyTime < 10 || standbyTime > 3600 {
-		fmt.Fprintf(os.Stderr, "Error: standby_time must be between 10 and 3600\n")
+		fmt.Fprintf(os.Stderr, "Invalid -d value: driver wait must be between 10 and 3600 seconds.\n")
+		fmt.Fprintln(os.Stderr, "Suggestion: use a value such as `-d 300`.")
 		return false
 	}
 	return true
@@ -868,6 +948,9 @@ func writeTimestamp(hours int) error {
 	data := []byte(fmt.Sprintf("%d\n", now.Unix()))
 	if err := writeFileNoFollow(TIMESTAMP_FILE, data, 0644); err != nil {
 		return fmt.Errorf("failed to write timestamp file: %v", err)
+	}
+	if err := os.Chmod(TIMESTAMP_FILE, 0644); err != nil {
+		return fmt.Errorf("failed to set timestamp file mode: %v", err)
 	}
 	return nil
 }
@@ -892,11 +975,17 @@ func readTimestamp() (time.Time, error) {
 // stuck-but-respawned systemd unit racing against the next invocation, which
 // would otherwise corrupt the counter and silently break the test schedule.
 func updateRebootCount() (int, error) {
+	if err := verifyRootRegularFileIfPresent(REBOOTCOUNT_FILE); err != nil {
+		return 0, err
+	}
 	fp, err := os.OpenFile(REBOOTCOUNT_FILE, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open reboot count file: %v", err)
 	}
 	defer fp.Close()
+	if err := fp.Chmod(0600); err != nil {
+		return 0, fmt.Errorf("failed to set reboot count mode: %w", err)
+	}
 
 	if err := syscall.Flock(int(fp.Fd()), syscall.LOCK_EX); err != nil {
 		return 0, fmt.Errorf("failed to lock reboot count file: %v", err)
@@ -1048,7 +1137,6 @@ func monitorRebootWait(ctx context.Context, wait time.Duration, bdfs []string, l
 		previous[bdf] = content
 	}
 	previousSet := snapshotSet(bdfs)
-	lastLogged := make(map[string]string)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	timer := time.NewTimer(wait)
@@ -1076,29 +1164,21 @@ func monitorRebootWait(ctx context.Context, wait time.Duration, bdfs []string, l
 			currentSet := snapshotSet(filteredBDFs)
 			for bdf := range currentSet {
 				if !previousSet[bdf] {
-					key := "NEW_DEVICE:" + bdf
-					if lastLogged[key] != "seen" {
-						content, readErr := readLspciSnapshot(bdf)
-						if readErr != nil {
-							content = fmt.Sprintf("lspci read failed: %v\n", readErr)
-						}
-						logRebootMonitorEvent(logFp, "NEW_DEVICE", bdf, "", content, stopService)
-						lastLogged[key] = "seen"
-						if stopService {
-							return false
-						}
+					content, readErr := readLspciSnapshot(bdf)
+					if readErr != nil {
+						content = fmt.Sprintf("lspci read failed: %v\n", readErr)
+					}
+					logRebootMonitorEvent(logFp, "NEW_DEVICE", bdf, "", content, stopService)
+					if stopService {
+						return false
 					}
 				}
 			}
 			for bdf := range previousSet {
 				if !currentSet[bdf] {
-					key := "REMOVED_DEVICE:" + bdf
-					if lastLogged[key] != "seen" {
-						logRebootMonitorEvent(logFp, "REMOVED_DEVICE", bdf, previous[bdf], "", stopService)
-						lastLogged[key] = "seen"
-						if stopService {
-							return false
-						}
+					logRebootMonitorEvent(logFp, "REMOVED_DEVICE", bdf, previous[bdf], "", stopService)
+					if stopService {
+						return false
 					}
 				}
 			}
@@ -1107,9 +1187,8 @@ func monitorRebootWait(ctx context.Context, wait time.Duration, bdfs []string, l
 				if readErr != nil {
 					continue
 				}
-				if old, ok := previous[bdf]; ok && old != content && lastLogged[bdf] != content {
+				if old, ok := previous[bdf]; ok && old != content {
 					logRebootMonitorEvent(logFp, "LSPCI_OUTPUT_CHANGED", bdf, baseline[bdf], content, stopService)
-					lastLogged[bdf] = content
 					if stopService {
 						return false
 					}
@@ -1159,48 +1238,58 @@ func executeLspci(bdf, suffix string) error {
 // Create reboot script
 func createRebootScript(args []string) error {
 	scriptPath := filepath.Join(LPOT_DIR, "reboot.sh")
-
-	// Use O_CREATE|O_EXCL|O_NOFOLLOW to close the TOCTOU window between the
-	// existence check and the create: if an attacker drops a symlink at
-	// scriptPath between Stat and Create the write would otherwise land in the
-	// symlink target. O_EXCL makes the syscall fail with EEXIST if the file
-	// already exists, which we treat as "already generated, nothing to do".
-	file, err := os.OpenFile(scriptPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0700)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			info, statErr := os.Lstat(scriptPath)
-			if statErr != nil {
-				return fmt.Errorf("failed to verify existing reboot script: %v", statErr)
-			}
-			if info.Mode()&os.ModeSymlink != 0 {
-				return fmt.Errorf("refusing to use %s: path is a symlink", scriptPath)
-			}
-			return nil
-		}
-		return fmt.Errorf("failed to create script file: %v", err)
-	}
-	defer file.Close()
-
-	// Get the absolute path of the current executable
-	executablePath, err := os.Executable()
-	if err != nil {
-		// Fallback to args[0] if os.Executable() fails
-		executablePath = args[0]
-		if !filepath.IsAbs(executablePath) {
-			// Try to resolve relative path to absolute path
-			if absPath, err := filepath.Abs(executablePath); err == nil {
-				executablePath = absPath
-			}
-		}
+	if err := verifyRootRegularFileIfPresent(scriptPath); err != nil {
+		return err
 	}
 
-	fmt.Fprintln(file, "#!/bin/sh")
-	fmt.Fprint(file, "exec ", shellQuote(executablePath))
+	// Install the binary under /lpot before writing the script. The original
+	// download location may be /root, /tmp, or another transient directory;
+	// systemd must have a stable executable path after reboot.
+	source, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate current executable: %w", err)
+	}
+	if err := installPersistentBinary(source); err != nil {
+		return err
+	}
+
+	executablePath := PERSISTENT_BINARY
+	_, err = os.Stat(executablePath)
+	if err != nil {
+		return fmt.Errorf("verify installed executable %s: %w", executablePath, err)
+	}
+
+	var script strings.Builder
+	script.WriteString("#!/bin/sh\nexec ")
+	script.WriteString(shellQuote(executablePath))
 	for _, arg := range args[1:] {
-		fmt.Fprint(file, " ", shellQuote(arg))
+		script.WriteString(" ")
+		script.WriteString(shellQuote(arg))
 	}
-	fmt.Fprintln(file)
+	script.WriteByte('\n')
+	if err := writeFileNoFollow(scriptPath, []byte(script.String()), 0700); err != nil {
+		return fmt.Errorf("write reboot script %s: %w", scriptPath, err)
+	}
+	if err := os.Chmod(scriptPath, 0700); err != nil {
+		return fmt.Errorf("set reboot script mode on %s: %w", scriptPath, err)
+	}
+	return nil
+}
 
+func verifyRootRegularFileIfPresent(path string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to use %s: expected a regular file", path)
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid != 0 {
+		return fmt.Errorf("refusing to use %s: owner must be root, found uid %d", path, st.Uid)
+	}
 	return nil
 }
 
@@ -1218,33 +1307,14 @@ func setupSystemdService() error {
 	}
 	serviceContent := systemdServiceContent(scriptPath, target)
 
-	// O_CREATE|O_EXCL|O_NOFOLLOW: either we create the unit file freshly or we
-	// treat its pre-existence as success. This avoids both the Stat/Create race
-	// and the possibility of following a malicious symlink into another file
-	// under /etc/systemd/system/.
-	f, err := os.OpenFile(servicePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0644)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			info, statErr := os.Lstat(servicePath)
-			if statErr != nil {
-				return fmt.Errorf("failed to verify existing systemd service file: %v", statErr)
-			}
-			if info.Mode()&os.ModeSymlink != 0 {
-				return fmt.Errorf("refusing to use %s: path is a symlink", servicePath)
-			}
-			// The unit may exist but still need daemon-reload/enable. Continue
-			// through the common systemd activation path below.
-		} else {
-			return fmt.Errorf("failed to create systemd service file: %v", err)
-		}
-	} else {
-		if _, err := f.WriteString(serviceContent); err != nil {
-			f.Close()
-			return fmt.Errorf("failed to write systemd service file: %v", err)
-		}
-		if err := f.Close(); err != nil {
-			return fmt.Errorf("failed to close systemd service file: %v", err)
-		}
+	if err := verifyRootRegularFileIfPresent(servicePath); err != nil {
+		return err
+	}
+	if err := writeFileNoFollow(servicePath, []byte(serviceContent), 0644); err != nil {
+		return fmt.Errorf("write systemd service file %s: %w", servicePath, err)
+	}
+	if err := os.Chmod(servicePath, 0644); err != nil {
+		return fmt.Errorf("set systemd service mode on %s: %w", servicePath, err)
 	}
 
 	// Reload systemd daemon
@@ -1430,7 +1500,7 @@ func prepareHostPolicies() error {
 }
 
 // Reset lpot directory
-func resetLpotDirectory() {
+func resetLpotDirectory() error {
 	fmt.Println("Resetting /lpot directory...")
 
 	// Refuse to operate on LPOT_DIR if it is a symlink or not owned by root,
@@ -1438,35 +1508,37 @@ func resetLpotDirectory() {
 	info, err := os.Lstat(LPOT_DIR)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
-			fmt.Printf("Refusing to reset: %s is a symlink\n", LPOT_DIR)
-			return
+			return fmt.Errorf("refusing to reset: %s is a symlink", LPOT_DIR)
 		}
 		if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid != 0 {
-			fmt.Printf("Refusing to reset: %s must be owned by root (uid 0), found uid %d\n", LPOT_DIR, st.Uid)
-			return
+			return fmt.Errorf("refusing to reset: %s must be owned by root (uid 0), found uid %d", LPOT_DIR, st.Uid)
 		}
 	}
 
-	if err := os.MkdirAll(LPOT_DIR, 0700); err != nil {
-		fmt.Printf("Failed to create %s directory: %v\n", LPOT_DIR, err)
-		return
+	if err := os.MkdirAll(LPOT_DIR, 0755); err != nil {
+		return fmt.Errorf("failed to create %s directory: %w", LPOT_DIR, err)
 	}
 
 	// Clean all files directly under /lpot. WalkDir does not descend into
 	// symlinks by default; os.Remove removes the symlink entry itself rather
 	// than following it, so both layers are safe against a symlink-redirected
 	// delete.
-	filepath.WalkDir(LPOT_DIR, func(path string, d fs.DirEntry, err error) error {
+	if err := filepath.WalkDir(LPOT_DIR, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if !d.IsDir() && path != LPOT_DIR {
-			os.Remove(path)
+			if err := os.Remove(path); err != nil {
+				return err
+			}
 		}
 		return nil
-	})
+	}); err != nil {
+		return fmt.Errorf("failed to remove runtime files under %s: %w", LPOT_DIR, err)
+	}
 
 	fmt.Println("Reset completed. You can now run lpot with normal parameters.")
+	return nil
 }
 
 // printDryRunFile reports a complete text payload without opening the target
@@ -1533,7 +1605,6 @@ func printDryRunReadCommand(timeout time.Duration, name string, args ...string) 
 
 func runDryRunScanAudit() {
 	fmt.Println("[DRY-RUN] scan audit mode; no scan result will be written")
-	printDryRunHostPolicyActions()
 	fmt.Printf("[DRY-RUN] WOULD READ %s for PCI configuration samples\n", SYS_PCI_DEVICES)
 	fmt.Println("[DRY-RUN] WOULD COLLECT 5 read-only PCI samples at one-second intervals")
 	fmt.Printf("[DRY-RUN] WOULD WRITE %s (generated volatile-byte ignore list)\n", IGNORE_LIST_FILE)
@@ -1543,7 +1614,6 @@ func runDryRunScanAudit() {
 
 func runDryRunClassifyAudit() {
 	fmt.Println("[DRY-RUN] classify audit mode; no report or host policy will be written")
-	printDryRunHostPolicyActions()
 	bdfs, err := fetchPCIBDFs()
 	if err != nil {
 		fmt.Printf("[DRY-RUN] READ PCI devices failed: %v\n", err)
@@ -1581,7 +1651,7 @@ func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stop
 
 	if info, err := os.Lstat(LPOT_DIR); err != nil {
 		if os.IsNotExist(err) {
-			fmt.Printf("[DRY-RUN] WOULD MKDIR %s mode=0700\n", LPOT_DIR)
+			fmt.Printf("[DRY-RUN] WOULD MKDIR %s mode=0755\n", LPOT_DIR)
 		} else {
 			fmt.Printf("[DRY-RUN] READ %s failed: %v\n", LPOT_DIR, err)
 		}
@@ -1590,7 +1660,7 @@ func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stop
 			LPOT_DIR, info.Mode().Perm(), info.IsDir(), info.Mode()&os.ModeSymlink != 0)
 	}
 	if info, err := os.Lstat(TMP_DIR); err != nil && os.IsNotExist(err) {
-		fmt.Printf("[DRY-RUN] WOULD MKDIR %s mode=0700\n", TMP_DIR)
+		fmt.Printf("[DRY-RUN] WOULD MKDIR %s mode=0755\n", TMP_DIR)
 	} else if err == nil {
 		fmt.Printf("[DRY-RUN] READ %s exists mode=%#o directory=%t symlink=%t\n",
 			TMP_DIR, info.Mode().Perm(), info.IsDir(), info.Mode()&os.ModeSymlink != 0)
@@ -1622,22 +1692,16 @@ func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stop
 		fmt.Printf("[DRY-RUN] READ %s: absent or symlink (no SELinux config write)\n", selinuxConfigPath)
 	}
 
-	executablePath, err := os.Executable()
-	if err != nil {
-		executablePath = args[0]
-		if !filepath.IsAbs(executablePath) {
-			executablePath, _ = filepath.Abs(executablePath)
-		}
-	}
 	var script strings.Builder
 	script.WriteString("#!/bin/sh\nexec ")
-	script.WriteString(shellQuote(executablePath))
+	script.WriteString(shellQuote(PERSISTENT_BINARY))
 	for _, arg := range args[1:] {
 		script.WriteString(" ")
 		script.WriteString(shellQuote(arg))
 	}
 	script.WriteByte('\n')
-	printDryRunFile(filepath.Join(LPOT_DIR, "reboot.sh"), "create", 0700, script.String())
+	printDryRunFile(PERSISTENT_BINARY, "replace", 0755, "[binary copied from the invoked executable]\n")
+	printDryRunFile(filepath.Join(LPOT_DIR, "reboot.sh"), "replace", 0700, script.String())
 
 	if info, err := os.Lstat(legacyPath); err == nil && info.Mode()&os.ModeSymlink == 0 {
 		printDryRunCommand(systemctlPath, "stop", legacyService)
@@ -1744,20 +1808,33 @@ func flagWasProvided(name string) bool {
 	return false
 }
 
+func applyDefaultDurationForBareT() {
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] != "-t" {
+			continue
+		}
+		if i+1 == len(os.Args) || strings.HasPrefix(os.Args[i+1], "-") {
+			os.Args[i] = "-t=12"
+		}
+	}
+}
+
 // Show help
 func showHelp(programName string) {
 	fmt.Printf("Usage: %s [OPTIONS]\n", programName)
 	fmt.Printf("Version: %s\n", version)
 	fmt.Printf("Author: Nephom,Chiang (Integrated by AI)\n")
+	fmt.Printf("Running without -t only shows this help menu.\n")
 	fmt.Printf("OPTIONS:\n")
 	fmt.Printf("  -t <hours>   Setup runtime, default is 12 hours.\n")
 	fmt.Printf("  -d <secs>    Setup delay time for driver ready, default is 300 seconds.\n")
 	fmt.Printf("  -s <secs>    Setup delay time for reboot, default is 300 seconds.\n")
 	fmt.Printf("  -p           Set stop flag when Error occurred!\n")
+	fmt.Printf("  -g <hash>    Authenticated read-only audit; never changes the host.\n")
 	fmt.Printf("  -k           Show encrypted root password value.\n")
 	fmt.Printf("  -r           Reset /lpot directory and clean all files.\n")
 	fmt.Printf("  -scan        Scan USB/bridge/volatile devices and write /lpot/ignore_list.txt, then exit.\n")
-	fmt.Printf("  -classify    Print PCI endpoint classification report and exit (dry-run).\n")
+	fmt.Printf("  -classify    Print and save the PCI endpoint classification report, then exit.\n")
 	fmt.Printf("  -h, --help   Show Help menu\n")
 	fmt.Printf("\nNOTE: PCI device scanning is automatically performed after driver ready time if ignore_list.txt doesn't exist.\n")
 	fmt.Printf("NOTE: Bridges and legacy PCI devices are filtered automatically. Override via %s.\n", PCIE_FILTER_FILE)
@@ -1765,32 +1842,14 @@ func showHelp(programName string) {
 	fmt.Printf("  %s -t 24 -s 600    Run reboot during 24 hours and each reboot wait for 600 seconds\n", programName)
 	fmt.Printf("  %s -r              Reset /lpot directory to clean state\n", programName)
 	fmt.Printf("  %s -scan           Only scan PCI devices and generate ignore bits file\n", programName)
-	fmt.Printf("  %s -classify       Preview which BDFs the endpoint filter will keep/skip\n", programName)
+	fmt.Printf("  %s -classify       Print and save endpoint keep/skip decisions\n", programName)
+	fmt.Printf("  %s -t              Run the default 12-hour reboot test\n", programName)
 }
 
 func main() {
-	// Root privileges are required to read /sys/bus/pci/*/config, write under
-	// /etc/systemd/system, and call reboot(). Bail out early rather than failing
-	// half-initialised.
-	ensureRoot()
-
-	// rootCtx is the single cancellation primitive for external commands and
-	// internal sleep loops. signal handlers cancel it on first Ctrl-C.
-	rootCtx, rootCancel = context.WithCancel(context.Background())
-	defer rootCancel()
-
-	// Signal handlers must be installed before any long-running operation.
-	setupSignalHandlers()
-
-	// Resolve external tool paths against a sanitised PATH to prevent a
-	// writable PATH entry from shadowing standard system binaries.
-	if err := resolveBinaries(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to resolve required binaries: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Parse flags before touching /lpot so dry-run mode can guarantee that
-	// startup itself does not create or chmod any runtime directory.
+	// Parse flags before requiring root or resolving Linux-only tools. This keeps
+	// `./lpot` and `./lpot -h` useful from a development machine and makes the
+	// explicit -t gate visible before any host mutation can begin.
 	var (
 		waitHours   = flag.Int("t", 12, "Setup runtime in hours")
 		standbyTime = flag.Int("d", 300, "Setup delay time for driver ready in seconds")
@@ -1803,14 +1862,29 @@ func main() {
 		classify    = flag.Bool("classify", false, "Print PCI endpoint classification report and exit")
 		help        = flag.Bool("h", false, "Show help menu")
 	)
+	applyDefaultDurationForBareT()
 	flag.Parse()
 	debugHash = *debug
 	debugRequested := flagWasProvided("g")
+	tRequested := flagWasProvided("t")
 
-	if *help {
+	if *help || (!tRequested && !debugRequested && !*showKey && !*reset && !*scanOnly && !*classify) {
 		showHelp(os.Args[0])
 		return
 	}
+
+	// Root privileges are required for every operation other than help. Bail
+	// out early rather than failing half-initialised after touching the host.
+	ensureRoot()
+
+	// rootCtx is the single cancellation primitive for external commands and
+	// internal sleep loops. signal handlers cancel it on first Ctrl-C.
+	rootCtx, rootCancel = context.WithCancel(context.Background())
+	defer rootCancel()
+
+	// Signal handlers must be installed before any long-running operation.
+	setupSignalHandlers()
+
 	if *showKey {
 		hash, err := rootPasswordHash()
 		if err != nil {
@@ -1820,6 +1894,19 @@ func main() {
 		fmt.Println(hash)
 		return
 	}
+
+	// Resolve external tool paths against a sanitised PATH to prevent a
+	// writable PATH entry from shadowing standard system binaries. Reset only
+	// touches local runtime state and does not need Linux command dependencies.
+	if !*reset {
+		requireRebootTools := tRequested || (debugRequested && !*scanOnly && !*classify)
+		if err := resolveBinaries(requireRebootTools); err != nil {
+			fmt.Fprintf(os.Stderr, "Startup failed: unable to resolve required Linux tools: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Suggestion: install pciutils and systemd tools, then run this binary on the target Linux host.")
+			os.Exit(1)
+		}
+	}
+
 	if debugRequested {
 		if err := authenticateDebug(debugHash); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -1834,44 +1921,40 @@ func main() {
 	// persistent state files are addressed via absolute constants thereafter,
 	// so we no longer need to Chdir into it.
 	if err := secureLpotDir(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to secure %s: %v\n", LPOT_DIR, err)
-		os.Exit(1)
+		fatalOperation("Startup failed: cannot prepare /lpot", err,
+			"ensure /lpot is a root-owned directory and rerun as root")
 	}
 
 	if *reset {
-		resetLpotDirectory()
+		if err := resetLpotDirectory(); err != nil {
+			fatalOperation("Reset failed", err,
+				"confirm that /lpot is root-owned and that no process is using its runtime files")
+		}
 		return
 	}
 
 	if *scanOnly {
-		if err := prepareHostPolicies(); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to prepare host: %v\n", err)
-			os.Exit(1)
-		}
 		if err := scanAndGenerateIgnoreBits(); err != nil {
-			fmt.Printf("Error during scan: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Scan failed: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Suggestion: verify that /sys/bus/pci/devices is readable and that the process is running as root.")
 			os.Exit(1)
 		}
 		return
 	}
 
-	// -classify is a dry-run that prints how every PCI BDF would be treated by
-	// the endpoint filter (after pcie_filter.txt overrides), then exits. It
-	// touches no persistent state so users can run it before committing to a
-	// reboot test.
+	// -classify prints how every PCI BDF would be treated by the endpoint filter
+	// and appends the same report to /lpot. It does not change host policies.
 	if *classify {
-		if err := prepareHostPolicies(); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to prepare host: %v\n", err)
-			os.Exit(1)
-		}
 		bdfs, err := fetchPCIBDFs()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to fetch PCI BDFs: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Classification failed: unable to read PCI devices: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Suggestion: run on Linux with PCI sysfs mounted and execute as root.")
 			os.Exit(1)
 		}
 		ov, err := loadPCIeFilterOverrides(PCIE_FILTER_FILE)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to load %s: %v\n", PCIE_FILTER_FILE, err)
+			fmt.Fprintf(os.Stderr, "Classification failed: unable to load %s: %v\n", PCIE_FILTER_FILE, err)
+			fmt.Fprintln(os.Stderr, "Suggestion: fix the filter file permissions or remove it to use automatic classification.")
 			os.Exit(1)
 		}
 		decisions := classifyDevices(bdfs, ov)
@@ -1881,14 +1964,17 @@ func main() {
 		// reboot.log / pci-config-changes.log) so the keep/skip decisions can be
 		// reviewed later. Appended with a timestamped banner so repeated runs
 		// build a history instead of silently overwriting the prior report. A
-		// write failure is non-fatal: the report already printed to stdout.
-		if fp, err := openSecureAppend(CLASSIFY_LOG, 0644); err == nil {
-			fmt.Fprintf(fp, "\n===== %s classify run (%d devices) =====\n",
-				getCurrentTimestamp(), len(decisions))
-			printClassificationReport(fp, decisions)
-			fp.Close()
-		} else {
-			fmt.Fprintf(os.Stderr, "Warning: failed to write %s: %v\n", CLASSIFY_LOG, err)
+		fp, err := openSecureAppend(CLASSIFY_LOG, 0644)
+		if err != nil {
+			fatalOperation("Classification failed: cannot write the report", err,
+				"check /lpot permissions and available disk space")
+		}
+		fmt.Fprintf(fp, "\n===== %s classify run (%d devices) =====\n",
+			getCurrentTimestamp(), len(decisions))
+		printClassificationReport(fp, decisions)
+		if err := fp.Close(); err != nil {
+			fatalOperation("Classification failed: cannot close the report", err,
+				"check the filesystem and /lpot permissions")
 		}
 		return
 	}
@@ -1907,27 +1993,28 @@ func main() {
 	// mandatory access-control services before installing the reboot service so
 	// the PCI test is not blocked by distro-specific policy.
 	if err := prepareHostPolicies(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to prepare host: %v\n", err)
-		os.Exit(1)
+		fatalOperation("Startup failed: cannot prepare host policies", err,
+			"run only on the reserved test host and verify the listed service can be stopped or disabled")
 	}
 
 	// Create reboot script if not exists
 	if err := createRebootScript(os.Args); err != nil {
-		fmt.Printf("Failed to create reboot script: %v\n", err)
+		fatalOperation("Startup failed: cannot install the persistent reboot executable/script", err,
+			"keep the downloaded binary readable and executable, and verify that /lpot is root-owned")
 	}
 
 	// Check timestamp
 	if !fileExists(TIMESTAMP_FILE) {
 		if err := writeTimestamp(*waitHours); err != nil {
-			fmt.Printf("Failed to write timestamp: %v\n", err)
-			os.Exit(1)
+			fatalOperation("Startup failed: cannot write the test expiration timestamp", err,
+				"check /lpot permissions and available disk space")
 		}
 	} else {
 		currentTime := time.Now()
 		timestamp, err := readTimestamp()
 		if err != nil {
-			fmt.Printf("Failed to read timestamp: %v\n", err)
-			os.Exit(1)
+			fatalOperation("Startup failed: cannot read the existing test expiration timestamp", err,
+				"remove the corrupt /lpot/timestamp only after confirming the previous test is no longer running")
 		}
 
 		if currentTime.After(timestamp) {
@@ -1960,8 +2047,8 @@ func main() {
 
 	// Setup systemd service
 	if err := setupSystemdService(); err != nil {
-		fmt.Printf("Failed to setup systemd service: %v\n", err)
-		os.Exit(1)
+		fatalOperation("Startup failed: cannot install or enable lpot.service", err,
+			"verify that systemd is running and /etc/systemd/system is writable by root")
 	}
 
 	// Initialize statistics tracking
@@ -1971,8 +2058,8 @@ func main() {
 	// [Cycle N] for every subsequent write.
 	rebootCount, err := updateRebootCount()
 	if err != nil {
-		fmt.Printf("Failed to update reboot count: %v\n", err)
-		os.Exit(1)
+		fatalOperation("Startup failed: cannot update the reboot counter", err,
+			"check /lpot/rebootcount ownership, permissions, and filesystem health")
 	}
 	currentCycle.Store(int64(rebootCount))
 
@@ -1981,8 +2068,8 @@ func main() {
 	// Open log file
 	logFp, err := openSecureAppend(REBOOT_LOG, 0644)
 	if err != nil {
-		fmt.Printf("Failed to open reboot.log: %v\n", err)
-		os.Exit(1)
+		fatalOperation("Startup failed: cannot open /lpot/reboot.log", err,
+			"check /lpot permissions and available disk space")
 	}
 	defer logFp.Close()
 
@@ -1992,8 +2079,8 @@ func main() {
 	// Get PCI device list
 	bdfs, err := fetchPCIBDFs()
 	if err != nil {
-		fmt.Printf("Failed to fetch PCI BDFs: %v\n", err)
-		os.Exit(1)
+		fatalOperation("Cycle failed: cannot enumerate PCI devices", err,
+			"verify that /sys/bus/pci/devices is mounted and readable on Linux")
 	}
 
 	// Apply endpoint classification (three-layer rule) plus the optional
@@ -2003,8 +2090,8 @@ func main() {
 	// users see exactly which BDFs were dropped and why.
 	overrides, err := loadPCIeFilterOverrides(PCIE_FILTER_FILE)
 	if err != nil {
-		fmt.Printf("Warning: Failed to load %s: %v\n", PCIE_FILTER_FILE, err)
-		overrides = pcieFilterOverrides{Include: map[string]bool{}, Exclude: map[string]bool{}}
+		fatalOperation("Startup failed: cannot read the PCI endpoint filter", err,
+			"fix the permissions on /lpot/pcie_filter.txt or remove it to use automatic classification")
 	}
 	kept, skipped := filterEndpoints(bdfs, overrides)
 	skippedDevicesGlobal = skipped
@@ -2052,8 +2139,8 @@ func main() {
 		fmt.Printf("%s Auto-scanning PCI devices to generate ignore bits...\n", timestampStr)
 
 		if err := scanAndGenerateIgnoreBits(); err != nil {
-			fmt.Printf("Warning: Auto-scan failed: %v\n", err)
-			fmt.Fprintf(logFp, "%s Warning: Auto-scan failed: %v\n", timestampStr, err)
+			fatalOperation("Cycle failed: automatic volatile-byte scan failed", err,
+				"run -scan separately, verify PCI config-space access, then retry the -t run")
 		} else {
 			fmt.Printf("%s Auto-scan completed successfully\n", timestampStr)
 			fmt.Fprintf(logFp, "%s Auto-scan completed successfully\n", timestampStr)
@@ -2062,8 +2149,8 @@ func main() {
 	}
 
 	if len(bdfs) == 0 {
-		fmt.Printf("Error: No PCI devices found\n")
-		os.Exit(1)
+		fatalOperation("Cycle failed: no PCI endpoint devices were found", errors.New("empty endpoint set"),
+			"run -classify to review filtering and check /lpot/pcie_filter.txt")
 	}
 
 	// Create initial PCI device files if not exist
@@ -2085,7 +2172,10 @@ func main() {
 			if stopFlag.Load() {
 				break
 			}
-			executeLspci(bdf, "_init.txt")
+			if err := executeLspci(bdf, "_init.txt"); err != nil {
+				fatalOperation("Startup failed: cannot capture the initial lspci snapshot", err,
+					"verify that pciutils is installed and that the device is still present")
+			}
 		}
 	}
 
@@ -2098,7 +2188,8 @@ func main() {
 
 	// Execute config scan logic
 	if err := runConfigScan(); err != nil {
-		fmt.Printf("Warning: Config scan failed: %v\n", err)
+		fatalOperation("Cycle failed: PCI configuration scan failed", err,
+			"verify PCI sysfs access and regenerate /lpot/ignore_list.txt with -scan")
 	}
 
 	timestampStr = getCurrentTimestamp()
@@ -2109,7 +2200,8 @@ func main() {
 	if err := processPCIDevices(bdfs, logFp, *stopService); err != nil {
 		timestampStr = getCurrentTimestamp()
 		fmt.Fprintf(logFp, "%s PCI devices check failed\n", timestampStr)
-		os.Exit(1)
+		fatalOperation("Cycle failed: PCI device comparison failed", err,
+			"review /lpot/reboot.log and verify that pciutils can query every endpoint")
 	}
 
 	// Clean up tmp directory files
@@ -2203,7 +2295,7 @@ func runConfigScan() error {
 	// Check if ignore_list.txt exists, if not run scan first
 	if !fileExists(IGNORE_LIST_FILE) {
 		if err := scanAndGenerateIgnoreBits(); err != nil {
-			fmt.Printf("Warning: Failed to generate ignore bits: %v\n", err)
+			return fmt.Errorf("generate volatile-byte ignore list: %w", err)
 		}
 	}
 
@@ -2238,7 +2330,9 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 
 	// Generate current device files
 	for _, bdf := range bdfs {
-		executeLspci(bdf, ".txt")
+		if err := executeLspci(bdf, ".txt"); err != nil {
+			return fmt.Errorf("capture current lspci snapshot for %s: %w", bdf, err)
+		}
 	}
 
 	// Check for removed devices. Removed devices cannot be queried via sysfs
