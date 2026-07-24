@@ -16,9 +16,9 @@
 *.tar
 *.tar.gz
 
-# CodeGraph local index and daemon data
-/.codegraph/*
-!/.codegraph/.gitignore
+# Local tool state and configuration
+/.codegraph/
+/.claude/
 
 # Go tooling and editor/OS metadata
 coverage.out
