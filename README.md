@@ -137,15 +137,14 @@ runtime logs can contain host-specific hardware information.
 ## Review Notes and Known Limitations
 
 The current implementation passes `go test ./...` and `go vet ./...`. The
-source includes tests for secure file writes, SELinux symlink refusal, and
-interruptible waits. Before production use, validate the full reboot workflow
-on the intended Linux hardware.
+source includes tests for secure file writes, SELinux symlink refusal,
+interruptible waits, and shell argument quoting. Before production use,
+validate the full reboot workflow on the intended Linux hardware.
 
-Known follow-up items are tracked in `TODO.md`, including a parser edge case in
-`splitDevices()` where the first device header in a raw config dump can be
-parsed incorrectly. The planned management layer for adding hosts, deploying
-the agent, collecting reports, and displaying a dashboard is documented in
-`CHANGE.md`; it is not implemented by this repository yet.
+Technical documentation is organized under [`docs/`](docs/README.md). Ongoing
+changes, known parser limitations, security history, and the planned remote
+host/report/dashboard management layer are tracked in
+[GitHub Issues](https://github.com/Nephom/lpot/issues).
 
 ## License and Relationship to Upstream
 

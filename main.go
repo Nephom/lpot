@@ -665,6 +665,13 @@ func writeFileNoFollow(path string, data []byte, perm os.FileMode) error {
 	return f.Close()
 }
 
+// shellQuote returns a single-quoted POSIX shell word. Reboot script arguments
+// originate from os.Args, so each argument must be quoted independently rather
+// than joined into an unescaped command line.
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
 // sleepInterruptible blocks until d elapses or ctx is cancelled. It returns
 // true if the full duration elapsed and false if the context was cancelled
 // first. Callers that must not proceed after cancellation should consult the
@@ -971,6 +978,13 @@ func createRebootScript(args []string) error {
 	file, err := os.OpenFile(scriptPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0700)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
+			info, statErr := os.Lstat(scriptPath)
+			if statErr != nil {
+				return fmt.Errorf("failed to verify existing reboot script: %v", statErr)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("refusing to use %s: path is a symlink", scriptPath)
+			}
 			return nil
 		}
 		return fmt.Errorf("failed to create script file: %v", err)
@@ -990,8 +1004,12 @@ func createRebootScript(args []string) error {
 		}
 	}
 
-	fmt.Fprintf(file, "#!/bin/bash\n")
-	fmt.Fprintf(file, "%s %s\n", executablePath, strings.Join(args[1:], " "))
+	fmt.Fprintln(file, "#!/bin/sh")
+	fmt.Fprint(file, "exec ", shellQuote(executablePath))
+	for _, arg := range args[1:] {
+		fmt.Fprint(file, " ", shellQuote(arg))
+	}
+	fmt.Fprintln(file)
 
 	return nil
 }
@@ -1023,6 +1041,13 @@ WantedBy=graphical.target
 	f, err := os.OpenFile(servicePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0644)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
+			info, statErr := os.Lstat(servicePath)
+			if statErr != nil {
+				return fmt.Errorf("failed to verify existing systemd service file: %v", statErr)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("refusing to use %s: path is a symlink", servicePath)
+			}
 			return nil
 		}
 		return fmt.Errorf("failed to create systemd service file: %v", err)
@@ -1241,7 +1266,7 @@ func main() {
 		// reviewed later. Appended with a timestamped banner so repeated runs
 		// build a history instead of silently overwriting the prior report. A
 		// write failure is non-fatal: the report already printed to stdout.
-		if fp, err := os.OpenFile(CLASSIFY_LOG, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+		if fp, err := openSecureAppend(CLASSIFY_LOG, 0644); err == nil {
 			fmt.Fprintf(fp, "\n===== %s classify run (%d devices) =====\n",
 				getCurrentTimestamp(), len(decisions))
 			printClassificationReport(fp, decisions)
@@ -1288,7 +1313,7 @@ func main() {
 			timestampStr := getCurrentTimestamp()
 			errorMsg := fmt.Sprintf("%s Execution halted: timestamp expired.\n", timestampStr)
 
-			if logFp, err := os.OpenFile(REBOOT_LOG, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			if logFp, err := openSecureAppend(REBOOT_LOG, 0644); err == nil {
 				logFp.WriteString(errorMsg)
 				logFp.Close()
 			}
@@ -1333,7 +1358,7 @@ func main() {
 	totalRebootCycles = rebootCount
 
 	// Open log file
-	logFp, err := os.OpenFile(REBOOT_LOG, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logFp, err := openSecureAppend(REBOOT_LOG, 0644)
 	if err != nil {
 		fmt.Printf("Failed to open reboot.log: %v\n", err)
 		os.Exit(1)
@@ -1652,7 +1677,7 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 		}
 
 		timeStr := getCurrentTimestamp()
-		logFile, err := os.OpenFile(REBOOT_LOG, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		logFile, err := openSecureAppend(REBOOT_LOG, 0644)
 		if err != nil {
 			return fmt.Errorf("failed to open log file: %v", err)
 		}
@@ -2200,7 +2225,7 @@ func compareDeviceConfigs(initialFile, reportFile string) error {
 		return fmt.Errorf("failed to collect stable config: %v", err)
 	}
 
-	logFile, err := os.OpenFile(reportFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logFile, err := openSecureAppend(reportFile, 0644)
 	if err != nil {
 		return err
 	}
@@ -2771,7 +2796,7 @@ func compareDevices(device1, device2 Device, stopServiceEnabled bool) Comparison
 	result.ScannedDeviceIDs = append(result.ScannedDeviceIDs, device1.DeviceID)
 
 	// Open log file
-	logFile, err := os.OpenFile(LPOTSCAN_LOG, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logFile, err := openSecureAppend(LPOTSCAN_LOG, 0644)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to open log file: %w", err)
 		return result
@@ -2982,7 +3007,7 @@ func writeFilteredDevicesSection(logFile *os.File) {
 
 // generateFinalSummary generates the final test summary and appends to reboot.log
 func generateFinalSummary() {
-	logFile, err := os.OpenFile(REBOOT_LOG, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logFile, err := openSecureAppend(REBOOT_LOG, 0644)
 	if err != nil {
 		fmt.Printf("Failed to open log file for summary: %v\n", err)
 		return

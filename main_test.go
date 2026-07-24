@@ -156,3 +156,23 @@ func TestSleepInterruptible_Cancelled(t *testing.T) {
 		t.Errorf("did not cancel promptly, took %v", elapsed)
 	}
 }
+
+func TestShellQuote(t *testing.T) {
+	tests := []struct {
+		name string
+		input string
+		want  string
+	}{
+		{name: "plain", input: "/usr/bin/lpot", want: "'/usr/bin/lpot'"},
+		{name: "spaces", input: "-t 2", want: "'-t 2'"},
+		{name: "shell metacharacters", input: "x; rm -rf /", want: "'x; rm -rf /'"},
+		{name: "single quote", input: "it's", want: "'it'\\''s'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shellQuote(tt.input); got != tt.want {
+				t.Errorf("shellQuote(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
