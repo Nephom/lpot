@@ -10,22 +10,25 @@
 Runtime binaries, logs, archives, timestamps, and CodeGraph databases are
 excluded by `.gitignore`.
 
-## Linux Checks Before a Pull Request
+## Linux Target Build
 
 ```bash
 GOOS=linux GOARCH=amd64 go build -o lpot_integrated .
-go vet ./...
-git diff --check
 ```
 
-Run these commands on Linux. The supported target is Linux and the project does
-not require or document macOS compilation or testing.
+The command may be run from the macOS development environment and produces a
+Linux `amd64` executable. The supported runtime target is Linux; macOS is not a
+runtime target. No unit-test suite is maintained for this system-level tool,
+so successful Linux-target compilation is the required local verification.
+
+Run `go vet ./...` only when a compatible Go static-analysis environment is
+available. It is not a substitute for the Linux-target build.
 
 Use `gofmt` on files being modified. The current legacy `main.go` may contain
 pre-existing formatting differences; avoid unrelated whole-file formatting
 changes unless that is the explicit goal of the change.
 
-## Validation Boundaries
+## Runtime Validation Boundaries
 
 Validation must not modify PCI state, reboot an unrelated machine, change
 SELinux kernel state unexpectedly, or write outside the intended runtime

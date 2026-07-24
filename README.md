@@ -38,9 +38,8 @@ enabled. Use it only on a disposable or explicitly reserved test system.
 - `systemd` for reboot persistence during a normal run.
 - A test host whose reboot can be interrupted or observed safely.
 
-The project targets Linux only. Build and validate it on the Linux test host or
-in a Linux build environment; macOS and other local development environments
-are outside the supported build matrix.
+The project targets Linux only. macOS may be used as the local development
+environment, but it must produce a Linux binary through cross-compilation.
 
 ## Linux Build
 
@@ -48,11 +47,13 @@ are outside the supported build matrix.
 GOOS=linux GOARCH=amd64 go build -o lpot_integrated .
 ```
 
-Run the build command on Linux. The executable depends on Linux sysfs, PCI
-utilities, systemd, and root-only operations, so macOS is not a development or
-validation target for this project.
+The command above can be run from macOS or another development host. The
+resulting executable depends on Linux sysfs, PCI utilities, systemd, and
+root-only operations, so it must be deployed and run on Linux.
 
-On the Linux build host, optional static checks can be run with:
+No unit-test suite is maintained for this system-level executable. The required
+local verification is a successful Linux-target compilation. Optional static
+analysis can be run in a compatible Go environment with:
 
 ```bash
 go vet ./...
@@ -146,9 +147,10 @@ runtime logs can contain host-specific hardware information.
 
 ## Review Notes and Known Limitations
 
-The implementation is intended to be reviewed and validated on Linux. Before
-production use, validate the full reboot workflow on the intended Linux
-hardware. macOS validation is deliberately not part of this project workflow.
+The implementation targets Linux. Confirm the Linux-target build succeeds
+before deployment, then validate the full reboot workflow on the intended Linux
+hardware. The macOS role is limited to local development and cross-compilation;
+the binary must not be run there.
 
 Technical documentation is organized under [`docs/`](docs/README.md). Ongoing
 changes, known parser limitations, security history, and the planned remote
