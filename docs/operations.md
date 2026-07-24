@@ -6,8 +6,8 @@ LPOT is a Linux system-level test tool. A normal run requires root, writes
 under `/lpot`, stops/disables firewall services, stops/disables AppArmor when
 present, changes SELinux settings when present, installs `lpot_reboot.service`,
 and invokes `reboot`. Run it only on a reserved laboratory host. Use `-g`
-while validating command-line behavior because debug mode never invokes the
-reboot command.
+while validating command-line behavior because debug mode performs one complete
+setup/scan/compare cycle and never invokes the reboot command.
 
 ## Requirements
 
@@ -57,8 +57,8 @@ sudo ./lpot -r
 | `-p` | Stop after a comparison error | disabled |
 | `-g` | Debug mode; skip reboot | disabled |
 | `-r` | Reset `/lpot` state | off |
-| `-scan` | Generate volatile-byte ignore data and exit | off |
-| `-classify` | Print endpoint classification and exit | off |
+| `-scan` | Scan USB/bridge/volatile devices into `ignore_list.txt` and exit | off |
+| `-classify` | List external PCIe endpoints and write a report | off |
 | `-h` | Print help | off |
 
 ## Endpoint Filter
@@ -87,9 +87,10 @@ All persistent state is stored under `/lpot`:
 - `rebootcount`: reboot-cycle counter.
 - `timestamp`: test expiration timestamp.
 - `initial_pci_devices.txt`: initial `lspci` snapshot.
-- `ignore_bits.txt`: volatile configuration-byte list.
+- `ignore_list.txt`: whole-device ignores plus volatile configuration offsets.
 - `pci-config-changes.log`: configuration-space comparison results.
 - `pci_devices_classify.log`: classification report history.
+- `lpotscan.log`: lspci comparison log.
 - `pcie_filter.txt`: optional endpoint overrides.
 - `tmp/`: temporary per-device `lspci` snapshots.
 

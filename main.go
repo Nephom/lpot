@@ -35,10 +35,10 @@ const (
 	INITIAL_PCI_DEVICES = "/lpot/initial_pci_devices.txt"
 	REBOOT_LOG          = "/lpot/reboot.log"
 	TMP_DIR             = "/lpot/tmp"
-	IGNORE_BITS_FILE    = "/lpot/ignore_bits.txt"
+	IGNORE_LIST_FILE    = "/lpot/ignore_list.txt"
 	CONFIG_CHANGES_LOG  = "/lpot/pci-config-changes.log"
 	CLASSIFY_LOG        = "/lpot/pci_devices_classify.log"
-	LPOTSCAN_LOG        = "/tmp/lpotscan.log"
+	LPOTSCAN_LOG        = "/lpot/lpotscan.log"
 	PCIE_FILTER_FILE    = "/lpot/pcie_filter.txt"
 
 	// Per-command timeouts for external tools. Chosen conservatively so a stuck
@@ -608,7 +608,7 @@ func ensureRoot() {
 
 // secureLpotDir ensures LPOT_DIR exists as a real directory owned by root and
 // not reachable through a symlink. Permissions are tightened to 0700 so that
-// only root can read the accumulated logs and ignore_bits.txt.
+	// only root can read the accumulated logs and ignore_list.txt.
 func secureLpotDir() error {
 	info, err := os.Lstat(LPOT_DIR)
 	if err != nil {
@@ -763,6 +763,7 @@ type DeviceIgnoreBits struct {
 	BusID           string
 	IgnoreBytes     map[int]bool
 	IsUSBController bool
+	IgnoreDevice    bool
 }
 
 // StableConfig holds PCI config data together with per-byte stability info.
@@ -1203,6 +1204,19 @@ func disableAppArmor() error {
 	return stopAndDisableUnit("apparmor")
 }
 
+func prepareHostPolicies() error {
+	if err := disableFirewall(); err != nil {
+		return fmt.Errorf("disable firewall: %w", err)
+	}
+	if err := disableAppArmor(); err != nil {
+		return fmt.Errorf("disable AppArmor: %w", err)
+	}
+	if err := disableSELinux(); err != nil {
+		return fmt.Errorf("configure SELinux: %w", err)
+	}
+	return nil
+}
+
 // Reset lpot directory
 func resetLpotDirectory() {
 	fmt.Println("Resetting /lpot directory...")
@@ -1255,10 +1269,10 @@ func showHelp(programName string) {
 	fmt.Printf("  -p           Set stop flag when Error occurred!\n")
 	fmt.Printf("  -g           Enable debug mode (disable reboot commands and show debug info).\n")
 	fmt.Printf("  -r           Reset /lpot directory and clean all files.\n")
-	fmt.Printf("  -scan        Only scan and generate ignore bits file, then exit.\n")
+	fmt.Printf("  -scan        Scan USB/bridge/volatile devices and write /lpot/ignore_list.txt, then exit.\n")
 	fmt.Printf("  -classify    Print PCI endpoint classification report and exit (dry-run).\n")
 	fmt.Printf("  -h, --help   Show Help menu\n")
-	fmt.Printf("\nNOTE: PCI device scanning is automatically performed after driver ready time if ignore_bits.txt doesn't exist.\n")
+	fmt.Printf("\nNOTE: PCI device scanning is automatically performed after driver ready time if ignore_list.txt doesn't exist.\n")
 	fmt.Printf("NOTE: Bridges and legacy PCI devices are filtered automatically. Override via %s.\n", PCIE_FILTER_FILE)
 	fmt.Printf("\nExample:\n")
 	fmt.Printf("  %s -t 24 -s 600    Run reboot during 24 hours and each reboot wait for 600 seconds\n", programName)
@@ -1324,6 +1338,10 @@ func main() {
 	}
 
 	if *scanOnly {
+		if err := prepareHostPolicies(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to prepare host: %v\n", err)
+			os.Exit(1)
+		}
 		if err := scanAndGenerateIgnoreBits(); err != nil {
 			fmt.Printf("Error during scan: %v\n", err)
 			os.Exit(1)
@@ -1336,6 +1354,10 @@ func main() {
 	// touches no persistent state so users can run it before committing to a
 	// reboot test.
 	if *classify {
+		if err := prepareHostPolicies(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to prepare host: %v\n", err)
+			os.Exit(1)
+		}
 		bdfs, err := fetchPCIBDFs()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to fetch PCI BDFs: %v\n", err)
@@ -1378,16 +1400,8 @@ func main() {
 	// The test host is dedicated lab hardware. Disable host firewall and
 	// mandatory access-control services before installing the reboot service so
 	// the PCI test is not blocked by distro-specific policy.
-	if err := disableFirewall(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to disable firewall: %v\n", err)
-		os.Exit(1)
-	}
-	if err := disableAppArmor(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to disable AppArmor: %v\n", err)
-		os.Exit(1)
-	}
-	if err := disableSELinux(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to configure SELinux: %v\n", err)
+	if err := prepareHostPolicies(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to prepare host: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -1524,8 +1538,8 @@ func main() {
 		return
 	}
 
-	// Auto-scan after driver ready time (if ignore_bits.txt doesn't exist)
-	if !fileExists(IGNORE_BITS_FILE) {
+	// Auto-scan after driver ready time (if ignore_list.txt doesn't exist)
+	if !fileExists(IGNORE_LIST_FILE) {
 		timestampStr = getCurrentTimestamp()
 		fmt.Fprintf(logFp, "%s Auto-scanning PCI devices to generate ignore bits...\n", timestampStr)
 		logFp.Sync()
@@ -1660,7 +1674,7 @@ func scanAndGenerateIgnoreBits() error {
 		return fmt.Errorf("failed to detect volatile bytes: %v", err)
 	}
 
-	err = saveIgnoreBits(IGNORE_BITS_FILE, ignoreBits)
+	err = saveIgnoreBits(IGNORE_LIST_FILE, ignoreBits)
 	if err != nil {
 		return fmt.Errorf("failed to save ignore bits: %v", err)
 	}
@@ -1673,8 +1687,8 @@ func scanAndGenerateIgnoreBits() error {
 func runConfigScan() error {
 	initialFile := "/lpot/initial.bin"
 
-	// Check if ignore_bits.txt exists, if not run scan first
-	if !fileExists(IGNORE_BITS_FILE) {
+	// Check if ignore_list.txt exists, if not run scan first
+	if !fileExists(IGNORE_LIST_FILE) {
 		if err := scanAndGenerateIgnoreBits(); err != nil {
 			fmt.Printf("Warning: Failed to generate ignore bits: %v\n", err)
 		}
@@ -1753,7 +1767,7 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 
 	if allUnchanged {
 		// Load ignore list for lpotscan
-		ignoreSet, err := loadIgnoreList(IGNORE_BITS_FILE)
+		ignoreSet, err := loadIgnoreList(IGNORE_LIST_FILE)
 		if err != nil {
 			fmt.Printf("Warning: Failed to load ignore list: %v\n", err)
 			ignoreSet = make(map[string]bool)
@@ -1968,7 +1982,24 @@ func detectVolatileBytesWithSamples() (map[string]DeviceIgnoreBits, []map[string
 			continue
 		}
 
-		// Check if it's a USB Controller
+		// USB controllers, bridges, and legacy/non-endpoint devices are not part
+		// of the external PCIe test set. Record them as whole-device ignores so
+		// -scan produces the reusable ignore_list.txt requested by the operator.
+		if info, ok := readPCIDeviceInfo(busID); ok {
+			if endpoint, reason := isPCIeEndpoint(info); !endpoint {
+				ignoreBits[busID] = DeviceIgnoreBits{
+					BusID:        busID,
+					IgnoreBytes:  make(map[int]bool),
+					IgnoreDevice: true,
+				}
+				fmt.Printf("Device %s: %s, ignoring entire device\n", busID, reason)
+				continue
+			}
+		}
+
+		// Check if it's a USB Controller. Keep this explicit classification in
+		// the record for readable diagnostics even though IgnoreDevice is the
+		// field consumed by saveIgnoreBits.
 		if len(deviceData[0]) >= 11 {
 			classCode := deviceData[0][11] // Base Class
 			subClass := deviceData[0][10]  // Sub Class
@@ -1978,6 +2009,7 @@ func detectVolatileBytesWithSamples() (map[string]DeviceIgnoreBits, []map[string
 					BusID:           busID,
 					IgnoreBytes:     make(map[int]bool),
 					IsUSBController: true,
+					IgnoreDevice:    true,
 				}
 				fmt.Printf("Device %s: USB Controller detected, ignoring entire device\n", busID)
 				continue
@@ -2038,9 +2070,10 @@ func detectVolatileBytesWithSamples() (map[string]DeviceIgnoreBits, []map[string
 
 		if len(ignoreBytes) > 0 {
 			ignoreBits[busID] = DeviceIgnoreBits{
-				BusID:           busID,
-				IgnoreBytes:     ignoreBytes,
-				IsUSBController: false,
+					BusID:           busID,
+					IgnoreBytes:     ignoreBytes,
+					IsUSBController: false,
+					IgnoreDevice:    false,
 			}
 		}
 	}
@@ -2257,7 +2290,7 @@ func saveIgnoreBits(filePath string, ignoreBits map[string]DeviceIgnoreBits) err
 
 	buffer.WriteString("# Auto-generated list of volatile PCI configuration bytes to ignore\n")
 	buffer.WriteString("# Generated at: " + logTimestamp() + "\n")
-	buffer.WriteString("# Format: BusID [0xXX 0xYY ...] (offsets are timer-related, no offsets means USB device)\n")
+	buffer.WriteString("# Format: BusID [0xXX 0xYY ...] (offsets are volatile, no offsets means whole-device ignore)\n")
 	buffer.WriteString("# BusID is written in short form (bus:device.function) to match\n")
 	buffer.WriteString("# parseDeviceFile()'s lspci-text view; long form is still accepted on read.\n")
 	buffer.WriteString("# These bytes are identified as timer-related or frequently changing\n")
@@ -2278,9 +2311,9 @@ func saveIgnoreBits(filePath string, ignoreBits map[string]DeviceIgnoreBits) err
 	for _, busID := range busIDs {
 		device := normalised[busID]
 
-		// Check if it's a USB Controller (Class 0x0c, Subclass 0x03)
-		if device.IsUSBController {
-			// USB Controller - ignore entire device
+		// Whole-device ignores include USB controllers, bridges, and other
+		// non-endpoint devices.
+		if device.IgnoreDevice || device.IsUSBController {
 			buffer.WriteString(busID + "\n")
 		} else if len(device.IgnoreBytes) > 0 {
 			// Has timer offsets - only ignore specific offsets
@@ -2313,7 +2346,7 @@ func compareDeviceConfigs(initialFile, reportFile string) error {
 	}
 
 	// Read ignore devices and offsets
-	ignoreDevices, ignoreOffsets, err := readIgnoreDevicesAndOffsets(IGNORE_BITS_FILE)
+	ignoreDevices, ignoreOffsets, err := readIgnoreDevicesAndOffsets(IGNORE_LIST_FILE)
 	if err != nil {
 		return fmt.Errorf("failed to read ignore devices: %v", err)
 	}
@@ -2382,7 +2415,7 @@ func compareDeviceConfigs(initialFile, reportFile string) error {
 		currentInfo := parsePCIConfig(stableCfg.Data)
 		currentInfo.BusID = busID
 
-		// Merge static offset ignore list from ignore_bits.txt
+		// Merge static offset ignore list from ignore_list.txt
 		combinedIgnore := map[int]bool{}
 		if offsets, ok := ignoreOffsets[busID]; ok {
 			for offset := range offsets {
@@ -2459,7 +2492,7 @@ func formatDeviceInfo(info PCIDeviceInfo) string {
 //
 // Filter priority (highest to lowest):
 //  1. unstableBytes: bytes flagged as timer noise by live stability analysis (collectStableConfig)
-//  2. timerPatterns: static offset ignore list from ignore_bits.txt
+//  2. timerPatterns: static offset ignore list from ignore_list.txt
 //  3. timerRelatedOffsets: hardcoded known timer registers
 //  4. volatileStatusBits: volatile status bits masked in the Status register
 //

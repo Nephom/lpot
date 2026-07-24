@@ -76,13 +76,13 @@ sudo ./lpot -h
 Common commands:
 
 ```bash
-# Dry-run endpoint classification; does not start a reboot test.
+# List external PCIe endpoints and write the classification report.
 sudo ./lpot -classify
 
-# Generate the volatile PCI configuration-byte ignore list and exit.
+# Scan USB/bridge/volatile devices and write /lpot/ignore_list.txt.
 sudo ./lpot -scan
 
-# Two-hour debug run; debug mode does not invoke reboot.
+# Two-hour debug cycle; setup, scan and compare, but do not invoke reboot.
 sudo ./lpot -g -t 2
 
 # Twenty-four hours, waiting 600 seconds before each reboot.
@@ -106,26 +106,30 @@ flowchart TD
     A[Start lpot as root] --> B[Resolve lspci systemctl reboot]
     B --> C[Create or verify /lpot]
     C --> D[Parse command-line options]
-    D -->|help reset scan classify| E[Run special mode and exit]
-    D --> F[Stop and disable firewall services]
-    F --> G[Stop and disable AppArmor if present]
-    G --> H[Set SELinux permissive now and disabled on reboot]
-    H --> I[Create reboot.sh and systemd service]
-    I --> J[Increment reboot counter]
-    J --> K[Discover PCI BDFs]
-    K --> L[Classify endpoints and apply pcie_filter.txt]
-    L --> M[Wait for drivers]
-    M --> N[Scan volatile config bytes if needed]
-    N --> O[Capture lspci and PCI config snapshots]
-    O --> P[Compare topology, lspci, and config space]
-    P --> Q[Write cycle summary]
-    Q --> R{Debug mode or stop requested?}
-    R -->|debug| S[Log reboot skipped]
-    R -->|stop| T[Exit without reboot]
-    R -->|no| U[Wait before reboot]
-    U --> V[Reboot host]
-    V --> W[systemd starts /lpot/reboot.sh after boot]
-    W --> A
+    D -->|help or reset| E[Run special mode and exit]
+    D -->|scan or classify| F[Prepare host policies and initialize /lpot]
+    F -->|classify| G[List external PCIe endpoints and write report]
+    F -->|scan| H[Scan USB bridge and volatile devices]
+    G --> E
+    H --> I[Write /lpot/ignore_list.txt and exit]
+    D --> J[Stop and disable firewall services]
+    J --> K[Stop and disable AppArmor if present]
+    K --> L[Set SELinux permissive now and disabled on reboot]
+    L --> M[Create reboot.sh and systemd service]
+    M --> N[Increment reboot counter]
+    N --> O[Discover PCI BDFs]
+    O --> P[Classify endpoints and apply pcie_filter.txt]
+    P --> Q[Wait -d seconds for drivers]
+    Q --> R[Scan if needed and capture lspci/config snapshots]
+    R --> S[Compare topology lspci and config space]
+    S --> T[Write cycle records and summary under /lpot]
+    T --> U{Debug mode or stop requested?}
+    U -->|debug| V[Log reboot skipped and exit]
+    U -->|stop| W[Exit without reboot]
+    U -->|normal| X[Wait -s seconds]
+    X --> Y[Reboot host]
+    Y --> Z[systemd starts /lpot/reboot.sh after boot]
+    Z --> A
 ```
 
 ## Host Policy Preparation
@@ -191,7 +195,8 @@ The program stores persistent state under `/lpot`:
 - `rebootcount`: current reboot-cycle counter.
 - `timestamp`: test expiration timestamp.
 - `initial_pci_devices.txt`: initial `lspci` snapshot.
-- `ignore_bits.txt`: configuration bytes treated as volatile.
+- `ignore_list.txt`: whole-device ignores for USB/bridges plus volatile offsets.
+- `lpotscan.log`: lspci comparison log.
 - `pci-config-changes.log`: configuration-space comparison results.
 - `pci_devices_classify.log`: historical `-classify` reports.
 - `pcie_filter.txt`: optional endpoint overrides.
