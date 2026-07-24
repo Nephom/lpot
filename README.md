@@ -28,6 +28,7 @@ enabled. Use it only on a disposable or explicitly reserved test system.
 - Interruptible waits and bounded external-command execution.
 - Authenticated read-only audit mode (`-g <hash>`) that prints planned commands
   and complete text file payloads without changing the host.
+- Local read-only result dashboard (`-ui`) backed by an aggregated JSON report.
 - Root-owned runtime directory (`0755`) for readable reports, with
   root-only reboot controls and symlink-resistant writes.
 - Per-cycle logs and a final summary that separates noteworthy changes from
@@ -103,6 +104,9 @@ sudo ./lpot -g "$(sudo ./lpot -k)" -t 2 -d 10 -s 10
 # Audit only scan or classify without writing their results.
 sudo ./lpot -g "$(sudo ./lpot -k)" -scan
 sudo ./lpot -g "$(sudo ./lpot -k)" -classify
+
+# Open the completed result report in the local browser.
+./lpot -ui
 
 # First invocation: install the binary persistently and run for twenty-four
 # hours, waiting 600 seconds before each reboot.
@@ -185,6 +189,7 @@ Options:
 | `-r` | Reset `/lpot` runtime state | off |
 | `-scan` | Generate volatile-byte ignore data and exit | off |
 | `-classify` | Print endpoint classification and exit | off |
+| `-ui` | Open the local read-only result dashboard | off |
 | `-h` | Show help | off |
 
 ## Endpoint Filter
@@ -223,6 +228,7 @@ The program stores persistent state under `/lpot`:
 - `pci_devices_classify.log`: historical `-classify` reports.
 - `pcie_filter.txt`: optional endpoint overrides.
 - `tmp/`: temporary per-device `lspci` snapshots.
+- `result.json`: atomic structured checkpoint and final test report.
 
 `/lpot` and `/lpot/tmp` are root-owned and mode `0755` so non-root operators
 can inspect reports. The reboot executable and script remain root-owned and
@@ -230,6 +236,22 @@ mode `0700`; only root can modify reboot behavior.
 
 The `logs/` directory in this repository is intentionally ignored because
 runtime logs can contain host-specific hardware information.
+
+## Result Dashboard
+
+After a normal test has produced `/lpot/result.json`, open the local read-only
+dashboard on the test machine with:
+
+```bash
+./lpot -ui
+```
+
+The dashboard binds only to `127.0.0.1`, opens the local browser through
+`xdg-open` when available, and shows the overall status, check categories,
+cycle timeline, filtered problems, and links to detailed text logs. A
+checkpoint is written after each completed cycle before the reboot wait starts;
+the final report is written when the test expires. The dashboard does not
+modify `/lpot`, systemd, security policy, or reboot state.
 
 ## Review Notes and Known Limitations
 

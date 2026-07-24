@@ -27,6 +27,9 @@ systemd, and reboot persistence.
    present, sets SELinux permissive for the current boot and disabled for the
    next boot, then prepares the reboot script and systemd service.
 9. The cycle state is recorded under `/lpot`.
+10. After each completed cycle, result aggregation writes an atomic
+    `/lpot/result.json` checkpoint before the reboot wait starts. On expiration,
+    the same report is finalized with `PASS`, `FAIL`, or `INCOMPLETE`.
 
 ## Reboot Cycle
 
@@ -71,6 +74,8 @@ regular files are refreshed so changed arguments and binaries take effect. A leg
   files and should not be committed.
 - Fatal startup and cycle errors include an operation, the underlying cause,
   and an operator suggestion in stderr.
+- `-ui` serves the structured result and fixed report allowlist on
+  `127.0.0.1` only; it has no mutation endpoints.
 
 ## Known Limitations
 

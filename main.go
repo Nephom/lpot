@@ -7,12 +7,15 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -40,6 +43,7 @@ const (
 	TMP_DIR             = "/lpot/tmp"
 	IGNORE_LIST_FILE    = "/lpot/ignore_list.txt"
 	CONFIG_CHANGES_LOG  = "/lpot/pci-config-changes.log"
+	RESULT_FILE         = "/lpot/result.json"
 	CLASSIFY_LOG        = "/lpot/pci_devices_classify.log"
 	LPOTSCAN_LOG        = "/lpot/lpotscan.log"
 	PCIE_FILTER_FILE    = "/lpot/pcie_filter.txt"
@@ -56,7 +60,7 @@ const (
 	// lets users correlate events by plain text search and by tools like
 	// `sort -k1,2` without translation.
 	logTimeFormat = "2006-01-02 15:04:05"
-	version       = "2.4.0"
+	version       = "2.5.0"
 	serviceName   = "lpot.service"
 	legacyService = "lpot_reboot.service"
 	servicePath   = "/etc/systemd/system/" + serviceName
@@ -148,6 +152,63 @@ type cycleChange struct {
 	Time       time.Time
 	Reason     string
 	Noteworthy bool
+}
+
+type resultReport struct {
+	SchemaVersion    int               `json:"schema_version"`
+	Version          string            `json:"version"`
+	RunID            string            `json:"run_id"`
+	Status           string            `json:"status"`
+	Checkpoint       bool              `json:"checkpoint"`
+	Message          string            `json:"message"`
+	StartedAt        string            `json:"started_at,omitempty"`
+	UpdatedAt        string            `json:"updated_at"`
+	FinishedAt       string            `json:"finished_at,omitempty"`
+	TotalCycles      int               `json:"total_cycles"`
+	CompletedCycles  int               `json:"completed_cycles"`
+	SuccessfulCycles int               `json:"successful_cycles"`
+	FailedCycles     int               `json:"failed_cycles"`
+	Checks           resultChecks      `json:"checks"`
+	Cycles           []resultCycle     `json:"cycles"`
+	Problems         []resultProblem   `json:"problems"`
+	Artifacts        map[string]string `json:"artifacts"`
+}
+
+type resultChecks struct {
+	Topology    resultCheck `json:"topology"`
+	LSPCI       resultCheck `json:"lspci"`
+	ConfigSpace resultCheck `json:"config_space"`
+	ConfigNoise resultCheck `json:"config_noise"`
+	RebootWait  resultCheck `json:"reboot_wait"`
+}
+
+type resultCheck struct {
+	Status        string `json:"status"`
+	ChangedCycles int    `json:"changed_cycles,omitempty"`
+	Noteworthy    int    `json:"noteworthy_changes,omitempty"`
+	BenignChanges int    `json:"benign_changes,omitempty"`
+	Message       string `json:"message,omitempty"`
+}
+
+type resultCycle struct {
+	Number      int             `json:"number"`
+	StartedAt   string          `json:"started_at,omitempty"`
+	FinishedAt  string          `json:"finished_at,omitempty"`
+	Status      string          `json:"status"`
+	Topology    string          `json:"topology"`
+	LSPCI       string          `json:"lspci"`
+	ConfigSpace string          `json:"config_space"`
+	Events      []resultProblem `json:"events,omitempty"`
+}
+
+type resultProblem struct {
+	Severity   string `json:"severity"`
+	Category   string `json:"category"`
+	Cycle      int    `json:"cycle,omitempty"`
+	Timestamp  string `json:"timestamp,omitempty"`
+	BDF        string `json:"bdf,omitempty"`
+	Message    string `json:"message"`
+	DetailsLog string `json:"details_log,omitempty"`
 }
 
 // recordCycleChange appends a noteworthy change record (topology / lspci) for
@@ -1757,7 +1818,7 @@ func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stop
 
 	for _, path := range []string{
 		INITIAL_PCI_DEVICES, IGNORE_LIST_FILE, "/lpot/initial.bin", "/lpot/current.bin",
-		CONFIG_CHANGES_LOG, CLASSIFY_LOG, LPOTSCAN_LOG, REBOOT_LOG,
+		CONFIG_CHANGES_LOG, CLASSIFY_LOG, LPOTSCAN_LOG, REBOOT_LOG, RESULT_FILE,
 	} {
 		fmt.Printf("[DRY-RUN] WOULD WRITE/UPDATE %s (content generated from read-only PCI scan and comparison)\n", path)
 	}
@@ -1835,6 +1896,7 @@ func showHelp(programName string) {
 	fmt.Printf("  -r           Reset /lpot directory and clean all files.\n")
 	fmt.Printf("  -scan        Scan USB/bridge/volatile devices and write /lpot/ignore_list.txt, then exit.\n")
 	fmt.Printf("  -classify    Print and save the PCI endpoint classification report, then exit.\n")
+	fmt.Printf("  -ui          Open the local read-only result dashboard.\n")
 	fmt.Printf("  -h, --help   Show Help menu\n")
 	fmt.Printf("\nNOTE: PCI device scanning is automatically performed after driver ready time if ignore_list.txt doesn't exist.\n")
 	fmt.Printf("NOTE: Bridges and legacy PCI devices are filtered automatically. Override via %s.\n", PCIE_FILTER_FILE)
@@ -1860,6 +1922,7 @@ func main() {
 		reset       = flag.Bool("r", false, "Reset /lpot directory")
 		scanOnly    = flag.Bool("scan", false, "Only scan and generate ignore bits file, then exit")
 		classify    = flag.Bool("classify", false, "Print PCI endpoint classification report and exit")
+		ui          = flag.Bool("ui", false, "Open the local read-only result dashboard")
 		help        = flag.Bool("h", false, "Show help menu")
 	)
 	applyDefaultDurationForBareT()
@@ -1868,8 +1931,16 @@ func main() {
 	debugRequested := flagWasProvided("g")
 	tRequested := flagWasProvided("t")
 
-	if *help || (!tRequested && !debugRequested && !*showKey && !*reset && !*scanOnly && !*classify) {
+	if *help || (!tRequested && !debugRequested && !*showKey && !*reset && !*scanOnly && !*classify && !*ui) {
 		showHelp(os.Args[0])
+		return
+	}
+	if *ui {
+		if err := startDashboard(); err != nil {
+			fmt.Fprintf(os.Stderr, "Dashboard failed: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Suggestion: verify that localhost is available and try -ui again.")
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -2221,6 +2292,10 @@ func main() {
 		cycleStatus = "clean (config noise)"
 	}
 	logCycleEnd(logFp, rebootCount, cycleStatus)
+	if err := writeResultReport(true); err != nil {
+		fatalOperation("Cycle failed: cannot write the result checkpoint before reboot wait", err,
+			"check /lpot permissions and available disk space; reboot was not started")
+	}
 
 	// Prepare for reboot. The wait is interruptible so SIGINT/SIGTERM does not
 	// force the operator to sit through the full waitSeconds (up to 3600).
@@ -2233,6 +2308,9 @@ func main() {
 				getCurrentTimestamp(), currentCycle.Load())
 			logFp.Sync()
 		}
+		if err := writeResultReportWithStatus(false, "INCOMPLETE"); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: unable to publish incomplete result report: %v\n", err)
+		}
 		return
 	}
 
@@ -2243,6 +2321,9 @@ func main() {
 	if stopFlag.Load() {
 		fmt.Fprintf(logFp, "%s Stop requested before reboot; skipping reboot.\n", getCurrentTimestamp())
 		logFp.Sync()
+		if err := writeResultReportWithStatus(false, "INCOMPLETE"); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: unable to publish incomplete result report: %v\n", err)
+		}
 		return
 	}
 
@@ -2264,6 +2345,9 @@ func main() {
 			if logFp, lerr := openSecureAppend(REBOOT_LOG, 0600); lerr == nil {
 				fmt.Fprintf(logFp, "%s reboot command failed: %v\n", getCurrentTimestamp(), err)
 				logFp.Close()
+			}
+			if reportErr := writeResultReportWithStatus(false, "INCOMPLETE"); reportErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: unable to publish incomplete result report: %v\n", reportErr)
 			}
 		}
 	}
@@ -3757,6 +3841,522 @@ func writeFilteredDevicesSection(logFile *os.File) {
 	fmt.Fprintf(logFile, "  Total filtered: %d device(s)\n", len(snap))
 }
 
+type configResultChange struct {
+	cycle     int
+	timestamp string
+	device    string
+	offset    string
+	before    string
+	after     string
+}
+
+func lineTimestamp(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) >= 2 {
+		if _, err := time.Parse(logTimeFormat, fields[0]+" "+fields[1]); err == nil {
+			return fields[0] + " " + fields[1]
+		}
+	}
+	return ""
+}
+
+func lineCycleNumber(line string) int {
+	marker := "Cycle "
+	start := strings.Index(line, marker)
+	if start < 0 {
+		return 0
+	}
+	value := strings.TrimSpace(line[start+len(marker):])
+	value = strings.TrimSuffix(value, "]")
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return 0
+	}
+	value = fields[0]
+	n, _ := strconv.Atoi(value)
+	return n
+}
+
+func parseBDFAfterMarker(line, marker string) string {
+	index := strings.Index(line, marker)
+	if index < 0 {
+		return ""
+	}
+	value := strings.TrimSpace(line[index+len(marker):])
+	if fields := strings.Fields(value); len(fields) > 0 {
+		return strings.TrimSuffix(fields[0], ":")
+	}
+	return ""
+}
+
+func parseConfigResultChanges() []configResultChange {
+	data, err := os.ReadFile(CONFIG_CHANGES_LOG)
+	if err != nil {
+		return nil
+	}
+	var changes []configResultChange
+	cycle := 0
+	timestamp := ""
+	device := ""
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if n := lineCycleNumber(line); n > 0 {
+			cycle = n
+		}
+		if ts := lineTimestamp(line); ts != "" {
+			timestamp = ts
+		}
+		if strings.Contains(line, "Device:") && strings.Contains(line, "config space change detected") {
+			device = parseBDFAfterMarker(line, "Device:")
+			continue
+		}
+		if !strings.Contains(line, "Value at offset") || device == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		offset := ""
+		before := ""
+		after := ""
+		for i, field := range fields {
+			switch field {
+			case "offset":
+				if i+1 < len(fields) {
+					offset = fields[i+1]
+				}
+			case "from":
+				if i+1 < len(fields) {
+					before = fields[i+1]
+				}
+			case "to":
+				if i+1 < len(fields) {
+					after = fields[i+1]
+				}
+			}
+		}
+		if offset != "" {
+			changes = append(changes, configResultChange{cycle, timestamp, device, offset, before, after})
+		}
+	}
+	return changes
+}
+
+func latestTestSession(data []byte) []byte {
+	marker := []byte("#########Start to test#########")
+	markerAt := bytes.LastIndex(data, marker)
+	if markerAt < 0 {
+		return data
+	}
+	startAt := bytes.LastIndex(data[:markerAt], []byte("===== Cycle "))
+	if startAt < 0 {
+		return data[markerAt:]
+	}
+	return data[startAt:]
+}
+
+func buildResultReport(checkpoint bool, statusOverride string) resultReport {
+	var startedAt time.Time
+	totalCycles := 0
+	cyclesWithChanges := 0
+	topologyChanges := 0
+	lspciChanges := 0
+	rebootWaitChanges := 0
+	cycles := make(map[int]*resultCycle)
+	var cycleOrder []int
+	allLogData, _ := os.ReadFile(REBOOT_LOG)
+	data := latestTestSession(allLogData)
+	current := 0
+	var pendingMonitor *resultProblem
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if startedAt.IsZero() && strings.Contains(line, "#########Start to test#########") {
+			if ts := lineTimestamp(line); ts != "" {
+				startedAt, _ = time.Parse(logTimeFormat, ts)
+			}
+		}
+		if n := lineCycleNumber(line); n > 0 {
+			current = n
+			if _, ok := cycles[n]; !ok {
+				cycles[n] = &resultCycle{Number: n, Status: "RUNNING", Topology: "PASS", LSPCI: "PASS", ConfigSpace: "PASS"}
+				cycleOrder = append(cycleOrder, n)
+			}
+		}
+		if current == 0 {
+			continue
+		}
+		cycle := cycles[current]
+		if ts := lineTimestamp(line); ts != "" {
+			if cycle.StartedAt == "" {
+				cycle.StartedAt = ts
+			}
+		}
+		if strings.Contains(line, "===== Cycle") && strings.Contains(line, " END (") {
+			cycle.FinishedAt = lineTimestamp(line)
+			if strings.Contains(line, "changes detected") {
+				cycle.Status = "FAIL"
+			} else if strings.Contains(line, "config noise") {
+				cycle.Status = "INFO"
+			} else {
+				cycle.Status = "PASS"
+			}
+		}
+		if strings.Contains(line, "NEW Device:") || strings.Contains(line, "REMOVED Device:") {
+			cycle.Topology = "FAIL"
+			problem := resultProblem{Severity: "FAIL", Category: "TOPOLOGY", Cycle: current, Timestamp: lineTimestamp(line), Message: line}
+			if strings.Contains(line, "NEW Device:") {
+				problem.BDF = parseBDFAfterMarker(line, "NEW Device:")
+			} else {
+				problem.BDF = parseBDFAfterMarker(line, "REMOVED Device:")
+			}
+			problem.DetailsLog = REBOOT_LOG
+			cycle.Events = append(cycle.Events, problem)
+		}
+		if strings.Contains(line, "Had devices changed") {
+			cycle.LSPCI = "FAIL"
+			cycle.Status = "FAIL"
+			problem := resultProblem{Severity: "FAIL", Category: "LSPCI", Cycle: current, Timestamp: lineTimestamp(line), Message: "lspci capability changes detected", DetailsLog: LPOTSCAN_LOG}
+			cycle.Events = append(cycle.Events, problem)
+		}
+		if strings.Contains(line, "Event: ") {
+			pendingMonitor = &resultProblem{Severity: "FAIL", Category: "REBOOT_WAIT", Cycle: current, Timestamp: lineTimestamp(line), Message: strings.TrimSpace(strings.TrimPrefix(line, "Event: ")), DetailsLog: REBOOT_LOG}
+		}
+		if strings.HasPrefix(line, "BDF: ") && pendingMonitor != nil {
+			pendingMonitor.BDF = strings.TrimSpace(strings.TrimPrefix(line, "BDF: "))
+			cycle.Events = append(cycle.Events, *pendingMonitor)
+			rebootWaitChanges++
+			cycle.Status = "FAIL"
+			pendingMonitor = nil
+		}
+	}
+	for _, cycle := range cycles {
+		totalCycles++
+		if cycle.Topology == "FAIL" {
+			topologyChanges++
+		}
+		if cycle.LSPCI == "FAIL" {
+			lspciChanges++
+		}
+		if cycle.Status == "FAIL" {
+			cyclesWithChanges++
+		}
+	}
+
+	configChanges := parseConfigResultChanges()
+	counts := make(map[string]int)
+	for _, change := range configChanges {
+		counts[change.device+"\x00"+change.offset]++
+	}
+	configProblems := make([]resultProblem, 0, len(configChanges))
+	noteworthyConfig := 0
+	benignConfig := 0
+	for _, change := range configChanges {
+		ratio := 0.0
+		if totalCycles > 0 {
+			ratio = float64(counts[change.device+"\x00"+change.offset]) / float64(totalCycles)
+		}
+		severity := "INFO"
+		classification := "benign reboot-fixed register reset"
+		if ratio < 0.80 {
+			severity = "FAIL"
+			classification = "noteworthy config-space change"
+			noteworthyConfig++
+		} else {
+			benignConfig++
+		}
+		problem := resultProblem{
+			Severity: severity, Category: "CONFIG_SPACE", Cycle: change.cycle,
+			Timestamp: change.timestamp, BDF: change.device,
+			Message:    fmt.Sprintf("%s at %s changed from %s to %s (%s)", classification, change.offset, change.before, change.after, formatRatio(ratio)),
+			DetailsLog: CONFIG_CHANGES_LOG,
+		}
+		configProblems = append(configProblems, problem)
+		if cycle := cycles[change.cycle]; cycle != nil {
+			if severity == "FAIL" {
+				cycle.ConfigSpace = "FAIL"
+				cycle.Status = "FAIL"
+			} else if cycle.ConfigSpace == "PASS" {
+				cycle.ConfigSpace = "INFO"
+				if cycle.Status == "PASS" {
+					cycle.Status = "INFO"
+				}
+			}
+			cycle.Events = append(cycle.Events, problem)
+		}
+	}
+
+	sort.Ints(cycleOrder)
+	orderedCycles := make([]resultCycle, 0, len(cycleOrder))
+	problems := make([]resultProblem, 0, len(configProblems))
+	for _, number := range cycleOrder {
+		cycle := *cycles[number]
+		orderedCycles = append(orderedCycles, cycle)
+		problems = append(problems, cycle.Events...)
+	}
+	if len(problems) == 0 {
+		problems = configProblems
+	}
+	status := "RUNNING"
+	message := "Test continues after reboot"
+	if !checkpoint {
+		if totalCycles == 0 {
+			status = "INCOMPLETE"
+			message = "No completed reboot cycle was recorded"
+		} else if cyclesWithChanges > 0 || noteworthyConfig > 0 {
+			status = "FAIL"
+			message = "Noteworthy PCI topology, lspci, or config-space changes were detected"
+		} else {
+			status = "PASS"
+			message = "PCI topology, lspci capability, and PCI config are stable"
+		}
+	}
+	if statusOverride != "" {
+		status = statusOverride
+		message = "Test stopped before the planned reboot cycle completed"
+	}
+	completed := len(orderedCycles)
+	failed := 0
+	for _, cycle := range orderedCycles {
+		if cycle.Status == "FAIL" {
+			failed++
+		}
+	}
+	runID := startedAt.Format(time.RFC3339)
+	if startedAt.IsZero() {
+		runID = time.Now().Format(time.RFC3339)
+	}
+	result := resultReport{
+		SchemaVersion: 1, Version: version, RunID: runID, Status: status,
+		Checkpoint: checkpoint, Message: message, UpdatedAt: time.Now().Format(time.RFC3339),
+		TotalCycles: totalCycles, CompletedCycles: completed,
+		SuccessfulCycles: completed - failed, FailedCycles: failed,
+		Checks: resultChecks{
+			Topology:    resultCheck{Status: resultStatus(topologyChanges), ChangedCycles: topologyChanges},
+			LSPCI:       resultCheck{Status: resultStatus(lspciChanges), ChangedCycles: lspciChanges},
+			ConfigSpace: resultCheck{Status: resultStatus(noteworthyConfig), Noteworthy: noteworthyConfig},
+			ConfigNoise: resultCheck{Status: resultInfoStatus(benignConfig), BenignChanges: benignConfig},
+			RebootWait:  resultCheck{Status: resultStatus(rebootWaitChanges), ChangedCycles: rebootWaitChanges},
+		},
+		Cycles: orderedCycles, Problems: problems,
+		Artifacts: map[string]string{"result": RESULT_FILE, "summary": REBOOT_LOG, "lspci": LPOTSCAN_LOG, "config_space": CONFIG_CHANGES_LOG},
+	}
+	if !startedAt.IsZero() {
+		result.StartedAt = startedAt.Format(time.RFC3339)
+	}
+	if !checkpoint {
+		result.FinishedAt = time.Now().Format(time.RFC3339)
+	}
+	return result
+}
+
+func formatRatio(ratio float64) string { return fmt.Sprintf("%.0f%% of cycles", ratio*100) }
+
+func resultStatus(changes int) string {
+	if changes > 0 {
+		return "FAIL"
+	}
+	return "PASS"
+}
+
+func resultInfoStatus(changes int) string {
+	if changes > 0 {
+		return "INFO"
+	}
+	return "PASS"
+}
+
+func writeResultReportWithStatus(checkpoint bool, statusOverride string) error {
+	result := buildResultReport(checkpoint, statusOverride)
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode result report: %w", err)
+	}
+	data = append(data, '\n')
+	if err := verifyRootRegularFileIfPresent(RESULT_FILE); err != nil {
+		return err
+	}
+	tmpPath := fmt.Sprintf("%s.tmp.%d", RESULT_FILE, os.Getpid())
+	if err := writeFileNoFollow(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("write temporary result report: %w", err)
+	}
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY, 0644)
+	if err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("open temporary result report: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("sync temporary result report: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temporary result report: %w", err)
+	}
+	if err := os.Rename(tmpPath, RESULT_FILE); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("publish result report: %w", err)
+	}
+	return nil
+}
+
+func writeResultReport(checkpoint bool) error {
+	return writeResultReportWithStatus(checkpoint, "")
+}
+
+const dashboardHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LPOT Test Dashboard</title>
+<style>
+:root { color-scheme: dark; --bg:#10151d; --panel:#18212d; --line:#2b3a4d; --text:#e7edf5; --muted:#9eacbd; --green:#43d17c; --red:#ff6b6b; --yellow:#f4c95d; --blue:#6eb6ff; }
+* { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+main { max-width:1280px; margin:0 auto; padding:28px 20px 60px; } h1,h2 { margin:0; } h1 { font-size:28px; letter-spacing:.02em; } h2 { font-size:16px; margin-bottom:14px; }
+.sub { color:var(--muted); margin:4px 0 24px; } .hero,.panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:20px; }
+.hero { display:flex; align-items:center; justify-content:space-between; gap:20px; margin-bottom:18px; } .status { font-size:30px; font-weight:800; letter-spacing:.06em; }
+.PASS { color:var(--green); } .FAIL { color:var(--red); } .INFO,.RUNNING { color:var(--yellow); } .INCOMPLETE { color:var(--blue); }
+.reason { color:var(--muted); text-align:right; max-width:560px; } .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:18px; }
+.metric { background:#121a24; border:1px solid var(--line); border-radius:10px; padding:14px; } .metric b { display:block; font-size:22px; } .metric span { color:var(--muted); }
+.columns { display:grid; grid-template-columns:1fr 1.35fr; gap:18px; margin-bottom:18px; } .check { display:flex; justify-content:space-between; border-bottom:1px solid var(--line); padding:10px 0; } .check:last-child { border:0; }
+.table-wrap { overflow:auto; } table { border-collapse:collapse; width:100%; min-width:680px; } th,td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; } th { color:var(--muted); font-weight:600; }
+select { background:#121a24; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:7px 10px; margin-bottom:10px; } .empty { color:var(--muted); padding:12px 0; }
+a { color:var(--blue); } code { color:#cbd8e8; } @media (max-width:800px) { .hero { display:block; } .reason { text-align:left; margin-top:10px; } .grid { grid-template-columns:repeat(2,1fr); } .columns { grid-template-columns:1fr; } }
+</style></head>
+<body><main>
+<div class="hero"><div><h1>LPOT PCIe Stability Test</h1><div class="sub" id="run">Loading result...</div></div><div class="status" id="status">...</div><div class="reason" id="reason"></div></div>
+<div class="grid" id="metrics"></div>
+<div class="columns"><section class="panel"><h2>Checks</h2><div id="checks"></div></section><section class="panel"><h2>Run Information</h2><div id="info"></div></section></div>
+<section class="panel" style="margin-bottom:18px"><h2>Problems and Events</h2><select id="severity"><option value="ALL">All severities</option><option value="FAIL">FAIL only</option><option value="INFO">INFO only</option></select><div class="table-wrap" id="problems"></div></section>
+<section class="panel" style="margin-bottom:18px"><h2>Artifacts</h2><div id="artifacts"></div></section>
+<section class="panel"><h2>Cycle Timeline</h2><div class="table-wrap" id="cycles"></div></section>
+</main><script>
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const badge = s => '<b class="'+esc(s)+'">'+esc(s)+'</b>';
+function render(d) {
+  const status = document.getElementById('status'); status.className='status '+esc(d.status); status.textContent=d.status;
+  document.getElementById('reason').textContent=d.message||'';
+  document.getElementById('run').textContent='Run '+(d.run_id||'unknown')+' | Updated '+(d.updated_at||'unknown');
+  document.getElementById('metrics').innerHTML=[['Total cycles',d.total_cycles],['Completed',d.completed_cycles],['Successful',d.successful_cycles],['Failed',d.failed_cycles]].map(x=>'<div class="metric"><b>'+esc(x[1])+'</b><span>'+x[0]+'</span></div>').join('');
+  const checks=[['Topology',d.checks?.topology],['lspci',d.checks?.lspci],['Config space',d.checks?.config_space],['Config noise',d.checks?.config_noise],['Reboot wait',d.checks?.reboot_wait]];
+  document.getElementById('checks').innerHTML=checks.map(x=>'<div class="check"><span>'+x[0]+'</span>'+badge(x[1]?.status||'UNKNOWN')+'</div>').join('');
+  document.getElementById('info').innerHTML='<div class="check"><span>Started</span><code>'+esc(d.started_at||'-')+'</code></div><div class="check"><span>Finished</span><code>'+esc(d.finished_at||'-')+'</code></div><div class="check"><span>Checkpoint</span><code>'+esc(d.checkpoint)+'</code></div>';
+  const filter=document.getElementById('severity').value; const problems=(d.problems||[]).filter(p=>filter==='ALL'||p.severity===filter);
+  document.getElementById('problems').innerHTML=problems.length?'<table><thead><tr><th>Severity</th><th>Category</th><th>Cycle</th><th>Device</th><th>Message</th><th>Log</th></tr></thead><tbody>'+problems.map(p=>'<tr><td>'+badge(p.severity)+'</td><td>'+esc(p.category)+'</td><td>'+esc(p.cycle)+'</td><td>'+esc(p.bdf||'-')+'</td><td>'+esc(p.message)+'</td><td><code>'+esc(p.details_log||'-')+'</code></td></tr>').join('')+'</tbody></table>':'<div class="empty">No matching problems.</div>';
+  document.getElementById('artifacts').innerHTML=Object.entries(d.artifacts||{}).map(([name,path])=>'<div class="check"><span>'+esc(name)+'</span><a href="/api/log?name='+encodeURIComponent(name)+'" target="_blank">'+esc(path)+'</a></div>').join('')||'<div class="empty">No artifacts.</div>';
+  const cycles=d.cycles||[]; document.getElementById('cycles').innerHTML=cycles.length?'<table><thead><tr><th>Cycle</th><th>Status</th><th>Topology</th><th>lspci</th><th>Config</th><th>Events</th></tr></thead><tbody>'+cycles.slice().reverse().map(c=>'<tr><td>'+String(c.number).padStart(3,'0')+'</td><td>'+badge(c.status)+'</td><td>'+badge(c.topology)+'</td><td>'+badge(c.lspci)+'</td><td>'+badge(c.config_space)+'</td><td>'+esc((c.events||[]).length)+'</td></tr>').join('')+'</tbody></table>':'<div class="empty">No completed cycles.</div>';
+}
+document.getElementById('severity').addEventListener('change',()=>window.current&&render(window.current));
+fetch('/api/result',{cache:'no-store'}).then(r=>r.json()).then(d=>{window.current=d;render(d)}).catch(e=>{document.getElementById('reason').textContent='Unable to load /lpot/result.json: '+e});
+</script></body></html>`
+
+func dashboardLogPath(name string) string {
+	switch name {
+	case "result":
+		return RESULT_FILE
+	case "summary":
+		return REBOOT_LOG
+	case "lspci":
+		return LPOTSCAN_LOG
+	case "config_space":
+		return CONFIG_CHANGES_LOG
+	default:
+		return ""
+	}
+}
+
+func startDashboard() error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, dashboardHTML)
+	})
+	mux.HandleFunc("/api/result", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		data, err := os.ReadFile(RESULT_FILE)
+		if os.IsNotExist(err) {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"status":"EMPTY","message":"No LPOT result is available. Run a normal test with -t first."}`)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write(data)
+	})
+	mux.HandleFunc("/api/log", func(w http.ResponseWriter, r *http.Request) {
+		path := dashboardLogPath(r.URL.Query().Get("name"))
+		if path == "" {
+			http.NotFound(w, r)
+			return
+		}
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if r.URL.Query().Get("name") == "result" {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		} else {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		}
+		w.Write(data)
+	})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("start dashboard listener: %w", err)
+	}
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	url := "http://" + listener.Addr().String()
+	fmt.Printf("LPOT dashboard listening at %s\n", url)
+	go openDashboardBrowser(url)
+	errs := make(chan error, 1)
+	go func() { errs <- server.Serve(listener) }()
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	select {
+	case <-signals:
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return server.Shutdown(ctx)
+	case err := <-errs:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("dashboard server stopped: %w", err)
+	}
+}
+
+func openDashboardBrowser(url string) {
+	for _, path := range []string{"/usr/bin/xdg-open", "/bin/xdg-open"} {
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := exec.CommandContext(ctx, path, url).Run()
+		cancel()
+		if err == nil {
+			return
+		}
+	}
+	fmt.Fprintln(os.Stderr, "Suggestion: open the dashboard URL manually because xdg-open was unavailable or failed.")
+}
+
 // generateFinalSummary generates the final test summary and appends to reboot.log
 func generateFinalSummary() {
 	logFile, err := openSecureAppend(REBOOT_LOG, 0644)
@@ -3882,6 +4482,10 @@ func generateFinalSummary() {
 		fmt.Fprintf(logFile, "Device topology and/or capability changes were detected across %d reboot cycles (see 'Affected Cycles' above).\n", actualTotalCycles)
 	}
 	fmt.Fprintf(logFile, "==========================================\n")
+	if err := writeResultReport(false); err != nil {
+		fatalOperation("Finalization failed: cannot publish /lpot/result.json", err,
+			"check /lpot permissions and available disk space before reviewing the report")
+	}
 
 	// Clean up PCI config binary files after test completion
 	initialFile := "/lpot/initial.bin"

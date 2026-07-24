@@ -14,6 +14,11 @@ reboot test; bare `-t` uses the default duration of 12 hours. `-scan` and
 `-classify` may write reports under `/lpot`, but do not disable host security
 policies unless normal `-t` mode is selected.
 
+`-ui` starts a read-only dashboard bound to `127.0.0.1`. It can be run as a
+non-root user because it only reads `/lpot/result.json` and the allowlisted
+reports. It does not run PCI scans, modify host policy, install services, or
+reboot.
+
 ## Requirements
 
 - Linux with effective UID 0.
@@ -60,6 +65,7 @@ sudo ./lpot -scan
 sudo ./lpot -g "$(sudo ./lpot -k)" -t 2 -d 10 -s 10
 sudo ./lpot -g "$(sudo ./lpot -k)" -scan
 sudo ./lpot -g "$(sudo ./lpot -k)" -classify
+./lpot -ui
 sudo ./lpot -t 24 -s 600
 sudo ./lpot -p
 sudo ./lpot -r
@@ -90,6 +96,7 @@ installing a new version.
 | `-r` | Reset `/lpot` state | off |
 | `-scan` | Scan USB/bridge/volatile devices into `ignore_list.txt` and exit | off |
 | `-classify` | List external PCIe endpoints and write a report | off |
+| `-ui` | Open the local read-only result dashboard | off |
 | `-h` | Print help | off |
 
 ## Endpoint Filter
@@ -125,6 +132,7 @@ All persistent state is stored under `/lpot`:
 - `lpotscan.log`: lspci comparison log.
 - `pcie_filter.txt`: optional endpoint overrides.
 - `tmp/`: temporary per-device `lspci` snapshots.
+- `result.json`: structured cycle checkpoint and final test report.
 
 The repository's `logs/` directory is ignored because reports can contain
 host-specific hardware information.
@@ -132,3 +140,11 @@ host-specific hardware information.
 `/lpot` and `/lpot/tmp` are root-owned with mode `0755` for non-root report
 inspection. Reboot controls remain root-only: `/lpot/lpot` and
 `/lpot/reboot.sh` are mode `0700`.
+
+`result.json` is written once after each completed cycle, before the `-s`
+reboot wait begins, and again as the final aggregated report when the test
+expires. Writes use a temporary file, `fsync`, and atomic rename so the
+dashboard never intentionally reads a partially written JSON document.
+Its top-level status is `RUNNING` for a checkpoint, `PASS` when the completed
+test has no noteworthy changes, `FAIL` when a noteworthy change is found, and
+`INCOMPLETE` when the test is interrupted or reboot fails.

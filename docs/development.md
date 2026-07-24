@@ -42,6 +42,10 @@ Run the binary from a stable location with an explicit `-t` value. The first
 normal invocation copies it to `/lpot/lpot`, which is the binary used after
 reboot.
 
+The result dashboard is intentionally local-only. It reads the atomic
+`/lpot/result.json` checkpoint/final report and fixed diagnostic logs; it is not
+part of the reboot loop and does not perform live PCI polling.
+
 ## Issue Tracking
 
 Behavior changes, security fixes, parser limitations, and future host-manager

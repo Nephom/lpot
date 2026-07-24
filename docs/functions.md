@@ -67,3 +67,9 @@ reference.
 - `noteCleanCycle` / `flushCleanStreak`: compact repeated clean-cycle output.
 - `generateFinalSummary`: writes aggregate results and affected-cycle details.
 - `parseRebootLogForStats`: derives summary counters from the persisted log.
+- `buildResultReport`: aggregates the current test session into structured
+  status, checks, cycles, problems, and artifact paths.
+- `writeResultReport`: writes a checkpoint or final `/lpot/result.json` using
+  fsync and atomic rename.
+- `startDashboard`: serves the read-only local result dashboard and fixed log
+  allowlist on loopback.
