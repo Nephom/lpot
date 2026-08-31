@@ -15,9 +15,6 @@ func setupSystemdService() error {
 		logWarn("could not detect the systemd default target: %v; using multi-user.target", err)
 		target = "multi-user.target"
 	}
-	if err := migrateLegacySystemdService(); err != nil {
-		return err
-	}
 	serviceContent := systemdServiceContent(scriptPath, target)
 	if err := verifyRootRegularFileIfPresent(servicePath); err != nil {
 		return err
@@ -46,26 +43,6 @@ func systemdDefaultTarget() (string, error) {
 		return "graphical.target", nil
 	}
 	return "multi-user.target", nil
-}
-
-func migrateLegacySystemdService() error {
-	info, err := os.Lstat(legacyPath)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("failed to inspect legacy systemd service: %v", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing to migrate %s: path is a symlink", legacyPath)
-	}
-	if err := stopAndDisableUnit(legacyService); err != nil {
-		return fmt.Errorf("failed to disable legacy %s: %v", legacyService, err)
-	}
-	if err := os.Remove(legacyPath); err != nil {
-		return fmt.Errorf("failed to remove legacy %s: %v", legacyPath, err)
-	}
-	return nil
 }
 
 func systemdServiceContent(scriptPath, target string) string {

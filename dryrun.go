@@ -165,11 +165,6 @@ func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stop
 	printDryRunFile(PERSISTENT_BINARY, "replace", 0755, "[binary copied from the invoked executable]\n")
 	printDryRunFile(filepath.Join(LPOT_DIR, "reboot.sh"), "replace", 0700, script)
 
-	if info, err := os.Lstat(legacyPath); err == nil && info.Mode()&os.ModeSymlink == 0 {
-		printDryRunCommand(systemctlPath, "stop", legacyService)
-		printDryRunCommand(systemctlPath, "disable", legacyService)
-		fmt.Printf("[DRY-RUN] WOULD REMOVE %s\n", legacyPath)
-	}
 	target := "multi-user.target"
 	if out := printDryRunReadCommand(systemctlTimeout, systemctlPath, "get-default"); strings.TrimSpace(string(out)) == "graphical.target" {
 		target = "graphical.target"

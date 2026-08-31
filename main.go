@@ -46,11 +46,9 @@ const (
 	// lets users correlate events by plain text search and by tools like
 	// `sort -k1,2` without translation.
 	logTimeFormat = "2006-01-02 15:04:05"
-	version       = "2.6.15"
+	version       = "2.6.16"
 	serviceName   = "lpot.service"
-	legacyService = "lpot_reboot.service"
 	servicePath   = "/etc/systemd/system/" + serviceName
-	legacyPath    = "/etc/systemd/system/" + legacyService
 )
 
 var buildTime = "development"
@@ -192,10 +190,6 @@ func main() {
 		}
 		return
 	}
-	if err := compactLegacyRebootLog(REBOOT_LOG); err != nil {
-		logWarn("could not compact legacy verbose lspci entries: %v", err)
-	}
-
 	if *testCycles < 0 {
 		fmt.Fprintln(os.Stderr, "-tm must be greater than zero when provided")
 		os.Exit(1)

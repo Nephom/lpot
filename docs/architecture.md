@@ -108,8 +108,7 @@ was started. The systemd unit at
 boot. `systemctl get-default` selects `graphical.target` only when it is the
 default; all other systems use `multi-user.target`. Writes use
 `O_NOFOLLOW`; pre-existing symlinks are rejected and existing root-owned
-regular files are refreshed so changed arguments and binaries take effect. A legacy
-`lpot_reboot.service` is stopped, disabled, and removed before installation.
+regular files are refreshed so changed arguments and binaries take effect.
 
 ## Data Safety Boundaries
 
