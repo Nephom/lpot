@@ -8,8 +8,20 @@ Linux sysfs, `lspci`, PCI configuration files, systemd, and reboot persistence.
 
 Current file boundaries are:
 
-- `main.go`: constants, global state, and `main()` (flag parsing, mode
-  dispatch, and the top-level startup/cycle/reboot-wait sequence).
+- `main.go`: path variables (redirectable only by `simulate_main.go`, see
+  below), other constants, and package-level global state shared by every
+  build variant.
+- `cli_main.go`: `func main()` for the normal production binary (build tag
+  `!simulate`, the default): flag parsing, mode dispatch, and the top-level
+  startup/cycle/reboot-wait sequence.
+- `simulate_main.go`: `func main()` for an offline, root-free 10-cycle
+  simulation binary (build tag `simulate`, built with
+  `go build -tags simulate`). It exercises the same production comparison
+  and reporting functions used by `cli_main.go` (`classifyDevices`,
+  `runConfigScan`, `processPCIDevices`, `generateFinalSummary`,
+  `writeResultReport`) against a synthetic PCI device model and a fake
+  `lspci` script, entirely under a throwaway `./test` directory. It is a
+  verification/review tool only and is never installed on a real host.
 - `bdf.go`: BDF regular expressions and `normalizeBDF()`.
 - `cli.go`: `-c` argument splitting and `-h` help text.
 - `lifecycle.go`: root/tool-path resolution, `/lpot` directory safety,
@@ -18,14 +30,19 @@ Current file boundaries are:
 - `logging.go`: shared `logWarn`/`logWarnFp`/`warnIncompleteReport`
   helpers so warning output shares one prefix and format.
 - `pcie_classify.go`: PCIe endpoint classification (KEEP/SKIP/UNVERIFIED),
-  link-capability decoding, and the classification report/baseline.
+  link-capability decoding, and the classification report/baseline (rebased
+  in place on every classification change so a change is reported exactly
+  once, not every subsequent cycle).
 - `pci_config_scan.go`: raw PCI configuration-space sampling, volatile-byte
-  detection, and `-scan`/config-space comparison.
+  detection, and `-scan`/config-space comparison, including the
+  `initial.bin` NEW/REMOVED-device baseline rebase.
 - `lspci_compare.go`: per-device `lspci -vv` text parsing and the selected
   Dev/Lnk capability-field comparison.
-- `reboot_cycle.go`: per-cycle orchestration (`processPCIDevices`), cycle
-  change/noise bookkeeping, clean-streak log compaction, and legacy
-  `reboot.log` migration.
+- `reboot_cycle.go`: per-cycle orchestration (`processPCIDevices`, including
+  its `<bdf>_init.txt` topology/Dev-Lnk baseline rebase), cycle
+  change/noise bookkeeping (persisted to `change_log.jsonl` and
+  `test_stats.json` so a multi-cycle summary survives the brand-new
+  process each reboot cycle runs in), and clean-streak log compaction.
 - `summary.go`: the final test summary and PCI config-space summary sections
   appended to `reboot.log`.
 - `result_types.go` / `result_helpers.go`: structured result data model and
@@ -35,17 +52,24 @@ Current file boundaries are:
 - `systemd.go`: systemd service, host policy preparation, and SELinux
   handling.
 - `runtime.go`: root-owned runtime file checks, safe writes, shell quoting,
-  and the `fatalOperation()` fatal-error helper.
+  and the `fatalOperation()` fatal-error helper. `simulationMode` (default
+  `false`, settable only from `simulate_main.go`) relaxes the root-ownership
+  check for offline simulation runs only; the default (non-simulate) build
+  never sets it, so production behaviour is unchanged.
 
 Every file is compiled into the same `package main`; the split only groups
 related declarations for readability, so cross-file calls behave exactly as
-if everything were still in one file.
+if everything were still in one file (aside from `cli_main.go` and
+`simulate_main.go`, which are mutually exclusive build-tag-gated entry
+points and are never compiled together).
 
 ## Startup Flow
 
 1. Flags are parsed before root and Linux-tool checks. An invocation without
    `-t` only prints help, except for explicit `-r`, `-scan`, `-classify`,
-   or `-ui` modes.
+   or `-ui` modes. `-t` and `-tm` are mutually exclusive run modes (hour-based
+   duration vs. a fixed reboot count); supplying both is rejected before any
+   host mutation begins.
 2. `main()` requires root for operational modes and creates a cancellable root
    context.
 3. Signal handlers cancel external commands and interrupt waits.
@@ -90,6 +114,45 @@ best-effort matches a disappeared BDF to a new BDF with the same vendor:device
 ID and appends a single `NOTE: device ... may have relocated from ... to ...`
 line; this is a readability aid only and never changes whether `-p` stops the
 service.
+
+## Baseline Rebasing
+
+Every comparison baseline that tracks device *presence* or a *discrete
+capability value* (as opposed to a raw config-space byte's occurrence
+ratio; see below) is rebased in place to the just-logged new state the
+moment a change is reported:
+
+- `processPCIDevices()` rewrites a device's `<bdf>_init.txt` to its current
+  `<bdf>.txt` snapshot whenever a Dev/Lnk field change is logged, and
+  removes/creates `<bdf>_init.txt` whenever a REMOVED/NEW topology event is
+  logged.
+- `compareDeviceConfigs()` folds a NEW device into its in-memory
+  `initialDevices` map (later rewritten to `initial.bin`) and drops a
+  REMOVED device from that same map.
+- `writeClassificationReportToLog()` rewrites `CLASSIFY_STATE_FILE` to the
+  current cycle's classification snapshot whenever any change/removal is
+  logged.
+
+This is required, not cosmetic: without it, a device that disappears (or a
+Dev/Lnk field that changes) exactly once would be permanently absent from
+(or different from) its comparison baseline for the rest of the run, so
+every subsequent cycle would rediscover the SAME disappearance/change and
+re-log it, permanently keeping `allUnchanged` false (silently disabling the
+lspci Dev/Lnk comparison for the rest of the run) and pinning the
+cycle-end banner to "changes detected" long after the underlying state had
+actually stabilised.
+
+The one deliberate exception is `compareAndLogDeviceChanges()`'s raw
+config-space BYTE-level diff, which stays anchored to the original
+one-time `initial.bin` for the entire run by design:
+`classifyConfigChangeRatio` (shared by `summary.go` and
+`result_helpers.go`) classifies a `(device, offset)` row as benign
+"reboot-fixed" noise specifically because it recurs in
+`>= rebootFixedThreshold` (80%) of ALL completed cycles when compared
+against that fixed baseline — rebasing after the first detected change
+would make that register look "clean" from the very next cycle onward,
+permanently hiding the classic every-boot-reset pattern this ratio-based
+classification exists to surface.
 
 ## Persistence Across Reboots
 

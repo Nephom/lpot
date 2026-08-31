@@ -218,11 +218,15 @@ func compareDevices(device1, device2 Device, logFile *os.File) ComparisonResult 
 		logEntry := fmt.Sprintf("%s %s%s | %s changed | before: %s | after: %s\n",
 			getCurrentTimestamp(), cycleTag(), device1.DeviceID, key, value1, value2)
 
-		// Track statistics
-		// Keyed by normalizeBDF() so multi-domain hosts (where the same device
-		// might be seen in long or short form across different call paths) do
-		// not fragment this device's count across two different map keys.
-		deviceChangeStats[normalizeBDF(device1.DeviceID)]++
+		// Track statistics. Persisted immediately (not an in-memory
+		// map increment) because generateFinalSummary()'s "Most affected
+		// device" / "Most changed field" lines must reflect the entire
+		// multi-cycle run, and each reboot cycle runs in a brand-new
+		// process. Keyed by normalizeBDF() so multi-domain hosts (where the
+		// same device might be seen in long or short form across different
+		// call paths) do not fragment this device's count across two
+		// different map keys.
+		recordDeviceFieldChange(device1.DeviceID, key)
 
 		fmt.Fprint(logFile, logEntry)
 		fmt.Print(logEntry)
@@ -256,10 +260,14 @@ func filterLpotscanErrors(errorLogPath string, logFp *os.File) {
 			continue
 		}
 
-		// Preserve every approved Dev/Lnk change, including invalid raw values
-		// and mismatch details. Do not discard a record merely because its raw
-		// width/speed decode looks invalid.
-		if isCompactLpotscanChange(line) || strings.Contains(line, "raw/lspci mismatch") {
+		// Preserve every approved Dev/Lnk change, including invalid raw values.
+		// lpotscan.log only ever contains the compact
+		// "<bdf> | <field> changed | before: ... | after: ..." lines written by
+		// compareDevices() (lspci_compare.go); a "raw/lspci mismatch" string is
+		// only ever written by pcie_classify.go into CLASSIFY_LOG/reboot.log,
+		// never into lpotscan.log, so a second OR'd Contains check for it here
+		// was unreachable dead code.
+		if isCompactLpotscanChange(line) {
 			fmt.Fprintln(logFp, line)
 		}
 	}

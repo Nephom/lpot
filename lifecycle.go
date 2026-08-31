@@ -389,10 +389,24 @@ func readRebootCount() (int, error) {
 
 func resetClassificationBaseline() error {
 	err := os.Remove(CLASSIFY_STATE_FILE)
-	if os.IsNotExist(err) {
-		return nil
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
-	return err
+	// A new test run (fresh -t timestamp or a new -tm target/start pair)
+	// must not inherit the previous run's persisted cross-cycle state.
+	// CHANGE_LOG_FILE, TEST_STATS_FILE, and LPOTSCAN_LOG all accumulate
+	// across the whole run precisely so a multi-cycle summary survives
+	// per-cycle process restarts (see their declaration comments in
+	// main.go, and LPOTSCAN_LOG's whole-run accumulation rationale in
+	// cli_main.go); without this reset, a brand-new run would silently
+	// merge its own events with whatever a previous, unrelated run left
+	// behind.
+	for _, path := range []string{CHANGE_LOG_FILE, TEST_STATS_FILE, LPOTSCAN_LOG} {
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			return rmErr
+		}
+	}
+	return nil
 }
 
 func prepareTestCycleLimit(limit int) (bool, error) {

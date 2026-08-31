@@ -10,8 +10,13 @@ by responsibility first so behavior can be verified before introducing
 
 ## Lifecycle and Signals
 
-- `main`: validates the host, parses flags, initializes state, executes one
-  reboot cycle, and schedules the next cycle through systemd.
+- `main` (`cli_main.go`, build tag `!simulate`): validates the host, parses
+  flags — rejecting `-t`/`-tm` used together — initializes state, executes
+  one reboot cycle, and schedules the next cycle through systemd.
+- `main` (`simulate_main.go`, build tag `simulate`): drives an offline
+  10-cycle simulation against a synthetic PCI device model, calling the
+  same production comparison/reporting functions `cli_main.go`'s `main`
+  does; see `architecture.md`.
 - `setupSignalHandlers`: turns SIGINT/SIGTERM into `stopFlag` and context
   cancellation.
 - `sleepInterruptible`: waits for a duration while responding to context
@@ -76,7 +81,11 @@ by responsibility first so behavior can be verified before introducing
 - `executeLspci`: captures one device's `lspci -vv` output.
 - `processPCIDevices`: compares topology and per-device text snapshots; opens
   `lpotscan.log` once per cycle and passes it to `compareDeviceFiles`/
-  `compareDevices` instead of reopening it per device.
+  `compareDevices` instead of reopening it per device. Rebases each
+  device's `<bdf>_init.txt` baseline in place after logging a Dev/Lnk
+  change or a NEW/REMOVED topology event, so the same event is reported
+  exactly once rather than every subsequent cycle (see `architecture.md`'s
+  "Baseline Rebasing" section).
 - `isComparedLspciField`: the eleven `Dev`/`Lnk` capability field names that
   are compared (`DevCap`, `DevCtl`, `DevSta`, `LnkCap`, `LnkCtl`, `LnkSta`,
   `DevCap2`, `DevCtl2`, `LnkCap2`, `LnkCtl2`, `LnkSta2`).
@@ -98,7 +107,18 @@ by responsibility first so behavior can be verified before introducing
 
 ## Reporting
 
-- `recordCycleChange` / `recordCycleNoise`: classify cycle observations.
+- `recordCycleChange` / `recordCycleNoise`: classify cycle observations and
+  persist each one as a JSON line to `change_log.jsonl`
+  (`appendChangeLogEntry`) so the whole-run "Affected Cycles" summary
+  survives the brand-new process each reboot cycle runs in.
+- `loadPersistedCycleChanges`: reads every event ever recorded across the
+  run from `change_log.jsonl`; the sole data source for
+  `writeAffectedCyclesSection`.
+- `recordConfigSpaceChangeCycle` / `recordDeviceFieldChange`: persist
+  whole-run counters (cycles with config-space changes; per-device and
+  per-field lspci change tallies) to `test_stats.json`
+  (`loadTestStats`/`saveTestStats`), for the same brand-new-process-per-cycle
+  reason as `change_log.jsonl`.
 - `noteCleanCycle` / `flushCleanStreak`: compact repeated clean-cycle output.
 - `generateFinalSummary`: writes aggregate results and affected-cycle details.
 - `parseRebootLogForStats`: derives summary counters from the persisted log.

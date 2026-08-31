@@ -15,6 +15,16 @@ func fatalOperation(operation string, err error, suggestion string) {
 	os.Exit(1)
 }
 
+// simulationMode relaxes the root-ownership check in
+// verifyRootRegularFileIfPresent for offline simulation runs only. It is
+// declared here (defaulting to false) but can only ever be set to true by
+// simulate_main.go, which is compiled in only under `go build -tags
+// simulate`. The normal, non-simulate binary (the default build, and the
+// only one ever installed on a real test host) never references this
+// variable's assignment path, so production behaviour — every persisted
+// /lpot file must be root-owned — is completely unchanged.
+var simulationMode bool
+
 func verifyRootRegularFileIfPresent(path string) error {
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
@@ -25,6 +35,9 @@ func verifyRootRegularFileIfPresent(path string) error {
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return fmt.Errorf("refusing to use %s: expected a regular file", path)
+	}
+	if simulationMode {
+		return nil
 	}
 	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid != 0 {
 		return fmt.Errorf("refusing to use %s: owner must be root, found uid %d", path, st.Uid)

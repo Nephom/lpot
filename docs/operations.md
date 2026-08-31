@@ -131,15 +131,35 @@ All persistent state is stored under `/lpot`:
   both via `/api/config?bdf=..&which=baseline|latest` for manual verification
   and comparison of LnkCap/LnkSta decoding over time.
 - `pci-config-changes.log`: configuration-space comparison results, diffed
-  against the one-time `/lpot/initial.bin` baseline on every cycle.
+  against the one-time `/lpot/initial.bin` baseline on every cycle. Not
+  truncated between cycles; `initial.bin` itself is rebased (a
+  disappeared/appeared device is removed/added in place) whenever a
+  NEW/REMOVED topology event is logged, so the same event is reported
+  exactly once instead of being rediscovered on every later cycle.
 - `pci_devices_classify.log`: classification report history.
 - `lpotscan.log`: lspci comparison log, one compact `<BDF> | <field> changed |
-  before: ... | after: ...` line per changed Dev/Lnk capability field.
+  before: ... | after: ...` line per changed Dev/Lnk capability field,
+  accumulated for the entire run (like `pci-config-changes.log`, it is not
+  truncated between cycles; every line is tagged with `[Cycle N]`).
 - `pcie_filter.txt`: optional endpoint overrides.
-- `tmp/`: temporary per-device `lspci` snapshots.
+- `tmp/`: temporary per-device `lspci` snapshots. `<bdf>_init.txt` is the
+  per-device Dev/Lnk comparison baseline; it is rebased in place to the
+  current snapshot whenever a genuine field change or topology event
+  (NEW/REMOVED) is logged for that device, for the same "report once, not
+  every cycle" reason as `initial.bin` above.
 - `result.json`: structured cycle checkpoint and final test report.
 - `pci_devices_classify_state.json`: persistent classification snapshot used to
-  report only PCIe classification changes after the first cycle.
+  report only PCIe classification changes after the first cycle. Rebased to
+  the current snapshot every time a change/removal is logged, so a
+  classification change is likewise reported exactly once.
+- `change_log.jsonl`: one JSON line per recorded topology/lspci/config-space
+  change event, accumulated for the entire run. Because each reboot cycle
+  runs in a brand-new process, this file (not an in-memory list) is what lets
+  the final summary's "Affected Cycles" section cover every cycle of a
+  multi-day run instead of only the last one.
+- `test_stats.json`: persisted whole-run counters ("Most affected device",
+  "Most changed field", and whether any raw config-space change occurred),
+  for the same brand-new-process-per-cycle reason as `change_log.jsonl`.
 - `command_user_custom.log`: stdout and stderr from the optional background
   command configured with `-c`.
 

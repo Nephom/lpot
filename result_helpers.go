@@ -22,7 +22,16 @@ func resultStatus(changes int) string {
 func lineTimestamp(line string) string {
 	fields := strings.Fields(line)
 	if len(fields) >= 2 {
-		if _, err := time.Parse(logTimeFormat, fields[0]+" "+fields[1]); err == nil {
+		// Only format validity is checked here (the parsed value itself is
+		// discarded), so the UTC-default of plain time.Parse would not
+		// itself corrupt anything in THIS function. ParseInLocation with
+		// time.Local is used anyway for consistency with every other
+		// logTimeFormat parse site in this codebase (see
+		// loadPersistedCycleChanges and buildResultReport), all of which
+		// parse getCurrentTimestamp()'s local-time-formatted strings and
+		// therefore must anchor to time.Local, not UTC, to avoid a
+		// silent timezone-offset error in duration calculations.
+		if _, err := time.ParseInLocation(logTimeFormat, fields[0]+" "+fields[1], time.Local); err == nil {
 			return fields[0] + " " + fields[1]
 		}
 	}
@@ -167,11 +176,16 @@ func parseLspciResultChanges() []lspciResultChange {
 // recorded change, sorted by cycle number. If no changes were recorded the
 // section is reduced to a single line noting perfect stability, so summaries
 // remain compact for clean runs.
+//
+// The snapshot is read from CHANGE_LOG_FILE (loadPersistedCycleChanges),
+// not from the in-memory changedCycles slice: generateFinalSummary() (the
+// only caller) usually runs in a different process than most of the cycles
+// it is summarising, since each reboot cycle re-execs the binary. Reading
+// the in-memory slice here would only ever show whichever single cycle
+// happened to run in the current process, silently losing every earlier
+// cycle's recorded changes from the final report.
 func writeAffectedCyclesSection(logFile *os.File) {
-	changedCyclesMu.Lock()
-	snapshot := make([]cycleChange, len(changedCycles))
-	copy(snapshot, changedCycles)
-	changedCyclesMu.Unlock()
+	snapshot := loadPersistedCycleChanges()
 
 	ts := getCurrentTimestamp()
 	fmt.Fprintf(logFile, "\n%s Affected Cycles:\n", ts)
@@ -304,7 +318,12 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 		}
 		if startedAt.IsZero() && strings.Contains(line, "#########Start to test#########") {
 			if ts := lineTimestamp(line); ts != "" {
-				startedAt, _ = time.Parse(logTimeFormat, ts)
+				// See loadPersistedCycleChanges (reboot_cycle.go) for why
+				// this must anchor to time.Local, not UTC: getCurrentTimestamp()
+				// formats every log timestamp with time.Now() in the host's
+				// local timezone, and logTimeFormat itself carries no zone
+				// offset.
+				startedAt, _ = time.ParseInLocation(logTimeFormat, ts, time.Local)
 			}
 		}
 		if n := lineCycleNumber(line); n > 0 {

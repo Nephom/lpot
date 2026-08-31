@@ -43,14 +43,94 @@ func recordCycleNoise(reason string) {
 }
 
 func appendCycleChange(reason string, noteworthy bool) {
-	changedCyclesMu.Lock()
-	defer changedCyclesMu.Unlock()
-	changedCycles = append(changedCycles, cycleChange{
+	entry := cycleChange{
 		Cycle:      currentCycle.Load(),
 		Time:       time.Now(),
 		Reason:     reason,
 		Noteworthy: noteworthy,
+	}
+	changedCyclesMu.Lock()
+	changedCycles = append(changedCycles, entry)
+	changedCyclesMu.Unlock()
+
+	// Persist immediately: each reboot cycle is a brand-new process, so the
+	// in-memory changedCycles slice above only ever holds this cycle's
+	// events by the time the NEXT cycle's process starts. Appending this
+	// entry to CHANGE_LOG_FILE is what lets writeAffectedCyclesSection()
+	// reconstruct the complete, multi-cycle "Affected Cycles" narrative at
+	// the end of a multi-day run. Best-effort: a failure here degrades the
+	// final summary's completeness but must never abort the cycle itself.
+	if err := appendChangeLogEntry(entry); err != nil {
+		logWarn("could not persist change-log entry to %s: %v", CHANGE_LOG_FILE, err)
+	}
+}
+
+// persistedCycleChange is the on-disk JSON representation of one
+// cycleChange event, one per line in CHANGE_LOG_FILE.
+type persistedCycleChange struct {
+	Cycle      int64  `json:"cycle"`
+	Time       string `json:"time"`
+	Reason     string `json:"reason"`
+	Noteworthy bool   `json:"noteworthy"`
+}
+
+// appendChangeLogEntry appends one JSON line to CHANGE_LOG_FILE. Using
+// O_APPEND (via openSecureAppend) means a later cycle's write can never
+// corrupt or truncate an earlier cycle's already-persisted entries, even if
+// the process is killed mid-write on some other line.
+func appendChangeLogEntry(entry cycleChange) error {
+	fp, err := openSecureAppend(CHANGE_LOG_FILE, 0644)
+	if err != nil {
+		return err
+	}
+	defer fp.Close()
+	data, err := json.Marshal(persistedCycleChange{
+		Cycle:      entry.Cycle,
+		Time:       entry.Time.Format(logTimeFormat),
+		Reason:     entry.Reason,
+		Noteworthy: entry.Noteworthy,
 	})
+	if err != nil {
+		return err
+	}
+	if _, err := fp.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return fp.Sync()
+}
+
+// loadPersistedCycleChanges reads every event ever recorded across the
+// entire run from CHANGE_LOG_FILE. A missing file (fresh run) or a corrupt
+// line (best-effort skipped, not fatal) never blocks the caller: this data
+// feeds only the human-readable "Affected Cycles" summary, never a
+// PASS/FAIL verdict.
+func loadPersistedCycleChanges() []cycleChange {
+	data, err := os.ReadFile(CHANGE_LOG_FILE)
+	if err != nil {
+		return nil
+	}
+	var out []cycleChange
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var p persistedCycleChange
+		if err := json.Unmarshal([]byte(line), &p); err != nil {
+			continue
+		}
+		// getCurrentTimestamp() (lifecycle.go) formats with time.Now(),
+		// which is always in the host's LOCAL timezone. logTimeFormat
+		// itself carries no zone offset, so parsing with a bare
+		// time.Parse (which defaults to UTC) would silently reinterpret a
+		// local-time string as UTC, corrupting every downstream duration
+		// calculation by exactly the host's UTC offset. ParseInLocation
+		// with time.Local matches the writer's timezone and keeps this
+		// round-trip lossless.
+		t, _ := time.ParseInLocation(logTimeFormat, p.Time, time.Local)
+		out = append(out, cycleChange{Cycle: p.Cycle, Time: t, Reason: p.Reason, Noteworthy: p.Noteworthy})
+	}
+	return out
 }
 
 // cycleChangeKind reports what kind of change records exist for the
@@ -224,26 +304,18 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 		return fmt.Errorf("error finding init files: %v", err)
 	}
 
-	// Check for removed devices. Removed devices cannot be queried via sysfs
-	// (they're gone), so we only emit the BDF; lspci dump for this BDF is
-	// already in *_init.txt and is appended to the log by filterLpotscanErrors.
-	for _, initFile := range initFiles {
-		filename := filepath.Base(initFile)
-		bdf := strings.TrimSuffix(filename, "_init.txt")
-		currentFile := filepath.Join(TMP_DIR, bdf+".txt")
-
-		if !fileExists(currentFile) {
-			removedDevices = append(removedDevices, bdf)
-			fmt.Fprintf(logFp, "%s %sREMOVED Device: %s\n", getCurrentTimestamp(), cycleTag(), bdf)
-			recordCycleChange(fmt.Sprintf("device removed: %s", bdf))
-		}
-	}
-
-	// Generate current device files and check for new devices in the same
-	// pass: both operate independently per bdf, so one walk over bdfs is
-	// enough. New devices are present in sysfs, so enrich the log line with
-	// vendor/device/class to help identify which hardware appeared without
-	// requiring a separate lspci.
+	// Step 1: Generate this cycle's current device snapshot (<bdf>.txt) for
+	// every bdf FIRST, before checking for removed devices. This ordering is
+	// load-bearing, not cosmetic: cleanupBDFFiles() (called at the end of
+	// every cycle in main()) deletes every <bdf>.txt while keeping
+	// <bdf>_init.txt, and each reboot cycle runs in a brand-new process. If
+	// the "removed device" check below ran BEFORE this snapshot step, it
+	// would always find last cycle's already-deleted <bdf>.txt missing and
+	// misreport every single device as REMOVED on every cycle after the
+	// first — silently disabling the lspci Dev/Lnk comparison entirely
+	// (allUnchanged would never be true) and, under -p, stopping the test on
+	// the very second cycle. Do not reorder these two steps.
+	//
 	// snapshotFailedBDFs collects devices whose current-cycle lspci snapshot
 	// could not be captured (e.g. a transient link reset or lspci timeout).
 	// This is a per-device, non-fatal condition: one flaky device must not
@@ -256,6 +328,45 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 		if err := executeLspci(bdf, ".txt"); err != nil {
 			snapshotFailedBDFs = append(snapshotFailedBDFs, bdf)
 			logWarnFp(logFp, "could not capture this cycle's lspci snapshot for %s (%v); this device is skipped from lspci comparison this cycle only and does not affect the pass/fail result", bdf, err)
+		}
+	}
+
+	// Step 2: Check for removed devices, now that every reachable bdf's
+	// <bdf>.txt has been (re)created above. Removed devices cannot be
+	// queried via sysfs (they're gone), so we only emit the BDF; lspci dump
+	// for this BDF is already in *_init.txt and is appended to the log by
+	// filterLpotscanErrors. A device whose snapshot failed this cycle
+	// (snapshotFailedBDFs) is NOT treated as removed: a transient lspci
+	// timeout is not evidence the device disappeared from sysfs, and
+	// conflating the two would turn a flaky read into a false topology
+	// alarm.
+	failedThisCycle := make(map[string]bool, len(snapshotFailedBDFs))
+	for _, bdf := range snapshotFailedBDFs {
+		failedThisCycle[normalizeBDF(bdf)] = true
+	}
+	for _, initFile := range initFiles {
+		filename := filepath.Base(initFile)
+		bdf := strings.TrimSuffix(filename, "_init.txt")
+		if failedThisCycle[normalizeBDF(bdf)] {
+			continue
+		}
+		currentFile := filepath.Join(TMP_DIR, bdf+".txt")
+
+		if !fileExists(currentFile) {
+			removedDevices = append(removedDevices, bdf)
+			fmt.Fprintf(logFp, "%s %sREMOVED Device: %s\n", getCurrentTimestamp(), cycleTag(), bdf)
+			recordCycleChange(fmt.Sprintf("device removed: %s", bdf))
+		}
+	}
+
+	// Step 3: Check for new devices. New devices are present in sysfs, so
+	// enrich the log line with vendor/device/class to help identify which
+	// hardware appeared without requiring a separate lspci. Skip bdfs whose
+	// snapshot failed this cycle: without a <bdf>.txt there is nothing to
+	// compare, and the device may simply not have been captured rather than
+	// genuinely be new.
+	for _, bdf := range bdfs {
+		if failedThisCycle[normalizeBDF(bdf)] {
 			continue
 		}
 		initFile := filepath.Join(TMP_DIR, bdf+"_init.txt")
@@ -301,6 +412,45 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 		}
 	}
 
+	// Rebase the lspci-text topology baseline for every REMOVED/NEW device
+	// found this cycle, so the SAME disappearance/appearance is not
+	// rediscovered and re-reported on every subsequent cycle for the rest
+	// of the run. Without this, a device that disappears once would leave
+	// its stale <bdf>_init.txt in place forever, so every later cycle's
+	// removed-device check (Step 2 above) would find its <bdf>.txt missing
+	// again and re-flag it as REMOVED — permanently keeping allUnchanged
+	// false and silently disabling the lspci Dev/Lnk comparison
+	// (the `if allUnchanged` branch below) for the rest of the run.
+	// Symmetrically, a device that appears once would never get an
+	// <bdf>_init.txt baseline of its own, so every later cycle would find it
+	// still missing and re-flag it as NEW forever.
+	for _, bdf := range removedDevices {
+		// The device is gone from sysfs; there is nothing to rebase to, so
+		// simply retire its stale baseline. os.Remove is used (not a rename)
+		// because vendorDeviceFromLspciDump() above has already consumed
+		// this file for this cycle's relocation-note best-effort match; nothing
+		// downstream needs it again once this cycle's decisions are logged.
+		if err := os.Remove(filepath.Join(TMP_DIR, bdf+"_init.txt")); err != nil && !os.IsNotExist(err) {
+			logWarnFp(logFp, "could not retire stale topology baseline for removed device %s: %v", bdf, err)
+		}
+	}
+	for _, bdf := range newDevices {
+		// The device is now present; adopt this cycle's snapshot as its new
+		// baseline so the NEXT cycle compares against "the device as it
+		// looked when it first appeared" instead of re-discovering the same
+		// appearance forever.
+		src := filepath.Join(TMP_DIR, bdf+".txt")
+		dst := filepath.Join(TMP_DIR, bdf+"_init.txt")
+		data, err := os.ReadFile(src)
+		if err != nil {
+			logWarnFp(logFp, "could not read snapshot to establish topology baseline for new device %s: %v", bdf, err)
+			continue
+		}
+		if err := writeFileNoFollow(dst, data, 0644); err != nil {
+			logWarnFp(logFp, "could not establish topology baseline for new device %s: %v", bdf, err)
+		}
+	}
+
 	// Track device topology changes. A topology change always interrupts any
 	// active "clean streak" summary that may have been aggregating.
 	if !allUnchanged {
@@ -336,6 +486,23 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 			result := compareDeviceFiles(initFile, currentFile, ignoreSet, lpotscanFile)
 			if result.HasDifferences {
 				overallSuccess = false
+				// Rebase this device's Dev/Lnk baseline to the value just
+				// logged as changed. Without this, a link that trains down
+				// once (e.g. x8 -> x4) and then stays stable at x4 would be
+				// re-reported as "changed" on every subsequent cycle for
+				// the rest of the run, because _init.txt would forever keep
+				// comparing against the ORIGINAL x8 value instead of the
+				// device's current, stable state. Rebasing after logging
+				// the difference means a genuinely new change (e.g. a
+				// later x4 -> x2 drop, or recovering back to x8) is still
+				// correctly detected and logged exactly once, mirroring
+				// the topology baseline rebase for NEW/REMOVED devices
+				// above and compareDeviceConfigs()' initial.bin rebase.
+				if data, err := os.ReadFile(currentFile); err != nil {
+					logWarnFp(logFp, "could not read snapshot to rebase Dev/Lnk baseline for %s: %v", bdf, err)
+				} else if err := writeFileNoFollow(initFile, data, 0644); err != nil {
+					logWarnFp(logFp, "could not rebase Dev/Lnk baseline for %s: %v", bdf, err)
+				}
 			}
 			if result.Error != nil {
 				logWarnFp(logFp, "comparison error for %s: %v", bdf, result.Error)
@@ -515,4 +682,77 @@ func stopAndDisableService(serviceName string) error {
 	}
 	fmt.Printf("Service %s stopped successfully\n", serviceName)
 	return nil
+}
+
+// persistedTestStats is the on-disk, whole-run-accumulated representation of
+// the statistics that used to live only in the in-memory globals
+// cyclesWithConfigChanges, deviceChangeStats, and (indirectly, via
+// FieldChanges) mostChangedField. See TEST_STATS_FILE's declaration comment
+// in main.go for why this must be a file rather than a package variable.
+type persistedTestStats struct {
+	CyclesWithConfigChanges int            `json:"cycles_with_config_changes"`
+	DeviceChanges           map[string]int `json:"device_changes"`
+	FieldChanges            map[string]int `json:"field_changes"`
+}
+
+// loadTestStats reads TEST_STATS_FILE. A missing or corrupt file is treated
+// as "no stats recorded yet" (a fresh run), matching the zero-value behaviour
+// the in-memory globals used to have on first use.
+func loadTestStats() persistedTestStats {
+	stats := persistedTestStats{DeviceChanges: make(map[string]int), FieldChanges: make(map[string]int)}
+	data, err := os.ReadFile(TEST_STATS_FILE)
+	if err != nil {
+		return stats
+	}
+	var loaded persistedTestStats
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		return stats
+	}
+	if loaded.DeviceChanges != nil {
+		stats.DeviceChanges = loaded.DeviceChanges
+	}
+	if loaded.FieldChanges != nil {
+		stats.FieldChanges = loaded.FieldChanges
+	}
+	stats.CyclesWithConfigChanges = loaded.CyclesWithConfigChanges
+	return stats
+}
+
+// saveTestStats persists stats to TEST_STATS_FILE. Failures are logged but
+// not fatal: losing this file only degrades the final summary's "Most
+// affected device" / "Most changed field" / raw-config STABLE-vs-CHANGED
+// lines, it never affects any cycle's PASS/FAIL verdict.
+func saveTestStats(stats persistedTestStats) {
+	data, err := json.Marshal(stats)
+	if err != nil {
+		logWarn("could not encode test stats: %v", err)
+		return
+	}
+	if err := writeFileNoFollow(TEST_STATS_FILE, data, 0644); err != nil {
+		logWarn("could not persist test stats to %s: %v", TEST_STATS_FILE, err)
+	}
+}
+
+// recordConfigSpaceChangeCycle increments the persisted count of cycles that
+// saw at least one raw config-space byte change. It is the disk-backed
+// equivalent of the old `cyclesWithConfigChanges++` in-memory statement,
+// which reset to 0 every cycle because each reboot cycle runs in a
+// brand-new process.
+func recordConfigSpaceChangeCycle() {
+	stats := loadTestStats()
+	stats.CyclesWithConfigChanges++
+	saveTestStats(stats)
+}
+
+// recordDeviceFieldChange increments the persisted per-device and per-field
+// change counters for one lspci Dev/Lnk capability change. It is the
+// disk-backed equivalent of the old in-memory `deviceChangeStats[bdf]++`
+// (lspci_compare.go) plus the field tally generateFinalSummary() used to
+// recompute from a single cycle's lpotscan.log (which is truncated before
+// every reboot and therefore cannot hold whole-run history on its own).
+func recordDeviceFieldChange(bdf, field string) {
+	stats := loadTestStats()
+	stats.DeviceChanges[normalizeBDF(bdf)]++
+	stats.FieldChanges[field]++
+	saveTestStats(stats)
 }

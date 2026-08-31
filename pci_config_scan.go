@@ -95,7 +95,7 @@ func scanAndGenerateIgnoreBits(logFp *os.File) error {
 
 // runConfigScan executes the config scan logic
 func runConfigScan(logFp *os.File) error {
-	initialFile := "/lpot/initial.bin"
+	initialFile := INITIAL_BIN_FILE
 
 	// Check if ignore_list.txt exists, if not run scan first
 	if !fileExists(IGNORE_LIST_FILE) {
@@ -246,7 +246,12 @@ func detectVolatileBytesWithSamples(logFp *os.File) (map[string]DeviceIgnoreBits
 		// Check if it's a USB Controller. Keep this explicit classification in
 		// the record for readable diagnostics even though IgnoreDevice is the
 		// field consumed by saveIgnoreBits.
-		if len(deviceData[0]) >= 11 {
+		// Reading index 11 requires a slice of length >= 12, not >= 11: the
+		// previous ">= 11" bound let a device whose config read returned
+		// exactly 11 bytes reach deviceData[0][11] and panic with an
+		// index-out-of-range, aborting the entire -scan/auto-scan for every
+		// device instead of just skipping this one malformed read.
+		if len(deviceData[0]) >= 12 {
 			classCode := deviceData[0][11] // Base Class
 			subClass := deviceData[0][10]  // Sub Class
 			if classCode == 0x0c && subClass == 0x03 {
@@ -332,13 +337,6 @@ func detectVolatileBytesWithSamples(logFp *os.File) (map[string]DeviceIgnoreBits
 	return ignoreBits, samples, nil
 }
 
-// initializeStatistics initializes the statistics tracking variables
-func initializeStatistics() {
-	if deviceChangeStats == nil {
-		deviceChangeStats = make(map[string]int)
-	}
-}
-
 // analyzeBitPatterns analyzes bit-level change patterns to detect timer bits
 func analyzeBitPatterns(samples [][]byte, offset int) (bool, string) {
 	if len(samples) < 3 {
@@ -421,7 +419,7 @@ func savePCIConfig(outputFile string) error {
 // trace of a per-device read failure, which meant the exact device a user
 // most needed to investigate left no mark in any persisted artifact.
 func savePCIConfigReportingFailures(outputFile string) ([]string, error) {
-	pciPath := "/sys/bus/pci/devices/"
+	pciPath := SYS_PCI_DEVICES
 	files, err := os.ReadDir(pciPath)
 	if err != nil {
 		return nil, err
@@ -455,37 +453,7 @@ func savePCIConfigReportingFailures(outputFile string) ([]string, error) {
 		// downstream consumers (splitDevices, the comparison maps, the ignore
 		// list) all share the same key form regardless of which path produced
 		// the BDF.
-		buffer.WriteString(fmt.Sprintf("# %s\n", normalizeBDF(busID)))
-		for i := 0; i < len(configData); i += 16 {
-			// Write offset
-			buffer.WriteString(fmt.Sprintf("%04x: ", i))
-			// Write hex representation
-			for j := 0; j < 16; j++ {
-				if i+j < len(configData) {
-					buffer.WriteString(fmt.Sprintf("%02x ", configData[i+j]))
-				} else {
-					buffer.WriteString("   ")
-				}
-				// Add a space between 8-byte groups
-				if j == 7 {
-					buffer.WriteString(" ")
-				}
-			}
-			// Write ASCII representation
-			buffer.WriteString(" |")
-			for j := 0; j < 16; j++ {
-				if i+j < len(configData) {
-					c := configData[i+j]
-					if c >= 32 && c <= 126 {
-						buffer.WriteString(string(c))
-					} else {
-						buffer.WriteString(".")
-					}
-				}
-			}
-			buffer.WriteString("|\n")
-		}
-		buffer.WriteString("\n")
+		writeDeviceConfigXXD(&buffer, normalizeBDF(busID), configData)
 	}
 	if err := writeFileNoFollow(outputFile, buffer.Bytes(), 0644); err != nil {
 		return failedBDFs, err
@@ -493,10 +461,68 @@ func savePCIConfigReportingFailures(outputFile string) ([]string, error) {
 	return failedBDFs, nil
 }
 
+// writeDeviceConfigXXD appends one device's raw config bytes to buffer in
+// the XXD-like format splitDevices() parses back: a "# <short-bdf>" header
+// followed by 16-byte hex/ASCII rows. Shared by
+// savePCIConfigReportingFailures() (the original writer) and
+// rewriteInitialBinBaseline() (which rewrites initial.bin after a
+// NEW/REMOVED device topology event, so the same event is not
+// re-discovered and re-reported on every subsequent cycle).
+func writeDeviceConfigXXD(buffer *bytes.Buffer, shortBDF string, configData []byte) {
+	buffer.WriteString(fmt.Sprintf("# %s\n", shortBDF))
+	for i := 0; i < len(configData); i += 16 {
+		// Write offset
+		buffer.WriteString(fmt.Sprintf("%04x: ", i))
+		// Write hex representation
+		for j := 0; j < 16; j++ {
+			if i+j < len(configData) {
+				buffer.WriteString(fmt.Sprintf("%02x ", configData[i+j]))
+			} else {
+				buffer.WriteString("   ")
+			}
+			// Add a space between 8-byte groups
+			if j == 7 {
+				buffer.WriteString(" ")
+			}
+		}
+		// Write ASCII representation
+		buffer.WriteString(" |")
+		for j := 0; j < 16; j++ {
+			if i+j < len(configData) {
+				c := configData[i+j]
+				if c >= 32 && c <= 126 {
+					buffer.WriteString(string(c))
+				} else {
+					buffer.WriteString(".")
+				}
+			}
+		}
+		buffer.WriteString("|\n")
+	}
+	buffer.WriteString("\n")
+}
+
 // splitDevices splits device data from XXD-like format
 func splitDevices(data []byte) map[string][]byte {
 	devices := make(map[string][]byte)
-	deviceSections := bytes.Split(data, []byte("\n# "))
+	// Every device section in this format (see writeDeviceConfigXXD) starts
+	// with a "# <bdf>" header line. bytes.Split on "\n# " strips that "# "
+	// prefix from every section EXCEPT the very first one in the file,
+	// because the first section has no preceding "\n" for the separator to
+	// match against — its header line still reads literally "# <bdf>".
+	// Trimming a single leading "# " from the whole input before splitting
+	// makes every section (including the first) go through bytes.Split with
+	// the identical "\n# " separator shape, so lines[0] is the same "<bdf>"
+	// text in every section instead of "# <bdf>" for the first one only.
+	// Without this, the first device recorded in ANY XXD-format file
+	// (initial.bin, a -scan sample, a config_dump snapshot) had its BusID
+	// parsed as the literal string "# <bdf>", which never matches
+	// normalizeBDF()/bdfRegex, silently breaking every map lookup keyed by
+	// that device's BDF for the first device in the file — including
+	// making it look like a permanently NEW device every cycle relative to
+	// any other device recorded in the same file.
+	trimmed := bytes.TrimPrefix(data, []byte("# "))
+	deviceSections := bytes.Split(trimmed, []byte("\n# "))
 	for i, section := range deviceSections {
 		if i == 0 && !bytes.Contains(section, []byte(": ")) {
 			continue // Skip potential header
@@ -632,8 +658,29 @@ func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error 
 
 	// Track if any config changes are found in this cycle
 	configChangesFoundInThisCycle := false
+	// topologyBaselineChanged is set whenever a device is added to or
+	// removed from initialDevices below (a NEW/REMOVED event). initial.bin
+	// is rewritten from the updated initialDevices map at the end of this
+	// function whenever this is true, so a disappearance/appearance is
+	// reported exactly once instead of being rediscovered every subsequent
+	// cycle for the rest of the run (see the rewrite call below for the
+	// full rationale, mirroring the lspci-text path's own baseline rebase
+	// in processPCIDevices()).
+	topologyBaselineChanged := false
 
-	// Check for new devices
+	// Check for new devices. This is the raw config-space path's own
+	// topology check, independent of the lspci-text path in
+	// processPCIDevices(). It must call recordCycleChange (noteworthy=true)
+	// AND write a "NEW Device:"/"REMOVED Device:" line to reboot.log (logFp)
+	// in the same shape processPCIDevices() uses, exactly like
+	// processPCIDevices' own NEW/REMOVED Device handling does: without this,
+	// a device that only this path noticed (e.g. because its _init.txt
+	// lspci snapshot happened to fail while its raw config sample
+	// succeeded) would never flip the cycle-end banner to "changes
+	// detected", never trigger -p, and never appear in result.json's
+	// TOPOLOGY problems or the Affected Cycles summary — a genuinely
+	// concerning event silently visible only in pci-config-changes.log,
+	// which neither buildResultReport() nor parseRebootLogForStats() scans.
 	for busID, stableCfg := range stableConfigs {
 		if _, exists := initialDevices[busID]; !exists {
 			if ignoreDevices[busID] {
@@ -642,6 +689,17 @@ func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error 
 			currentInfo := parsePCIConfig(stableCfg.Data)
 			currentInfo.BusID = busID
 			logDeviceChange(logFile, nil, &currentInfo, "NEW DEVICE")
+			bdf := normalizeBDF(busID)
+			if logFp != nil {
+				fmt.Fprintf(logFp, "%s %sNEW Device: %s (raw config-space)\n", getCurrentTimestamp(), cycleTag(), bdf)
+			}
+			recordCycleChange(fmt.Sprintf("raw config-space: device added: %s", bdf))
+			// Adopt this cycle's snapshot into the baseline map so the
+			// initial.bin rewrite below (and every later cycle's
+			// comparison) treats this device as "known, starting from
+			// this snapshot" instead of "new" forever.
+			initialDevices[busID] = stableCfg.Data
+			topologyBaselineChanged = true
 		}
 	}
 
@@ -649,6 +707,10 @@ func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error 
 	// current stable snapshot) or it is still present and gets compared for
 	// configuration changes. These two outcomes are mutually exclusive, so a
 	// single walk over initialDevices with an if/else covers both cases.
+	// disappearedBusIDs is collected during the walk and removed from
+	// initialDevices AFTER the loop (rather than deleting while ranging),
+	// so the baseline rewrite below never carries a since-vanished device.
+	var disappearedBusIDs []string
 	for busID, configData := range initialDevices {
 		stableCfg, exists := stableConfigs[busID]
 		if !exists {
@@ -658,6 +720,13 @@ func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error 
 			initialInfo := parsePCIConfig(configData)
 			initialInfo.BusID = busID
 			logDeviceChange(logFile, &initialInfo, nil, "DEVICE DISAPPEARED")
+			bdf := normalizeBDF(busID)
+			if logFp != nil {
+				fmt.Fprintf(logFp, "%s %sREMOVED Device: %s (raw config-space)\n", getCurrentTimestamp(), cycleTag(), bdf)
+			}
+			recordCycleChange(fmt.Sprintf("raw config-space: device removed: %s", bdf))
+			disappearedBusIDs = append(disappearedBusIDs, busID)
+			topologyBaselineChanged = true
 			continue
 		}
 		if ignoreDevices[busID] {
@@ -677,7 +746,22 @@ func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error 
 			}
 		}
 
-		// Pass stableCfg.UnstableBytes for live timer filtering
+		// Pass stableCfg.UnstableBytes for live timer filtering.
+		//
+		// Deliberately NOT rebased on change (unlike the topology
+		// NEW/REMOVED handling above and the lspci Dev/Lnk baseline in
+		// processPCIDevices()): compareAndLogDeviceChanges' byte-level diffs
+		// stay anchored to the ORIGINAL one-time initial.bin for the
+		// lifetime of the run by design. classifyConfigChangeRatio
+		// (result_helpers.go/summary.go) classifies a (device, offset) row
+		// as benign "reboot-fixed" noise specifically because it recurs in
+		// >= rebootFixedThreshold (80%) of ALL completed cycles when
+		// compared against that fixed baseline — the classic pattern for a
+		// register that resets to the same value on every boot regardless
+		// of its pre-test initial value. Rebasing after the first detected
+		// change would make that register look "clean" from the very next
+		// cycle onward, permanently hiding the fixed/reproducible pattern
+		// this ratio-based classification exists to surface.
 		hasChanges := compareAndLogDeviceChanges(logFile, initialInfo, currentInfo, combinedIgnore, stableCfg.UnstableBytes)
 		if hasChanges {
 			configChangesFoundInThisCycle = true
@@ -688,10 +772,46 @@ func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error 
 	// found. These are recorded as noise (not noteworthy): the vast majority
 	// are vendor registers a controller resets to the same value on every
 	// boot. The final summary partitions them into reboot-fixed vs. truly
-	// volatile; only the latter warrants attention.
+	// volatile; only the latter warrants attention. Persisted immediately
+	// (not an in-memory `cyclesWithConfigChanges++`) because
+	// generateFinalSummary()'s raw-config STABLE/CHANGED line must reflect
+	// the entire multi-cycle run, and each reboot cycle runs in a
+	// brand-new process.
 	if configChangesFoundInThisCycle {
-		cyclesWithConfigChanges++
+		recordConfigSpaceChangeCycle()
 		recordCycleNoise("PCI config-space byte changes detected")
+	}
+
+	// Rebase initial.bin (the one-time raw config-space baseline) whenever
+	// a NEW/REMOVED device was found this cycle, exactly mirroring
+	// processPCIDevices()' lspci-text baseline rebase and for the identical
+	// reason: without this, a device that disappears once would remain
+	// permanently absent from the CURRENT snapshot while staying in
+	// initial.bin forever, so every subsequent cycle's "for each initial
+	// device" walk above would rediscover the same absence and re-log
+	// "DEVICE DISAPPEARED"/"REMOVED Device: ... (raw config-space)" and
+	// re-call recordCycleChange on every cycle for the rest of the run —
+	// permanently keeping this path's contribution to "changes detected"
+	// active even though nothing further actually changed. Symmetrically, a
+	// newly-appeared device is folded into initialDevices above the moment
+	// it is found, so this rewrite simply persists that already-updated map
+	// (with vanished devices removed) back to disk as the new baseline.
+	if topologyBaselineChanged {
+		for _, busID := range disappearedBusIDs {
+			delete(initialDevices, busID)
+		}
+		var rebased bytes.Buffer
+		var busIDs []string
+		for busID := range initialDevices {
+			busIDs = append(busIDs, busID)
+		}
+		sort.Strings(busIDs)
+		for _, busID := range busIDs {
+			writeDeviceConfigXXD(&rebased, normalizeBDF(busID), initialDevices[busID])
+		}
+		if err := writeFileNoFollow(initialFile, rebased.Bytes(), 0644); err != nil {
+			logWarnFp(logFp, "could not rebase raw config-space topology baseline %s: %v", initialFile, err)
+		}
 	}
 
 	return nil
@@ -1044,12 +1164,27 @@ func analyzeStableConfig(samples []map[string][]byte) map[string]StableConfig {
 }
 
 // loadIgnoreList reads ignore_list.txt for the lspci comparison path
-// (processPCIDevices -> compareDeviceFiles). Unlike readIgnoreDevicesAndOffsets
-// (the raw config-space path's reader, see its comment for the full
-// semantics difference), this treats ANY line for a BDF as "ignore the whole
-// device" regardless of whether it also lists specific offsets, because
-// lspci's Dev/Lnk field comparison has no notion of ignoring individual PCI
-// config-space byte offsets.
+// (processPCIDevices -> compareDeviceFiles). A line is "ignore the whole
+// device" ONLY when it is a bare BDF with no offsets (saveIgnoreBits()
+// writes this shape exclusively for USB controllers / other IgnoreDevice
+// cases). A line that also lists specific offsets (the shape saveIgnoreBits
+// writes for every device that has ANY timer/volatile byte, which in
+// practice is nearly every device on the system, since timerRelatedOffsets
+// is unconditionally copied into every device's ignore bytes) must NOT
+// cause the whole device to be skipped here: lspci's Dev/Lnk field
+// comparison has no notion of ignoring individual PCI config-space byte
+// offsets, so an offset-qualified line is simply not applicable to this
+// path and must be treated as "no whole-device ignore for this BDF" here.
+//
+// This previously treated ANY line for a BDF (with or without offsets) as
+// "ignore the whole device", which meant every device that ever had a
+// single timer-related ignore byte recorded (effectively all of them, via
+// the unconditional timerRelatedOffsets copy in
+// detectVolatileBytesWithSamples) was silently skipped from the entire
+// lspci Dev/Lnk comparison — the exact "footgun" scenario this function's
+// old comment warned about for hand-edited files was in fact happening on
+// every normal -t run, disabling the comparison for essentially the whole
+// system.
 func loadIgnoreList(filePath string) (map[string]bool, error) {
 	ignoreSet := make(map[string]bool)
 
@@ -1073,11 +1208,12 @@ func loadIgnoreList(filePath string) (map[string]bool, error) {
 			continue
 		}
 
-		// Extract BusID (first field before any space) and normalise to short
+		// Only a bare BDF (exactly one field, no offsets) means "ignore the
+		// whole device" for the lspci comparison path. Normalise to short
 		// form so the lookup in parseDeviceFile() (which uses lspci-text's
 		// short BDF) succeeds even when the file on disk uses long form.
 		fields := strings.Fields(line)
-		if len(fields) > 0 {
+		if len(fields) == 1 {
 			ignoreSet[normalizeBDF(fields[0])] = true
 		}
 	}

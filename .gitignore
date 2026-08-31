@@ -20,6 +20,9 @@
 /.codegraph/
 /.claude/
 
+# Local simulation output (never uploaded)
+/test/
+
 # Go tooling and editor/OS metadata
 coverage.out
 *.test

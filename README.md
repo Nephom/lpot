@@ -229,9 +229,12 @@ The program stores persistent state under `/lpot`:
   volatile offsets. PCIe capability decode failures do not remove a device
   from raw config comparison.
 - `lpotscan.log`: lspci comparison log, one compact `<BDF> | <field> changed |
-  before: ... | after: ...` line per changed Dev/Lnk capability field.
+  before: ... | after: ...` line per changed Dev/Lnk capability field,
+  accumulated for the entire run (not truncated between cycles).
 - `pci-config-changes.log`: configuration-space comparison results, diffed
   against the one-time `/lpot/initial.bin` baseline on every cycle.
+  `initial.bin` is rebased in place whenever a NEW/REMOVED topology event is
+  logged, so the same event is reported once, not every subsequent cycle.
 - `config_dump/<bdf>_baseline.txt`: the first-cycle raw PCI configuration
   bytes for each KEEP device, captured once and never overwritten.
 - `config_dump/<bdf>_latest.txt`: the current cycle's raw PCI configuration
@@ -240,7 +243,13 @@ The program stores persistent state under `/lpot`:
   same device.
 - `pci_devices_classify.log`: historical `-classify` reports.
 - `pcie_filter.txt`: optional endpoint overrides.
-- `tmp/`: temporary per-device `lspci` snapshots.
+- `tmp/`: temporary per-device `lspci` snapshots. `<bdf>_init.txt` is rebased
+  in place whenever a Dev/Lnk field change or topology event is logged for
+  that device, for the same "report once" reason as `initial.bin`.
+- `change_log.jsonl` / `test_stats.json`: whole-run persisted event log and
+  counters that back the final summary's "Affected Cycles", "Most affected
+  device", and "Most changed field" sections across the brand-new process
+  each reboot cycle runs in.
 - `result.json`: atomic structured checkpoint and final test report.
 - `command_user_custom.log`: stdout and stderr from the optional background
   command configured with `-c`.
@@ -272,6 +281,28 @@ can be compared directly. A checkpoint is written after each completed cycle
 before the reboot wait starts; the final report is written when the test
 expires. The dashboard does not modify `/lpot`, systemd, security policy, or
 reboot state.
+
+## Offline Simulation (Development Only)
+
+A `simulate`-tagged build exercises the real comparison/reporting pipeline
+(`classifyDevices`, `runConfigScan`, `processPCIDevices`,
+`generateFinalSummary`, `writeResultReport`) against a synthetic 10-cycle
+reboot run, entirely offline — no root, no systemd, no real PCI hardware,
+and no actual reboot:
+
+```bash
+go build -tags simulate -o /tmp/lpot-sim .
+/tmp/lpot-sim -out ./test
+```
+
+This writes a full simulated `/lpot`-shaped tree under `./test/lpot`
+(`reboot.log`, `lpotscan.log`, `pci-config-changes.log`, `result.json`, ...),
+a `./test/VERIFICATION_TRACKING.md` table recording exactly what was
+injected each cycle, what the logs were expected to show, and whether that
+expectation held (PASS/FAIL) against the real output, and a
+`./test/dashboard.html` snapshot of the same `-ui` dashboard pre-loaded with
+the simulated result so it can be opened directly in a browser. `./test/` is
+gitignored and must never be committed.
 
 ## Review Notes and Known Limitations
 

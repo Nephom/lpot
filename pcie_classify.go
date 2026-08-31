@@ -750,6 +750,23 @@ func writeClassificationReportToLog(logFp *os.File, decisions []deviceClassifica
 				fmt.Fprintf(logFp, "%s Removed: %s\n", getCurrentTimestamp(), bdf)
 				recordCycleChange(fmt.Sprintf("PCIe classification entry removed for %s", bdf))
 			}
+			// Rebase CLASSIFY_STATE_FILE to this cycle's snapshot now that
+			// every change/removal has been logged and recorded. Without
+			// this, CLASSIFY_STATE_FILE was only ever written once (in the
+			// "no previous baseline" branch above) and NEVER updated again,
+			// so a device that disappeared or changed classification once
+			// would keep comparing against the ORIGINAL, now-stale baseline
+			// forever: the same "changed"/"removed" entries would be
+			// rediscovered and re-recorded via recordCycleChange on every
+			// subsequent cycle for the rest of the run, permanently pinning
+			// the cycle-end banner to "changes detected" long after the
+			// classification had actually stabilised. This mirrors the
+			// identical baseline-rebase fix applied to processPCIDevices()
+			// (lspci Dev/Lnk _init.txt) and compareDeviceConfigs()
+			// (initial.bin).
+			if err := writeClassificationBaseline(current); err != nil {
+				return fmt.Errorf("rebase classification baseline: %w", err)
+			}
 		}
 	}
 	return nil

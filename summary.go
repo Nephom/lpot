@@ -66,35 +66,28 @@ func generateFinalSummary() {
 		duration = endTime.Sub(actualStartTime)
 	}
 
-	// Calculate most affected device and most changed field
+	// Calculate most affected device and most changed field from the
+	// whole-run persisted stats file (TEST_STATS_FILE), not from an
+	// in-memory map or from LPOTSCAN_LOG: LPOTSCAN_LOG is truncated by
+	// main() before every reboot and only ever holds the LAST cycle's lspci
+	// differences, and any in-memory map would reset to empty on every
+	// cycle since each reboot cycle runs in a brand-new process. Reading
+	// either would silently collapse "most affected device across the whole
+	// run" down to "most affected device in the last cycle only".
+	stats := loadTestStats()
 	maxDeviceChanges := 0
 	maxFieldChanges := 0
-	fieldChangeCount := make(map[string]int)
-
-	for device, count := range deviceChangeStats {
+	var mostAffectedDevice, mostChangedField string
+	for device, count := range stats.DeviceChanges {
 		if count > maxDeviceChanges {
 			maxDeviceChanges = count
 			mostAffectedDevice = device
 		}
 	}
-
-	// Count field changes from lpotscan log. lspciChangeField() (lspci_compare.go)
-	// is the same parser isCompactLpotscanChange() and buildResultReport() use,
-	// so "Most changed field" always names an actual Dev/Lnk field (e.g.
-	// "LnkSta") instead of accidentally picking up the "before: ..." segment
-	// that a naive positional split over " | " would land on.
-	if data, err := os.ReadFile(LPOTSCAN_LOG); err == nil {
-		lines := strings.Split(string(data), "\n")
-		for _, line := range lines {
-			field := lspciChangeField(line)
-			if field == "" {
-				continue
-			}
-			fieldChangeCount[field]++
-			if fieldChangeCount[field] > maxFieldChanges {
-				maxFieldChanges = fieldChangeCount[field]
-				mostChangedField = field
-			}
+	for field, count := range stats.FieldChanges {
+		if count > maxFieldChanges {
+			maxFieldChanges = count
+			mostChangedField = field
 		}
 	}
 
@@ -135,7 +128,7 @@ func generateFinalSummary() {
 	fmt.Fprintf(logFile, "%s   lspci capability changes: %d cycles\n", ts, actualLspciChanges)
 	classification := classificationReportFromBaseline()
 	rawConfigStatus := "STABLE"
-	if cyclesWithConfigChanges > 0 {
+	if stats.CyclesWithConfigChanges > 0 {
 		rawConfigStatus = "CHANGED"
 	}
 	lspciStatus := "STABLE"
@@ -151,13 +144,13 @@ func generateFinalSummary() {
 		fmt.Fprintf(logFile, "%s   Warning: some devices could not be fully checked, so this PASS result may not be accurate.\n", ts)
 	}
 
-	// deviceChangeStats only counts lspci Dev/Lnk capability changes
-	// (compareDevices() in lspci_compare.go). It intentionally excludes raw
-	// config-space byte changes, which the dashboard's per-device
-	// "Config Changed" column and classification.devices[].config_change_count
-	// (parseConfigResultChanges, a separate data source) already surface. The
-	// label below says so explicitly so the two counts are never mistaken for
-	// the same metric.
+	// stats.DeviceChanges only counts lspci Dev/Lnk capability changes
+	// (recordDeviceFieldChange(), called from compareDevices() in
+	// lspci_compare.go). It intentionally excludes raw config-space byte
+	// changes, which the dashboard's per-device "Config Changed" column and
+	// classification.devices[].config_change_count (parseConfigResultChanges,
+	// a separate data source) already surface. The label below says so
+	// explicitly so the two counts are never mistaken for the same metric.
 	if mostAffectedDevice != "" {
 		fmt.Fprintf(logFile, "%s     - Most affected device (lspci Dev/Lnk changes only): %s (%d changes). See the dashboard's per-device Config Changed column for raw config-space changes.\n", ts, mostAffectedDevice, maxDeviceChanges)
 	}
@@ -195,7 +188,7 @@ func generateFinalSummary() {
 	switch classifyFinalVerdict(actualCyclesWithChanges, noteworthyConfigChanges) {
 	case verdictPerfect:
 		fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED SUCCESSFULLY - PERFECT STABILITY\n", ts)
-		if cyclesWithConfigChanges > 0 {
+		if stats.CyclesWithConfigChanges > 0 {
 			fmt.Fprintf(logFile, "%s No noteworthy config-space changes across %d reboot cycles.\n", ts, actualTotalCycles)
 			fmt.Fprintf(logFile, "%s Some hardware settings reset to the same value every reboot. This is normal and not a problem.\n", ts)
 		} else {
@@ -215,7 +208,7 @@ func generateFinalSummary() {
 	}
 
 	// Clean up PCI config binary file after test completion
-	initialFile := "/lpot/initial.bin"
+	initialFile := INITIAL_BIN_FILE
 
 	if fileExists(initialFile) {
 		if err := os.Remove(initialFile); err != nil {
@@ -250,12 +243,23 @@ func parseRebootLogForStats() (time.Time, int, int, int, int) {
 		// Parse start time from first "Start to test" entry. Older logs used
 		// slash-separated dates; current logs use dash-separated. Try both so
 		// summaries still work when a test spans a format-change upgrade.
+		//
+		// ParseInLocation with time.Local (not plain time.Parse, which
+		// defaults to UTC) is required here: getCurrentTimestamp()
+		// (lifecycle.go) always formats with time.Now() in the host's
+		// local timezone, and neither layout below carries an explicit
+		// zone offset. On any host whose local timezone is not UTC, a bare
+		// time.Parse would silently reinterpret this local-time string as
+		// UTC, corrupting duration := endTime.Sub(actualStartTime) below by
+		// exactly the host's UTC offset (observed as a negative or
+		// nonsensical "Test Duration" for a run that actually took
+		// seconds).
 		if startTime.IsZero() && strings.Contains(line, "#########Start to test#########") {
 			parts := strings.Fields(line)
 			if len(parts) >= 2 {
 				timeStr := parts[0] + " " + parts[1]
 				for _, layout := range []string{logTimeFormat, "2006/01/02 15:04:05"} {
-					if parsedTime, err := time.Parse(layout, timeStr); err == nil {
+					if parsedTime, err := time.ParseInLocation(layout, timeStr, time.Local); err == nil {
 						startTime = parsedTime
 						break
 					}
@@ -331,7 +335,7 @@ func generateConfigSpaceSummary(logFile *os.File, totalCycles int) (noteworthy b
 
 	// Count total monitored devices from initial.bin if it exists
 	totalDevices := 0
-	if data, err := os.ReadFile("/lpot/initial.bin"); err == nil {
+	if data, err := os.ReadFile(INITIAL_BIN_FILE); err == nil {
 		devices := splitDevices(data)
 		totalDevices = len(devices)
 	}
