@@ -8,13 +8,41 @@ Linux sysfs, `lspci`, PCI configuration files, systemd, and reboot persistence.
 
 Current file boundaries are:
 
-- `main.go`: CLI parsing, startup, reboot-cycle orchestration, PCI comparison.
-- `result_types.go` and `result_helpers.go`: structured result data and log
-  aggregation helpers.
+- `main.go`: constants, global state, and `main()` (flag parsing, mode
+  dispatch, and the top-level startup/cycle/reboot-wait sequence).
+- `bdf.go`: BDF regular expressions and `normalizeBDF()`.
+- `cli.go`: `-c` argument splitting, `-h` help text, and root-password/`-g`
+  authentication.
+- `dryrun.go`: the `-g <hash>` read-only audit implementation; prints every
+  planned command and file write without touching the host.
+- `lifecycle.go`: root/tool-path resolution, `/lpot` directory safety,
+  persistent binary and reboot-script installation, systemd bookkeeping
+  helpers, and reboot-count/timestamp/cycle-limit persistence.
+- `logging.go`: shared `logWarn`/`logWarnFp`/`debugf`/`warnIncompleteReport`
+  helpers so warning and debug output share one prefix and format.
+- `pcie_classify.go`: PCIe endpoint classification (KEEP/SKIP/UNVERIFIED),
+  link-capability decoding, and the classification report/baseline.
+- `pci_config_scan.go`: raw PCI configuration-space sampling, volatile-byte
+  detection, and `-scan`/config-space comparison.
+- `lspci_compare.go`: per-device `lspci -vv` text parsing and the selected
+  Dev/Lnk capability-field comparison.
+- `reboot_cycle.go`: per-cycle orchestration (`processPCIDevices`), cycle
+  change/noise bookkeeping, clean-streak log compaction, and legacy
+  `reboot.log` migration.
+- `summary.go`: the final test summary and PCI config-space summary sections
+  appended to `reboot.log`.
+- `result_types.go` / `result_helpers.go`: structured result data model and
+  the `/lpot/result.json` aggregation/parsing helpers.
 - `dashboard.go`: loopback HTTP server, fixed artifact allowlist, and browser
   launcher.
-- `systemd.go`: systemd service, host policy preparation, and SELinux handling.
-- `runtime.go`: root-owned runtime file checks, safe writes, and shell quoting.
+- `systemd.go`: systemd service, host policy preparation, and SELinux
+  handling.
+- `runtime.go`: root-owned runtime file checks, safe writes, shell quoting,
+  and the `fatalOperation()` fatal-error helper.
+
+Every file is compiled into the same `package main`; the split only groups
+related declarations for readability, so cross-file calls behave exactly as
+if everything were still in one file.
 
 ## Startup Flow
 
@@ -47,8 +75,9 @@ Each cycle fetches PCI BDFs, applies endpoint classification and filter
 overrides, waits for drivers, samples volatile bytes when needed, and compares:
 
 - PCI device topology.
-- The ten selected PCIe `Dev/Lnk` capability fields from per-device `lspci -vv`
-  output.
+- The eleven selected PCIe `Dev/Lnk` capability fields (`DevCap`, `DevCtl`,
+  `DevSta`, `LnkCap`, `LnkCtl`, `LnkSta`, `DevCap2`, `DevCtl2`, `LnkCap2`,
+  `LnkCtl2`, `LnkSta2`) from per-device `lspci -vv` output.
 - PCI configuration-space snapshots with ignored volatile offsets.
 
 The cycle writes a completion banner before the interruptible reboot delay. A
@@ -58,6 +87,16 @@ During the `-s` reboot wait, the program only performs an interruptible delay.
 It does not compare full lspci text during the wait; PCI changes are evaluated
 by the explicit raw config-space and selected Dev/Lnk comparisons before the
 wait.
+
+`-p` stops and disables the service when any of the following happens in a
+cycle: a Dev/Lnk field or raw config-space byte differs, a BDF disappears, or
+a new BDF appears. A device that changes its own BDF (moves to a different
+slot) is detected as one disappearance plus one appearance, so it already
+triggers `-p` through the same two checks. `processPCIDevices` additionally
+best-effort matches a disappeared BDF to a new BDF with the same vendor:device
+ID and appends a single `NOTE: device ... may have relocated from ... to ...`
+line; this is a readability aid only and never changes whether `-p` stops the
+service.
 
 ## Persistence Across Reboots
 

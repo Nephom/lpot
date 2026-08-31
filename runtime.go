@@ -44,10 +44,6 @@ func openSecureAppend(path string, perm os.FileMode) (*os.File, error) {
 	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW, perm)
 }
 
-func openSecureCreateExcl(path string, perm os.FileMode) (*os.File, error) {
-	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, perm)
-}
-
 func writeFileNoFollow(path string, data []byte, perm os.FileMode) error {
 	if err := verifyRootRegularFileIfPresent(path); err != nil {
 		return err

@@ -12,7 +12,7 @@ func setupSystemdService() error {
 	scriptPath := filepath.Join(LPOT_DIR, "reboot.sh")
 	target, err := systemdDefaultTarget()
 	if err != nil {
-		fmt.Printf("Warning: failed to detect systemd default target: %v; using multi-user.target\n", err)
+		logWarn("could not detect the systemd default target: %v; using multi-user.target", err)
 		target = "multi-user.target"
 	}
 	if err := migrateLegacySystemdService(); err != nil {
@@ -97,7 +97,7 @@ func disableSELinux() error {
 	}
 	if setenforcePath != "" {
 		if _, err := runExternal(systemctlTimeout, setenforcePath, "0"); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: setenforce 0 failed: %v\n", err)
+			logWarn("setenforce 0 failed: %v", err)
 		}
 	}
 	data, err := os.ReadFile(selinuxConfigPath)

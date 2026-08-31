@@ -30,11 +30,15 @@ by responsibility first so behavior can be verified before introducing
   status of `/lpot` and `/lpot/tmp`.
 - `writeFileNoFollow`: writes with `O_NOFOLLOW` to prevent path redirection.
 - `openSecureAppend`: safely appends to an existing or newly created log.
-- `openSecureCreateExcl`: creates a file once without a Stat/Create race.
+- `isTrustedBinPath`: shared check for whether a resolved tool path lives
+  under an allow-listed system directory.
 - `shellQuote`: encodes one command-line argument as a POSIX shell word.
 - `runExternal`: applies the root context and command-specific timeout.
 - `installPersistentBinary`: copies the invoked binary to `/lpot/lpot` so
   systemd does not depend on the original download directory.
+- `buildRebootScript`: renders the `reboot.sh` contents shared by
+  `createRebootScript` (the real write) and `runDryRunAudit` (the `-g`
+  preview), so the two can never drift out of sync.
 - `createRebootScript`: refreshes the persistent reboot script, rejects unsafe
   existing files, and quotes every argument independently.
 - `setupSystemdService`: refreshes the systemd unit and rejects unsafe existing
@@ -45,6 +49,21 @@ by responsibility first so behavior can be verified before introducing
 - `disableFirewall`: stops/disables common RHEL, SLES, and Ubuntu firewall
   services and invokes `ufw disable` when available.
 - `disableAppArmor`: stops/disables the Ubuntu AppArmor service when present.
+
+## Logging
+
+- `logWarn`: writes a single `Warning: ...` line to stderr with a consistent
+  prefix and trailing newline; the target for every ad hoc warning print.
+- `logWarnFp`: writes the same warning to stderr and, with a timestamp and
+  cycle tag, to an open cycle log file. Used for warnings that happen during
+  a reboot cycle and should also be visible in `reboot.log`.
+- `debugf`: prints a `DEBUG: ...` line only when `-g`'s debug mode is active;
+  replaces ad hoc `if debugMode { fmt.Printf("DEBUG: ...") }` blocks.
+- `warnIncompleteReport`: the single call site for "could not save the
+  incomplete test report" on every early-exit path in `main()`.
+- `fatalOperation` (in `runtime.go`): prints an operation, the underlying
+  error, and an optional operator suggestion, then exits with status 1. Every
+  fatal startup/mode error in `main()` funnels through this helper.
 
 ## PCI Discovery and Filtering
 
@@ -61,8 +80,19 @@ by responsibility first so behavior can be verified before introducing
 - `savePCIConfig` / `compareDeviceConfigs`: persist and compare binary PCI
   configuration snapshots.
 - `executeLspci`: captures one device's `lspci -vv` output.
-- `processPCIDevices`: compares topology and per-device text snapshots.
-- `compareDeviceFiles`: applies the ignore list to `lspci` text differences.
+- `processPCIDevices`: compares topology and per-device text snapshots; opens
+  `lpotscan.log` once per cycle and passes it to `compareDeviceFiles`/
+  `compareDevices` instead of reopening it per device.
+- `isComparedLspciField`: the eleven `Dev`/`Lnk` capability field names that
+  are compared (`DevCap`, `DevCtl`, `DevSta`, `LnkCap`, `LnkCtl`, `LnkSta`,
+  `DevCap2`, `DevCtl2`, `LnkCap2`, `LnkCtl2`, `LnkSta2`).
+- `compareDeviceFiles` / `compareDevices`: apply the ignore list and diff the
+  selected `lspci` text fields between an `_init.txt` baseline and the current
+  snapshot.
+- `vendorDeviceFromLspciDump`: best-effort extracts the `[vendor:device]` hex
+  ID from a saved `_init.txt` dump so `processPCIDevices` can recognise a
+  device that disappeared at one BDF and reappeared at another (see
+  `architecture.md`).
 - `cleanupBDFFiles`: removes current snapshots while keeping initial baselines.
 
 ## Reporting

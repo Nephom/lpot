@@ -2,13 +2,23 @@
 
 ## Repository Layout
 
-- `main.go`: executable and implementation.
-- `result_types.go`, `result_helpers.go`: structured report model and parsing.
+- `main.go`: constants, global state, and `main()`.
+- `bdf.go`, `cli.go`, `dryrun.go`, `lifecycle.go`, `logging.go`: startup,
+  CLI, audit-mode, and lifecycle/logging helpers. See `architecture.md` for
+  the full per-file breakdown.
+- `pcie_classify.go`, `pci_config_scan.go`, `lspci_compare.go`,
+  `reboot_cycle.go`, `summary.go`: PCI discovery, classification, scanning,
+  comparison, and per-cycle/final reporting.
+- `result_types.go`, `result_helpers.go`: structured report model and
+  `/lpot/result.json` aggregation/parsing.
 - `dashboard.go`: local read-only dashboard server.
 - `systemd.go`: systemd and host policy integration.
 - `runtime.go`: secure runtime file primitives and operator error reporting.
 - `go.mod`: Go module metadata.
 - `docs/`: operational, architectural, function, and development documentation.
+
+Every `.go` file above is part of the same `package main`; the split is for
+readability only and does not change build, linking, or runtime behavior.
 
 Runtime binaries, logs, archives, timestamps, and local tool state are excluded
 by `.gitignore`.
@@ -29,9 +39,8 @@ checks.
 Run `go vet ./...` only when a compatible Go static-analysis environment is
 available. It is not a substitute for the Linux-target build.
 
-Use `gofmt` on files being modified. The current legacy `main.go` may contain
-pre-existing formatting differences; avoid unrelated whole-file formatting
-changes unless that is the explicit goal of the change.
+Use `gofmt` on files being modified; the whole tree is currently `gofmt -l`
+clean, so unrelated whole-file formatting changes should not be needed.
 
 ## Runtime Validation Boundaries
 
