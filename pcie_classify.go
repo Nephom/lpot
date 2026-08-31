@@ -417,13 +417,12 @@ func classifyDevices(bdfs []string, ov pcieFilterOverrides) []deviceClassificati
 	return out
 }
 
-// filterEndpoints applies classifyDevices() to bdfs and returns only the BDFs
-// that pass. It is retained for callers that explicitly request the link-only
-// set; the normal stability run uses the complete raw-config device set.
-func filterEndpoints(bdfs []string, ov pcieFilterOverrides) (kept []string, skipped []deviceClassification) {
-	return filterClassifiedEndpoints(bdfs, classifyDevices(bdfs, ov))
-}
-
+// filterClassifiedEndpoints partitions bdfs into the BDFs classifyDevices()
+// marked KEEP (link-capable, i.e. comparable via lspci Dev/Lnk fields) versus
+// SKIP (bridges, legacy PCI, manually excluded, or unverified), using an
+// already-computed classification report. This is the KEEP/SKIP filter used
+// everywhere in the pipeline (main.go's endpointFilterSet construction,
+// -classify's report, and the -tm/-t startup path).
 func filterClassifiedEndpoints(bdfs []string, decisions []deviceClassification) (kept []string, skipped []deviceClassification) {
 	keptShort := make(map[string]bool, len(decisions))
 	for _, d := range decisions {
@@ -734,13 +733,35 @@ func writeClassificationReportToLog(logFp *os.File, decisions []deviceClassifica
 			fmt.Fprintf(logFp, "\n%s===== PCIe classification changes from baseline =====\n", cycleTag())
 			if len(changed) > 0 {
 				printClassificationReport(logFp, changed)
+				// A classification change (e.g. KEEP -> SKIP, or an LnkCap value
+				// shift) is a real topology/link-capability difference, exactly
+				// like the NEW/REMOVED Device handling in processPCIDevices().
+				// Without this, the change was written to reboot.log but never
+				// entered changedCycles, so it was invisible to the cycle-end
+				// banner, writeAffectedCyclesSection, and the -p stop-on-
+				// difference gate — a genuinely noteworthy event that could
+				// silently pass through an entire -p run.
+				for _, decision := range changed {
+					reason := decision.KeptReason + decision.SkipReason
+					recordCycleChange(fmt.Sprintf("PCIe classification changed for %s: now %s (%s)", decision.BDF, decisionLabel(decision), reason))
+				}
 			}
 			for _, bdf := range removed {
 				fmt.Fprintf(logFp, "%s Removed: %s\n", getCurrentTimestamp(), bdf)
+				recordCycleChange(fmt.Sprintf("PCIe classification entry removed for %s", bdf))
 			}
 		}
 	}
 	return nil
+}
+
+// decisionLabel renders a deviceClassification's KEEP/SKIP decision for the
+// recordCycleChange reason string above.
+func decisionLabel(d deviceClassification) string {
+	if d.Kept {
+		return "KEEP"
+	}
+	return "SKIP"
 }
 
 // writeClassificationBaseline publishes the first valid classification for a

@@ -9,6 +9,35 @@ import (
 	"time"
 )
 
+// pciOffsetRegisterType maps a hex-string PCI config-space offset (e.g.
+// "0x3c") to a coarse register category for the config-space summary table.
+// Offsets are parsed as integers and compared numerically against the PCI
+// header layout (PCI Local Bus Spec 3.0, section 6.1) instead of doing a
+// decimal-substring string match against the hex text, which previously
+// misclassified 0x06/0x07 (Status), 0x0d (Latency Timer), and 0x3e/0x3f
+// (MinGnt/MaxLat) into the same bucket as an unmatched offset, and made the
+// "0xa2" case indistinguishable from the default branch.
+func pciOffsetRegisterType(offsetHex string) string {
+	offset, err := strconv.ParseInt(strings.TrimPrefix(offsetHex, "0x"), 16, 32)
+	if err != nil {
+		return "Config"
+	}
+	switch {
+	case offset == 0x06 || offset == 0x07:
+		return "Status" // Status register
+	case offset == 0x3c || offset == 0x3d:
+		return "IRQ" // Interrupt Line / Interrupt Pin
+	case offset == 0x0d:
+		return "Timer" // Latency Timer
+	case offset == 0x3e || offset == 0x3f:
+		return "Timer" // Min_Gnt / Max_Lat
+	case offset == 0x04 || offset == 0x05:
+		return "Control" // Command register
+	default:
+		return "Config"
+	}
+}
+
 // generateFinalSummary generates the final test summary and appends to reboot.log
 func generateFinalSummary() {
 	logFile, err := openSecureAppend(REBOOT_LOG, 0644)
@@ -26,7 +55,16 @@ func generateFinalSummary() {
 	actualStartTime, actualTotalCycles, actualCyclesWithChanges, actualTopologyChanges, actualLspciChanges := parseRebootLogForStats()
 
 	endTime := time.Now()
-	duration := endTime.Sub(actualStartTime)
+	// A zero actualStartTime means parseRebootLogForStats() could not find or
+	// read a start marker; report duration/start as "unknown" rather than
+	// silently computing a duration against the zero time.Time value (which
+	// would print a nonsensical multi-thousand-hour figure) or fabricating a
+	// placeholder start time as if it were measured.
+	durationKnown := !actualStartTime.IsZero()
+	var duration time.Duration
+	if durationKnown {
+		duration = endTime.Sub(actualStartTime)
+	}
 
 	// Calculate most affected device and most changed field
 	maxDeviceChanges := 0
@@ -40,20 +78,22 @@ func generateFinalSummary() {
 		}
 	}
 
-	// Count field changes from lpotscan log
+	// Count field changes from lpotscan log. lspciChangeField() (lspci_compare.go)
+	// is the same parser isCompactLpotscanChange() and buildResultReport() use,
+	// so "Most changed field" always names an actual Dev/Lnk field (e.g.
+	// "LnkSta") instead of accidentally picking up the "before: ..." segment
+	// that a naive positional split over " | " would land on.
 	if data, err := os.ReadFile(LPOTSCAN_LOG); err == nil {
 		lines := strings.Split(string(data), "\n")
 		for _, line := range lines {
-			if strings.Contains(line, " | ") {
-				parts := strings.Split(line, " | ")
-				if len(parts) >= 3 {
-					field := strings.TrimSpace(parts[2])
-					fieldChangeCount[field]++
-					if fieldChangeCount[field] > maxFieldChanges {
-						maxFieldChanges = fieldChangeCount[field]
-						mostChangedField = field
-					}
-				}
+			field := lspciChangeField(line)
+			if field == "" {
+				continue
+			}
+			fieldChangeCount[field]++
+			if fieldChangeCount[field] > maxFieldChanges {
+				maxFieldChanges = fieldChangeCount[field]
+				mostChangedField = field
 			}
 		}
 	}
@@ -61,8 +101,13 @@ func generateFinalSummary() {
 	// Write test session summary
 	ts := getCurrentTimestamp()
 	fmt.Fprintf(logFile, "\n%s ========== Test Session Summary ==========\n", ts)
-	fmt.Fprintf(logFile, "%s Test Duration: %.1f hours (%s to %s)\n",
-		ts, duration.Hours(), actualStartTime.Format("2006-01-02 15:04:05"), endTime.Format("2006-01-02 15:04:05"))
+	if durationKnown {
+		fmt.Fprintf(logFile, "%s Test Duration: %.1f hours (%s to %s)\n",
+			ts, duration.Hours(), actualStartTime.Format("2006-01-02 15:04:05"), endTime.Format("2006-01-02 15:04:05"))
+	} else {
+		fmt.Fprintf(logFile, "%s Test Duration: unknown (no start marker found in reboot.log; ended %s)\n",
+			ts, endTime.Format("2006-01-02 15:04:05"))
+	}
 	fmt.Fprintf(logFile, "%s Total Reboot Cycles: %d\n", ts, actualTotalCycles)
 
 	// Calculate failed reboots: any cycle with device changes is considered failed
@@ -106,8 +151,15 @@ func generateFinalSummary() {
 		fmt.Fprintf(logFile, "%s   Warning: some devices could not be fully checked, so this PASS result may not be accurate.\n", ts)
 	}
 
+	// deviceChangeStats only counts lspci Dev/Lnk capability changes
+	// (compareDevices() in lspci_compare.go). It intentionally excludes raw
+	// config-space byte changes, which the dashboard's per-device
+	// "Config Changed" column and classification.devices[].config_change_count
+	// (parseConfigResultChanges, a separate data source) already surface. The
+	// label below says so explicitly so the two counts are never mistaken for
+	// the same metric.
 	if mostAffectedDevice != "" {
-		fmt.Fprintf(logFile, "%s     - Most affected device: %s (%d changes)\n", ts, mostAffectedDevice, maxDeviceChanges)
+		fmt.Fprintf(logFile, "%s     - Most affected device (lspci Dev/Lnk changes only): %s (%d changes). See the dashboard's per-device Config Changed column for raw config-space changes.\n", ts, mostAffectedDevice, maxDeviceChanges)
 	}
 	if mostChangedField != "" {
 		fmt.Fprintf(logFile, "%s     - Most changed field: %s (%d occurrences)\n", ts, mostChangedField, maxFieldChanges)
@@ -131,13 +183,17 @@ func generateFinalSummary() {
 	// volatile (irregular) register was seen.
 	noteworthyConfigChanges := generateConfigSpaceSummary(logFile, actualTotalCycles)
 
-	// Final result. A test is "perfect" only when there were no topology /
-	// lspci changes AND no noteworthy (irregular) config-space changes. Benign
-	// reboot-fixed register noise — vendor registers reset to the same value on
-	// every boot — does NOT downgrade the verdict, since it indicates stable,
-	// repeatable firmware behaviour rather than instability.
-	switch {
-	case actualCyclesWithChanges == 0 && !noteworthyConfigChanges:
+	// Final result. classifyFinalVerdict is the same classifier
+	// buildResultReport() (result_helpers.go) uses for result.json's top-level
+	// status/message, so reboot.log's "Test Result:" line and result.json's
+	// status can never disagree about whether a run was a full pass, a
+	// pass-with-notice, or a fail. A test is "perfect" only when there were no
+	// topology / lspci changes AND no noteworthy (irregular) config-space
+	// changes. Benign reboot-fixed register noise — vendor registers reset to
+	// the same value on every boot — does NOT downgrade the verdict, since it
+	// indicates stable, repeatable firmware behaviour rather than instability.
+	switch classifyFinalVerdict(actualCyclesWithChanges, noteworthyConfigChanges) {
+	case verdictPerfect:
 		fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED SUCCESSFULLY - PERFECT STABILITY\n", ts)
 		if cyclesWithConfigChanges > 0 {
 			fmt.Fprintf(logFile, "%s No noteworthy config-space changes across %d reboot cycles.\n", ts, actualTotalCycles)
@@ -145,7 +201,7 @@ func generateFinalSummary() {
 		} else {
 			fmt.Fprintf(logFile, "%s All PCI devices stayed exactly the same across %d reboots. No issues found.\n", ts, actualTotalCycles)
 		}
-	case actualCyclesWithChanges == 0 && noteworthyConfigChanges:
+	case verdictNotice:
 		fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED WITH NOTICE\n", ts)
 		fmt.Fprintf(logFile, "%s The devices themselves did not change across %d reboots, but some settings changed in an unusual way. Please check the 'Noteworthy changes' section above.\n", ts, actualTotalCycles)
 	default:
@@ -181,7 +237,7 @@ func parseRebootLogForStats() (time.Time, int, int, int, int) {
 	data, err := os.ReadFile(REBOOT_LOG)
 	if err != nil {
 		logWarn("could not read reboot.log for stats: %v", err)
-		return time.Now(), 0, 0, 0, 0
+		return time.Time{}, 0, 0, 0, 0
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -250,11 +306,11 @@ func parseRebootLogForStats() (time.Time, int, int, int, int) {
 		}
 	}
 
-	// If no start time found, use a reasonable default
-	if startTime.IsZero() {
-		startTime = time.Now().Add(-1 * time.Hour) // Assume 1 hour ago
-	}
-
+	// If no start time was found in reboot.log, leave startTime zero rather
+	// than fabricating a "1 hour ago" placeholder: printing a made-up
+	// duration as if it were measured is worse than admitting the duration is
+	// unknown. Callers must check startTime.IsZero() before using it (see
+	// generateFinalSummary).
 	return startTime, totalCycles, cyclesWithChanges, topologyChanges, lspciChanges
 }
 
@@ -347,8 +403,10 @@ func generateConfigSpaceSummary(logFile *os.File, totalCycles int) (noteworthy b
 		// "reboot-fixed" noise (e.g. the controller scribbles the same byte
 		// on every boot) and surfaced separately from genuinely volatile
 		// registers. Rows are stable-sorted by BDF then offset for diffable
-		// output.
-		const rebootFixedThreshold = 0.80
+		// output. rebootFixedThreshold itself is a package-level constant (see
+		// below) so buildResultReport() in result_helpers.go classifies the
+		// exact same (device, offset) rows into NOTICE vs INFO using the same
+		// cutoff reboot.log used to print them as "volatile" vs "reboot-fixed".
 		type rowKey struct{ device, offset string }
 		type row struct {
 			key   rowKey
@@ -360,17 +418,18 @@ func generateConfigSpaceSummary(logFile *os.File, totalCycles int) (noteworthy b
 		volatileDevices := map[string]bool{}
 		for device, offsets := range deviceChanges {
 			for offset, count := range offsets {
-				ratio := 0.0
-				if totalCycles > 0 {
-					ratio = float64(count) / float64(totalCycles)
-				}
+				// classifyConfigChangeRatio is the same function buildResultReport()
+				// (result_helpers.go) uses for the identical (device, offset, count,
+				// totalCycles) inputs, so this table's Fixed/volatile split always
+				// agrees with result.json's NOTICE/INFO severities.
+				ratio, rowNoteworthy := classifyConfigChangeRatio(count, totalCycles)
 				r := row{key: rowKey{normalizeBDF(device), offset}, count: count, ratio: ratio}
-				if ratio >= rebootFixedThreshold {
-					fixedRows = append(fixedRows, r)
-					fixedDevices[r.key.device] = true
-				} else {
+				if rowNoteworthy {
 					volatileRows = append(volatileRows, r)
 					volatileDevices[r.key.device] = true
+				} else {
+					fixedRows = append(fixedRows, r)
+					fixedDevices[r.key.device] = true
 				}
 			}
 		}
@@ -394,20 +453,15 @@ func generateConfigSpaceSummary(logFile *os.File, totalCycles int) (noteworthy b
 			fmt.Fprintf(logFile, "│ %-15s │ %-15s │ %-7s │ %-7s │ %-7s │\n", "Device BDF", "Change Count", "Offset", "Pattern", "Type")
 			fmt.Fprintf(logFile, "├─────────────────┼─────────────────┼─────────┼─────────┼─────────┤\n")
 			for _, r := range rows {
-				changeType := "Config"
-				switch {
-				case r.key.offset == "0xa2":
-					changeType = "Config"
-				case r.key.offset == "0x3c" || r.key.offset == "0x3d":
-					changeType = "IRQ"
-				case strings.Contains(r.key.offset, "0x4") || strings.Contains(r.key.offset, "0x5"):
-					changeType = "Control"
-				case strings.Contains(r.key.offset, "0x6") || strings.Contains(r.key.offset, "0x7"):
-					changeType = "Status"
-				}
+				changeType := pciOffsetRegisterType(r.key.offset)
 				// A register that changes in (almost) every cycle is a fixed
-				// boot-time reset, not an erratic counter; label it accordingly
-				// so the table itself signals "benign" vs "irregular".
+				// boot-time reset ("Fixed"); this ratio check has real bit-pattern
+				// evidence behind it via rebootFixedThreshold and matches the
+				// benign/volatile split used above. "Single" and "Various" below
+				// remain simple occurrence-count heuristics because
+				// analyzeBitPatterns()'s richer per-byte evidence (monotonic /
+				// bit-flip / multi-value) is only computed during -scan and is not
+				// persisted per (device, offset) for this summary to re-read.
 				pattern := "Various"
 				switch {
 				case r.count == 1:
@@ -415,7 +469,7 @@ func generateConfigSpaceSummary(logFile *os.File, totalCycles int) (noteworthy b
 				case r.ratio >= rebootFixedThreshold:
 					pattern = "Fixed"
 				case r.count > 5:
-					pattern = "Counter"
+					pattern = "Counter (heuristic: >5 occurrences, not confirmed monotonic)"
 				}
 				fmt.Fprintf(logFile, "│ %-15s │ %-15s │ %-7s │ %-7s │ %-7s │\n",
 					r.key.device,

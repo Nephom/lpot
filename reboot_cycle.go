@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,6 +72,32 @@ func cycleChangeKind() (noteworthy, configNoise bool) {
 		}
 	}
 	return noteworthy, configNoise
+}
+
+// cycleEndStatus is the single source of truth for how a cycle is labelled
+// at its end banner ('===== Cycle N END (<status>) ====='). It is also the
+// only place that decides whether a cycle counts as "noteworthy" for the -p
+// stop-on-difference gate, so the banner text and the -p behaviour can never
+// diverge again: a cycle that reads "clean (config noise)" in reboot.log by
+// definition does not trigger -p, because both consult this function.
+func cycleEndStatus(noteworthy, configNoise bool) string {
+	switch {
+	case noteworthy:
+		return "changes detected"
+	case configNoise:
+		return "clean (config noise)"
+	default:
+		return "clean"
+	}
+}
+
+// cycleRequiresStop reports whether -p should stop and disable the service
+// for the current cycle. Only genuinely noteworthy changes (topology, lspci
+// capability, or a classification change from writeClassificationReportToLog)
+// qualify; benign config-space reboot-noise alone does not, matching the
+// banner's "clean (config noise)" label produced by cycleEndStatus above.
+func cycleRequiresStop(noteworthy, configNoise bool) bool {
+	return noteworthy
 }
 
 // cycleTag returns a "[Cycle N] " prefix when a cycle number is set, and an
@@ -217,9 +244,19 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 	// enough. New devices are present in sysfs, so enrich the log line with
 	// vendor/device/class to help identify which hardware appeared without
 	// requiring a separate lspci.
+	// snapshotFailedBDFs collects devices whose current-cycle lspci snapshot
+	// could not be captured (e.g. a transient link reset or lspci timeout).
+	// This is a per-device, non-fatal condition: one flaky device must not
+	// abort the whole cycle (and with it, potentially the rest of a 48h run).
+	// It is recorded as a plain warning only — it does not affect this
+	// cycle's PASS/FAIL verdict, since the device may simply have been mid-
+	// reset when queried and could be perfectly stable a moment later.
+	var snapshotFailedBDFs []string
 	for _, bdf := range bdfs {
 		if err := executeLspci(bdf, ".txt"); err != nil {
-			return fmt.Errorf("capture current lspci snapshot for %s: %w", bdf, err)
+			snapshotFailedBDFs = append(snapshotFailedBDFs, bdf)
+			logWarnFp(logFp, "could not capture this cycle's lspci snapshot for %s (%v); this device is skipped from lspci comparison this cycle only and does not affect the pass/fail result", bdf, err)
+			continue
 		}
 		initFile := filepath.Join(TMP_DIR, bdf+"_init.txt")
 		if !fileExists(initFile) {
@@ -239,16 +276,26 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 	// purely a readability aid for the common "device relocated to a
 	// different slot/BDF" case.
 	if len(removedDevices) > 0 && len(newDevices) > 0 {
+		// consumedNewBDF tracks which new BDFs have already been matched to an
+		// old BDF, so two removed devices sharing the same vendor:device ID
+		// (common on multi-function NICs) cannot both claim the same new BDF
+		// and produce duplicate or contradictory relocation notes.
+		consumedNewBDF := make(map[string]bool, len(newDevices))
 		for _, oldBDF := range removedDevices {
 			oldVendor, oldDevice, oldOK := vendorDeviceFromLspciDump(filepath.Join(TMP_DIR, oldBDF+"_init.txt"))
 			if !oldOK {
 				continue
 			}
 			for _, newBDF := range newDevices {
+				if consumedNewBDF[newBDF] {
+					continue
+				}
 				newInfo, newOK := readPCIDeviceInfo(newBDF)
 				if newOK && oldVendor == newInfo.Vendor && oldDevice == newInfo.Device {
 					fmt.Fprintf(logFp, "%s %sNOTE: device %04x:%04x may have relocated from %s to %s\n",
 						getCurrentTimestamp(), cycleTag(), oldVendor, oldDevice, oldBDF, newBDF)
+					consumedNewBDF[newBDF] = true
+					break
 				}
 			}
 		}
@@ -326,21 +373,80 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 // cleanCycleStreak tracks how many consecutive cycles reported "No devices
 // changed". A single summary line is emitted for long clean runs so reboot.log
 // doesn't grow a page per idle cycle.
+//
+// The counter itself is persisted to CLEAN_STREAK_STATE_FILE (loaded lazily on
+// first use, saved after every update) because each reboot cycle runs in a
+// brand-new process: systemd re-execs /lpot/reboot.sh after every reboot, so
+// an in-memory-only counter would reset on every single cycle and the log's
+// own "N cycles clean (Cycle X..Y)" claim of a multi-cycle streak would never
+// actually be true (N would always be 1). Persisting to disk lets the streak
+// genuinely accumulate across reboots, matching what the log line claims.
 var (
 	cleanCycleMu     sync.Mutex
 	cleanCycleStart  int64
 	cleanCycleLast   int64
 	cleanCycleCount  int
 	cleanCycleHeader bool
+	cleanCycleLoaded bool
 )
 
+// cleanStreakState is the on-disk representation of the in-progress clean
+// streak, persisted so it survives the reboot between cycles.
+type cleanStreakState struct {
+	Start  int64 `json:"start"`
+	Last   int64 `json:"last"`
+	Count  int   `json:"count"`
+	Active bool  `json:"active"`
+}
+
+// loadCleanStreakStateLocked reads CLEAN_STREAK_STATE_FILE into the package
+// vars exactly once per process (cleanCycleLoaded guards repeat loads). Must
+// be called with cleanCycleMu held. A missing or corrupt file is treated as
+// "no streak in progress" rather than an error, since the state file is
+// best-effort bookkeeping, not authoritative data.
+func loadCleanStreakStateLocked() {
+	if cleanCycleLoaded {
+		return
+	}
+	cleanCycleLoaded = true
+	data, err := os.ReadFile(CLEAN_STREAK_STATE_FILE)
+	if err != nil {
+		return
+	}
+	var state cleanStreakState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return
+	}
+	cleanCycleStart = state.Start
+	cleanCycleLast = state.Last
+	cleanCycleCount = state.Count
+	cleanCycleHeader = state.Active
+}
+
+// saveCleanStreakStateLocked persists the current streak state. Must be
+// called with cleanCycleMu held. Failures are logged but not fatal: losing
+// the persisted streak only degrades a cosmetic "N cycles clean" count, it
+// never affects PASS/FAIL correctness.
+func saveCleanStreakStateLocked() {
+	state := cleanStreakState{Start: cleanCycleStart, Last: cleanCycleLast, Count: cleanCycleCount, Active: cleanCycleHeader}
+	data, err := json.Marshal(state)
+	if err != nil {
+		logWarn("could not encode clean streak state: %v", err)
+		return
+	}
+	if err := writeFileNoFollow(CLEAN_STREAK_STATE_FILE, data, 0644); err != nil {
+		logWarn("could not persist clean streak state to %s: %v", CLEAN_STREAK_STATE_FILE, err)
+	}
+}
+
 // noteCleanCycle emits a single line when a clean streak starts, then updates
-// a trailing "... N cycles clean (Cycle X-Y)" status line in-memory state.
+// a trailing "... N cycles clean (Cycle X-Y)" status line in persisted state.
 // The final flush happens either when a non-clean cycle interrupts the streak
 // (handled via flushCleanStreak) or at test end via generateFinalSummary.
 func noteCleanCycle(logFile *os.File, timeStr string) {
 	cleanCycleMu.Lock()
 	defer cleanCycleMu.Unlock()
+	loadCleanStreakStateLocked()
 	cycle := currentCycle.Load()
 	if !cleanCycleHeader {
 		fmt.Fprintf(logFile, "%s [Cycle %d] No devices changed (clean streak started)\n", timeStr, cycle)
@@ -358,6 +464,7 @@ func noteCleanCycle(logFile *os.File, timeStr string) {
 			timeStr, cycle, cleanCycleCount, cleanCycleStart, cleanCycleLast)
 	}
 	logFile.Sync()
+	saveCleanStreakStateLocked()
 }
 
 // flushCleanStreak terminates a clean streak and writes a one-line summary
@@ -366,6 +473,7 @@ func noteCleanCycle(logFile *os.File, timeStr string) {
 func flushCleanStreak(logFile *os.File) {
 	cleanCycleMu.Lock()
 	defer cleanCycleMu.Unlock()
+	loadCleanStreakStateLocked()
 	if !cleanCycleHeader {
 		return
 	}
@@ -374,6 +482,7 @@ func flushCleanStreak(logFile *os.File) {
 	logFile.Sync()
 	cleanCycleHeader = false
 	cleanCycleCount = 0
+	saveCleanStreakStateLocked()
 }
 
 // cleanupBDFFiles removes current .txt files but keeps _init.txt files

@@ -34,7 +34,11 @@ func compareDeviceFiles(filePath1, filePath2 string, ignoreSet map[string]bool, 
 		return ComparisonResult{Error: err}
 	}
 
-	if device1.DeviceID != device2.DeviceID {
+	// Normalise both BDFs before comparing: parseDeviceFile() may read a long
+	// ("0000:21:00.4") or short ("21:00.4") form depending on which lspci
+	// invocation produced the dump, and comparing the raw strings would
+	// falsely report "device IDs do not match" for the same physical device.
+	if normalizeBDF(device1.DeviceID) != normalizeBDF(device2.DeviceID) {
 		return ComparisonResult{
 			Error: fmt.Errorf("device IDs do not match: %s vs %s", device1.DeviceID, device2.DeviceID),
 		}
@@ -77,19 +81,24 @@ func parseDeviceFile(filePath string) (Device, error) {
 		line := strings.TrimSpace(rawLine)
 		indent := leadingWhitespace(rawLine)
 
-		// Extract device ID from the first line
+		// Extract device ID from the first line that actually looks like a BDF
+		// (short "bb:dd.f" or long "dddd:bb:dd.f" form). lspci -vv's first
+		// output line always starts with the BDF, but a stray warning line
+		// (e.g. from lspci itself) could otherwise be accepted verbatim as the
+		// DeviceID, causing an unrelated later device1.DeviceID != device2.DeviceID
+		// mismatch. A line that fails validation is skipped so a genuine BDF
+		// line further down is still picked up.
 		if currentDevice.DeviceID == "" && len(line) >= 7 {
-			// Extract full BusID (format: 0000:xx:yy.z)
 			fields := strings.Fields(line)
-			if len(fields) > 0 {
-				currentDevice.DeviceID = fields[0]
-			} else {
-				currentDevice.DeviceID = line[:7]
+			if len(fields) == 0 {
+				continue
 			}
-			remainingDesc := ""
-			if len(fields) > 0 {
-				remainingDesc = strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
+			candidate := fields[0]
+			if !bdfRegex.MatchString(candidate) && !shortBDFRegex.MatchString(candidate) {
+				continue
 			}
+			currentDevice.DeviceID = candidate
+			remainingDesc := strings.TrimSpace(strings.TrimPrefix(line, candidate))
 
 			// Skip virtual USB devices
 			if strings.Contains(strings.ToLower(remainingDesc), "virtual usb") {
@@ -210,7 +219,10 @@ func compareDevices(device1, device2 Device, logFile *os.File) ComparisonResult 
 			getCurrentTimestamp(), cycleTag(), device1.DeviceID, key, value1, value2)
 
 		// Track statistics
-		deviceChangeStats[device1.DeviceID]++
+		// Keyed by normalizeBDF() so multi-domain hosts (where the same device
+		// might be seen in long or short form across different call paths) do
+		// not fragment this device's count across two different map keys.
+		deviceChangeStats[normalizeBDF(device1.DeviceID)]++
 
 		fmt.Fprint(logFile, logEntry)
 		fmt.Print(logEntry)
@@ -227,7 +239,10 @@ func compareDevices(device1, device2 Device, logFile *os.File) ComparisonResult 
 func filterLpotscanErrors(errorLogPath string, logFp *os.File) {
 	errorLog, err := os.Open(errorLogPath)
 	if err != nil {
-		fmt.Printf("Failed to open error log: %v\n", err)
+		// This is the only record of "what changed" for this cycle; if it
+		// cannot be opened, say so in reboot.log (not just stdout) so the
+		// gap is visible to anyone reviewing the log after the fact.
+		logWarnFp(logFp, "could not open %s to extract lspci change details: %v", errorLogPath, err)
 		return
 	}
 	defer errorLog.Close()
@@ -263,10 +278,14 @@ func isCompactLpotscanChange(line string) bool {
 // lspciChangeField extracts the field name from a compact per-field change
 // record produced by compareDevices(), or "" if line doesn't match that
 // shape. Shared by isCompactLpotscanChange and the result-report parser so
-// both agree on what a "compact change" line looks like.
+// both agree on what a "compact change" line looks like. Requires at least 4
+// " | "-separated segments (not exactly 4): if a before/after value itself
+// contains " | ", there will be more than 4 segments, and the trailing two
+// are still the before/after values (see lspciChangeParts), so this must not
+// reject the line outright.
 func lspciChangeField(line string) string {
 	parts := strings.Split(line, " | ")
-	if len(parts) != 4 {
+	if len(parts) < 4 {
 		return ""
 	}
 	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(parts[1]), "changed"))
@@ -274,12 +293,19 @@ func lspciChangeField(line string) string {
 
 // lspciChangeParts extracts (bdf, field, before, after) from a compact
 // per-field change record produced by compareDevices(). ok is false when line
-// doesn't match that 4-segment shape or the field isn't a compared Dev/Lnk
-// field. Used by buildResultReport() to feed per-field LSPCI changes into
-// result.json with the same fidelity CONFIG_SPACE changes already have.
+// has fewer than 4 " | "-separated segments or the field isn't a compared
+// Dev/Lnk field. Used by buildResultReport() to feed per-field LSPCI changes
+// into result.json with the same fidelity CONFIG_SPACE changes already have.
+//
+// The shape is "<ts prefix> | <field> changed | before: ... | after: ...".
+// before/after are taken from the last two segments (not parts[2]/parts[3])
+// so a before or after value that itself contains " | " produces more than 4
+// segments without being silently dropped by filterLpotscanErrors or the
+// result.json parser — it previously required exactly 4 segments, which
+// would have discarded the entire line in that case.
 func lspciChangeParts(line string) (bdf, field, before, after string, ok bool) {
 	parts := strings.Split(line, " | ")
-	if len(parts) != 4 {
+	if len(parts) < 4 {
 		return "", "", "", "", false
 	}
 	field = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(parts[1]), "changed"))
@@ -291,7 +317,8 @@ func lspciChangeParts(line string) (bdf, field, before, after string, ok bool) {
 	if fields := strings.Fields(parts[0]); len(fields) > 0 {
 		bdf = fields[len(fields)-1]
 	}
-	before = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[2]), "before:"))
-	after = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[3]), "after:"))
+	last := len(parts) - 1
+	before = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[last-1]), "before:"))
+	after = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[last]), "after:"))
 	return bdf, field, before, after, true
 }

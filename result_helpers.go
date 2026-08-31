@@ -19,13 +19,6 @@ func resultStatus(changes int) string {
 	return "PASS"
 }
 
-func resultInfoStatus(changes int) string {
-	if changes > 0 {
-		return "INFO"
-	}
-	return "PASS"
-}
-
 func lineTimestamp(line string) string {
 	fields := strings.Fields(line)
 	if len(fields) >= 2 {
@@ -36,6 +29,23 @@ func lineTimestamp(line string) string {
 	return ""
 }
 
+// lineCycleNumber extracts the cycle number from any log line containing a
+// "Cycle N" marker. Real log lines take two shapes:
+//   - banner form: "===== Cycle 7 START =====" / "... END (...) =====" where
+//     the number is followed by a space and more banner text (no immediate "]").
+//   - tag form: "[Cycle 7] Device: ..." / "[Cycle 7] <bdf> | field changed | ..."
+//     where the number is immediately followed by "]".
+//
+// The previous implementation called strings.TrimSuffix on the *entire*
+// remainder of the line, which only strips a "]" that happens to be the very
+// last character of the line. Every tag-form line (used by CONFIG_CHANGES_LOG
+// and LPOTSCAN_LOG, i.e. every config-space and lspci change record) has text
+// after the "]", so the suffix trim never fired and strconv.Atoi always failed
+// on tokens like "7]", silently returning 0. That made every config-space and
+// lspci problem in result.json collapse onto cycle 0, which is never a valid
+// cycle key, so those events were dropped from their cycle or from the report
+// entirely. Trimming the suffix off the first whitespace-separated token
+// (not the whole remainder) handles both shapes correctly.
 func lineCycleNumber(line string) int {
 	marker := "Cycle "
 	start := strings.Index(line, marker)
@@ -43,12 +53,15 @@ func lineCycleNumber(line string) int {
 		return 0
 	}
 	value := strings.TrimSpace(line[start+len(marker):])
-	value = strings.TrimSuffix(value, "]")
 	fields := strings.Fields(value)
 	if len(fields) == 0 {
 		return 0
 	}
-	n, _ := strconv.Atoi(fields[0])
+	token := strings.TrimSuffix(fields[0], "]")
+	n, err := strconv.Atoi(token)
+	if err != nil {
+		return 0
+	}
 	return n
 }
 
@@ -214,6 +227,48 @@ func writeFilteredDevicesSection(logFile *os.File) {
 	}
 }
 
+// classifyConfigChangeRatio computes the occurrence ratio for a (device,
+// offset) change count against the total completed cycles, and reports
+// whether that ratio is noteworthy (below rebootFixedThreshold) or benign
+// reboot-fixed noise (at or above it). It is the single arithmetic source
+// shared by generateConfigSpaceSummary (summary.go, reboot.log's human-
+// readable table) and buildResultReport (result.json's CONFIG_SPACE
+// problems), so the two artifacts always draw the same benign/noteworthy
+// line for the same underlying counts.
+func classifyConfigChangeRatio(count, totalCycles int) (ratio float64, noteworthy bool) {
+	if totalCycles > 0 {
+		ratio = float64(count) / float64(totalCycles)
+	}
+	return ratio, ratio < rebootFixedThreshold
+}
+
+// finalVerdictKind enumerates the three possible end-of-run outcomes.
+type finalVerdictKind int
+
+const (
+	verdictPerfect finalVerdictKind = iota // no topology/lspci changes, no noteworthy config-space changes
+	verdictNotice                          // no topology/lspci changes, but noteworthy config-space changes
+	verdictFail                            // topology or lspci changes occurred in at least one cycle
+)
+
+// classifyFinalVerdict is the single classifier for the end-of-run outcome,
+// shared by generateFinalSummary (reboot.log's "Test Result:" line) and
+// buildResultReport (result.json's top-level status/message), so the two
+// artifacts can never disagree about whether a run was a full pass, a
+// pass-with-notice, or a fail. cyclesWithChanges counts cycles where a
+// topology or lspci difference was recorded; noteworthyConfigChanges reports
+// whether any config-space change fell below the reboot-fixed threshold.
+func classifyFinalVerdict(cyclesWithChanges int, noteworthyConfigChanges bool) finalVerdictKind {
+	switch {
+	case cyclesWithChanges == 0 && !noteworthyConfigChanges:
+		return verdictPerfect
+	case cyclesWithChanges == 0 && noteworthyConfigChanges:
+		return verdictNotice
+	default:
+		return verdictFail
+	}
+}
+
 func stabilityMessage(name string, changes int) string {
 	if changes == 0 {
 		return fmt.Sprintf("%s stable", name)
@@ -222,6 +277,13 @@ func stabilityMessage(name string, changes int) string {
 }
 
 func buildResultReport(checkpoint bool, statusOverride string) resultReport {
+	// completedCyclesFromLog is the single authoritative reboot-cycle count,
+	// parsed once here and shared as the ratio denominator for config-space
+	// noteworthy/benign classification below. generateConfigSpaceSummary()
+	// (summary.go) is handed the identical number by generateFinalSummary(),
+	// so reboot.log's "Noteworthy changes" verdict and result.json's
+	// ConfigSpace check can never disagree about how many cycles actually ran.
+	_, completedCyclesFromLog, _, _, _ := parseRebootLogForStats()
 	var startedAt time.Time
 	totalCycles := 0
 	cyclesWithChanges := 0
@@ -320,14 +382,11 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 	noteworthyPatterns := make(map[string]bool)
 	benignPatterns := make(map[string]bool)
 	for _, change := range configChanges {
-		ratio := 0.0
-		completedCount := len(completedCycles)
-		if completedCount > 0 {
-			ratio = float64(len(cycleSets[change.device+"\x00"+change.offset])) / float64(completedCount)
-		}
+		count := len(cycleSets[change.device+"\x00"+change.offset])
+		ratio, noteworthyRow := classifyConfigChangeRatio(count, completedCyclesFromLog)
 		severity := "INFO"
 		classification := "benign reboot-fixed register reset"
-		if ratio < 0.80 {
+		if noteworthyRow {
 			severity = "NOTICE"
 			classification = "noteworthy config-space change"
 			noteworthyPatterns[change.device+"\x00"+change.offset] = true
@@ -358,6 +417,14 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 	}
 	noteworthyConfig = len(noteworthyPatterns)
 	benignConfig = len(benignPatterns)
+	// ConfigNoise is purely informational: it is "INFO" whenever any benign
+	// (reboot-fixed) register reset was observed, and "PASS" otherwise. Inlined
+	// at the point of use since it previously lived in a one-line helper
+	// (resultInfoStatus) with no other caller.
+	configNoiseStatus := "PASS"
+	if benignConfig > 0 {
+		configNoiseStatus = "INFO"
+	}
 
 	// lspci Dev/Lnk field changes get the same per-BDF, before/after fidelity
 	// as config-space changes, parsed straight from lpotscan.log rather than
@@ -401,15 +468,21 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 		if totalCycles == 0 {
 			status = "INCOMPLETE"
 			message = "No completed reboot cycle was recorded"
-		} else if cyclesWithChanges > 0 {
-			status = "FAIL"
-			message = "Noteworthy PCI topology, lspci, or config-space changes were detected"
-		} else if noteworthyConfig > 0 {
-			status = "PASS"
-			message = "PCI topology and lspci capability are stable; config-space notices require review"
 		} else {
-			status = "PASS"
-			message = "PCI topology, lspci capability, and PCI config are stable"
+			// classifyFinalVerdict is the same classifier generateFinalSummary()
+			// (summary.go) uses for reboot.log's "Test Result:" line, so the two
+			// artifacts never disagree about pass/notice/fail for the same run.
+			switch classifyFinalVerdict(cyclesWithChanges, noteworthyConfig > 0) {
+			case verdictFail:
+				status = "FAIL"
+				message = "Noteworthy PCI topology, lspci, or config-space changes were detected"
+			case verdictNotice:
+				status = "PASS"
+				message = "PCI topology and lspci capability are stable; config-space notices require review"
+			default:
+				status = "PASS"
+				message = "PCI topology, lspci capability, and PCI config are stable"
+			}
 		}
 	}
 	if statusOverride != "" {
@@ -450,7 +523,7 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 			Topology:    resultCheck{Status: resultStatus(topologyChanges), ChangedCycles: topologyChanges, Message: stabilityMessage("topology", topologyChanges)},
 			LSPCI:       resultCheck{Status: resultStatus(lspciChanges), ChangedCycles: lspciChanges, Message: stabilityMessage("Dev/Lnk", lspciChanges)},
 			ConfigSpace: resultCheck{Status: configSpaceResultStatus(noteworthyConfig), Noteworthy: noteworthyConfig, Message: configSpaceStabilityMessage(noteworthyConfig)},
-			ConfigNoise: resultCheck{Status: resultInfoStatus(benignConfig), BenignChanges: benignConfig, Message: fmt.Sprintf("%d recurring benign register change(s)", benignConfig)},
+			ConfigNoise: resultCheck{Status: configNoiseStatus, BenignChanges: benignConfig, Message: fmt.Sprintf("%d recurring benign register change(s)", benignConfig)},
 		},
 		Cycles: orderedCycles, Problems: problems,
 		Artifacts: map[string]string{"result": RESULT_FILE, "summary": REBOOT_LOG, "lspci": LPOTSCAN_LOG, "config_space": CONFIG_CHANGES_LOG},

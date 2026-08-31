@@ -22,6 +22,12 @@ type PCIDeviceInfo struct {
 	SubsystemVendorID uint16
 	SubsystemID       uint16
 	ConfigData        []byte // Store raw config data for comparison
+	// Truncated is true when ConfigData was shorter than the 64-byte minimum
+	// PCI header, so VendorID/DeviceID above are zero-valued placeholders
+	// rather than a real "vendor 0000 device 0000" device. Callers must check
+	// this before printing VendorID/DeviceID so a read failure is never
+	// mistaken for a genuine (and vanishingly rare) all-zero device ID.
+	Truncated bool
 }
 
 // DeviceIgnoreBits structure for storing bytes to ignore
@@ -40,7 +46,18 @@ type StableConfig struct {
 	UnstableBytes map[int]bool
 }
 
-// Define which registers are timer-related
+// timerRelatedOffsets is a hardcoded fallback list of known timer/counter
+// registers. It overlaps by design with the auto-detected volatile bytes
+// produced by detectVolatileBytesWithSamples() (which is always run before
+// every -t cycle's comparison as of the auto-scan-on-every-run change in
+// main()) and persisted into ignore_list.txt (read back as timerPatterns in
+// compareAndLogDeviceChanges). This hardcoded set exists only as a safety net
+// for the narrow window where a comparison could run against a fresh
+// initial.bin before an auto-scan has ever completed for this device (e.g. a
+// first cycle interrupted between initial.bin creation and the scan step);
+// once ignore_list.txt reflects that device, these entries are redundant
+// with the auto-detected ones for the same offsets, not a competing source
+// of truth.
 var timerRelatedOffsets = map[int]bool{
 	0x0D: true, // LatencyTimer
 	0x3E: true, // MinGnt
@@ -54,12 +71,15 @@ var timerRelatedOffsets = map[int]bool{
 // Define volatile status bits
 var volatileStatusBits = uint16(0x00F8) // Bits 3-7 of Status register (offset 0x06)
 
-// scanAndGenerateIgnoreBits scans PCI devices and generates ignore bits file
-func scanAndGenerateIgnoreBits() error {
+// scanAndGenerateIgnoreBits scans PCI devices and generates ignore bits file.
+// logFp is optional (nil when called from the standalone -scan flag, which
+// has no open reboot.log); when present, per-device sample/read anomalies are
+// also written there instead of being visible only on stdout.
+func scanAndGenerateIgnoreBits(logFp *os.File) error {
 	timestamp := getCurrentTimestamp()
 	fmt.Printf("%s Starting volatile byte detection (this will take about 5 seconds)...\n", timestamp)
 
-	ignoreBits, _, err := detectVolatileBytesWithSamples()
+	ignoreBits, _, err := detectVolatileBytesWithSamples(logFp)
 	if err != nil {
 		return fmt.Errorf("failed to detect volatile bytes: %v", err)
 	}
@@ -74,12 +94,12 @@ func scanAndGenerateIgnoreBits() error {
 }
 
 // runConfigScan executes the config scan logic
-func runConfigScan() error {
+func runConfigScan(logFp *os.File) error {
 	initialFile := "/lpot/initial.bin"
 
 	// Check if ignore_list.txt exists, if not run scan first
 	if !fileExists(IGNORE_LIST_FILE) {
-		if err := scanAndGenerateIgnoreBits(); err != nil {
+		if err := scanAndGenerateIgnoreBits(logFp); err != nil {
 			return fmt.Errorf("generate volatile-byte ignore list: %w", err)
 		}
 	}
@@ -89,9 +109,11 @@ func runConfigScan() error {
 		timestamp := getCurrentTimestamp()
 		fmt.Printf("%s Initial PCI config not found, creating %s\n", timestamp, initialFile)
 
-		if err := savePCIConfig(initialFile); err != nil {
+		failedBDFs, err := savePCIConfigReportingFailures(initialFile)
+		if err != nil {
 			return fmt.Errorf("error saving initial PCI config: %v", err)
 		}
+		logSavePCIConfigFailures(logFp, failedBDFs)
 		fmt.Printf("%s Initial PCI config saved.\n", timestamp)
 		return nil
 	}
@@ -99,11 +121,27 @@ func runConfigScan() error {
 	// Compare initial snapshot against freshly-sampled stable config
 	timestamp := getCurrentTimestamp()
 	fmt.Printf("%s Comparing PCI configs...\n", timestamp)
-	return compareDeviceConfigs(initialFile, CONFIG_CHANGES_LOG)
+	return compareDeviceConfigs(initialFile, CONFIG_CHANGES_LOG, logFp)
 }
 
-// detectVolatileBytesWithSamples detects frequently changing bytes and returns sample data
-func detectVolatileBytesWithSamples() (map[string]DeviceIgnoreBits, []map[string][]byte, error) {
+// logSavePCIConfigFailures writes one reboot.log warning line per BDF whose
+// /sys/.../config read failed during a raw config-space snapshot, so the
+// device a user most needs to investigate is never silently absent from
+// every persisted artifact (previously these failures were stdout-only).
+func logSavePCIConfigFailures(logFp *os.File, failedBDFs []string) {
+	if logFp == nil || len(failedBDFs) == 0 {
+		return
+	}
+	for _, entry := range failedBDFs {
+		logWarnFp(logFp, "could not read raw PCI config space for %s; this device is excluded from config-space comparison this cycle", entry)
+	}
+}
+
+// detectVolatileBytesWithSamples detects frequently changing bytes and returns sample data.
+// logFp is optional (nil from the standalone -scan flag); when present, both
+// per-device sample-read failures and devices that dropped out of one or more
+// of the 5 samples are additionally logged there.
+func detectVolatileBytesWithSamples(logFp *os.File) (map[string]DeviceIgnoreBits, []map[string][]byte, error) {
 	ignoreBits := make(map[string]DeviceIgnoreBits)
 
 	// Create a fresh 0700 private directory under /tmp (name randomised by the
@@ -125,15 +163,28 @@ func detectVolatileBytesWithSamples() (map[string]DeviceIgnoreBits, []map[string
 	fmt.Println("Collecting PCI config samples for volatile byte detection...")
 
 	// Collect 5 samples, 1 second apart
+	sampleFailedSet := make(map[string]bool)
 	for i, tmpFile := range tmpFiles {
 		fmt.Printf("Collecting sample %d/%d...\n", i+1, len(tmpFiles))
-		if err := savePCIConfig(tmpFile); err != nil {
+		failedBDFs, err := savePCIConfigReportingFailures(tmpFile)
+		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create sample %d: %v", i+1, err)
+		}
+		for _, entry := range failedBDFs {
+			sampleFailedSet[entry] = true
 		}
 
 		if i < len(tmpFiles)-1 {
 			time.Sleep(1 * time.Second)
 		}
+	}
+	if len(sampleFailedSet) > 0 {
+		failedList := make([]string, 0, len(sampleFailedSet))
+		for entry := range sampleFailedSet {
+			failedList = append(failedList, entry)
+		}
+		sort.Strings(failedList)
+		logSavePCIConfigFailures(logFp, failedList)
 	}
 
 	// Read sample data
@@ -172,6 +223,18 @@ func detectVolatileBytesWithSamples() (map[string]DeviceIgnoreBits, []map[string
 		}
 
 		if !validDevice {
+			// This device did not appear in every one of the 5 samples (e.g. a
+			// flapping link that briefly drops out of sysfs). It is skipped here
+			// silently before this fix, meaning it never entered ignore_list.txt
+			// and later per-cycle byte comparisons had no volatile-byte baseline
+			// for it, risking false-positive "changed" reports. Recording it
+			// explicitly lets the operator know this device's stability could
+			// not be assessed by this scan.
+			if logFp != nil {
+				logWarnFp(logFp, "device %s was missing from one or more of the %d volatile-byte detection samples; its ignore-bits could not be computed this scan", normalizeBDF(busID), sampleCount)
+			} else {
+				fmt.Printf("Warning: device %s was missing from one or more of the %d volatile-byte detection samples; its ignore-bits could not be computed this scan\n", normalizeBDF(busID), sampleCount)
+			}
 			continue
 		}
 
@@ -346,12 +409,25 @@ func analyzeBitPatterns(samples [][]byte, offset int) (bool, string) {
 
 // savePCIConfig saves PCI configuration space to file
 func savePCIConfig(outputFile string) error {
+	_, err := savePCIConfigReportingFailures(outputFile)
+	return err
+}
+
+// savePCIConfigReportingFailures is the implementation behind savePCIConfig.
+// It additionally returns the list of BDFs whose /sys/.../config read
+// failed, so callers that have a log file open (runConfigScan, via main())
+// can write an explicit reboot.log line naming the affected BDF and reason
+// instead of the failure being visible only on stdout — previously the only
+// trace of a per-device read failure, which meant the exact device a user
+// most needed to investigate left no mark in any persisted artifact.
+func savePCIConfigReportingFailures(outputFile string) ([]string, error) {
 	pciPath := "/sys/bus/pci/devices/"
 	files, err := os.ReadDir(pciPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	var failedBDFs []string
 	var buffer bytes.Buffer
 	for _, file := range files {
 		busID := file.Name()
@@ -366,6 +442,7 @@ func savePCIConfig(outputFile string) error {
 		configData, err := os.ReadFile(configPath)
 		if err != nil {
 			fmt.Printf("Failed to read %s: %v\n", configPath, err)
+			failedBDFs = append(failedBDFs, fmt.Sprintf("%s (%v)", normalizeBDF(busID), err))
 			continue
 		}
 
@@ -410,7 +487,10 @@ func savePCIConfig(outputFile string) error {
 		}
 		buffer.WriteString("\n")
 	}
-	return writeFileNoFollow(outputFile, buffer.Bytes(), 0644)
+	if err := writeFileNoFollow(outputFile, buffer.Bytes(), 0644); err != nil {
+		return failedBDFs, err
+	}
+	return failedBDFs, nil
 }
 
 // splitDevices splits device data from XXD-like format
@@ -515,7 +595,7 @@ func saveIgnoreBits(filePath string, ignoreBits map[string]DeviceIgnoreBits) err
 // compareDeviceConfigs compares the initial PCI config snapshot against the
 // current state. Multiple live samples are collected via collectStableConfig
 // to filter out timer noise, so only genuine capability changes are logged.
-func compareDeviceConfigs(initialFile, reportFile string) error {
+func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error {
 	initialData, err := os.ReadFile(initialFile)
 	if err != nil {
 		return err
@@ -530,10 +610,11 @@ func compareDeviceConfigs(initialFile, reportFile string) error {
 	// Collect stable-value snapshot (3 samples, 200ms apart) instead of a single
 	// shot. Bytes that keep changing during the sampling window are marked as
 	// timer noise and skipped during comparison.
-	stableConfigs, err := collectStableConfig(3, 200)
+	stableConfigs, sampleFailedBDFs, err := collectStableConfig(3, 200)
 	if err != nil {
 		return fmt.Errorf("failed to collect stable config: %v", err)
 	}
+	logSavePCIConfigFailures(logFp, sampleFailedBDFs)
 
 	logFile, err := openSecureAppend(reportFile, 0644)
 	if err != nil {
@@ -622,7 +703,11 @@ func parsePCIConfig(rawConfig []byte) PCIDeviceInfo {
 		ConfigData: rawConfig,
 	}
 	if len(rawConfig) < 64 {
-		return info // Return empty info as data is insufficient
+		// Data is insufficient to parse a PCI header (64 bytes minimum). Mark
+		// Truncated so callers print an explicit "read incomplete" notice
+		// instead of a fake 0000:0000 vendor:device pair.
+		info.Truncated = true
+		return info
 	}
 	// Parse header
 	info.VendorID = binary.LittleEndian.Uint16(rawConfig[0:2])
@@ -638,8 +723,15 @@ func parsePCIConfig(rawConfig []byte) PCIDeviceInfo {
 	return info
 }
 
-// formatDeviceInfo formats device information into human-readable string
+// formatDeviceInfo formats device information into human-readable string. A
+// Truncated info (config read returned fewer than 64 bytes) prints an
+// explicit notice instead of a fake "0000:0000" vendor:device pair, since
+// that all-zero ID would otherwise look like a real (if extremely unusual)
+// device rather than a failed read.
 func formatDeviceInfo(info PCIDeviceInfo) string {
+	if info.Truncated {
+		return fmt.Sprintf(" %s (config read incomplete: got %d of 64+ required bytes)", info.BusID, len(info.ConfigData))
+	}
 	var sb strings.Builder
 	// Format basic information
 	sb.WriteString(fmt.Sprintf(" %s (%04x:%04x", info.BusID, info.VendorID, info.DeviceID))
@@ -662,6 +754,18 @@ func formatDeviceInfo(info PCIDeviceInfo) string {
 // Returns true if non-timer changes were found, false otherwise.
 func compareAndLogDeviceChanges(logFile *os.File, initialInfo, currentInfo PCIDeviceInfo,
 	timerPatterns map[int]bool, unstableBytes map[int]bool) bool {
+	// A truncated read (< 64 bytes) cannot be meaningfully diffed byte-by-byte
+	// against a full header; report the read failure explicitly instead of
+	// silently comparing whatever partial bytes happen to overlap, which could
+	// either report spurious changes or (if both sides truncated identically)
+	// falsely report stability.
+	if initialInfo.Truncated || currentInfo.Truncated {
+		timestamp := getCurrentTimestamp()
+		fmt.Fprintf(logFile, "%s %sDevice: %s (config read incomplete, comparison skipped this cycle)\n",
+			timestamp, cycleTag(), formatDeviceInfo(currentInfo))
+		fmt.Fprintln(logFile, "---")
+		return false
+	}
 	var changes []string
 
 	for i := 0; i < len(initialInfo.ConfigData) && i < len(currentInfo.ConfigData); i++ {
@@ -726,7 +830,24 @@ func logDeviceChange(logFile *os.File, initialInfo, currentInfo *PCIDeviceInfo, 
 	fmt.Fprintln(logFile, "---")
 }
 
-// readIgnoreDevicesAndOffsets reads ignore devices and offsets list
+// readIgnoreDevicesAndOffsets reads ignore_list.txt for the raw config-space
+// comparison path (compareDeviceConfigs). Its semantics deliberately differ
+// from loadIgnoreList (used by the lspci comparison path, processPCIDevices):
+// a bare-BDF line (no offsets) here means "ignore this whole device"
+// (ignoreDevices), while a BDF line WITH offsets means "ignore only those
+// specific offsets, still compare the rest of the device" (ignoreOffsets).
+// loadIgnoreList instead treats ANY line for a BDF — with or without offsets
+// — as "ignore the whole device" for the lspci path, because lspci comparison
+// has no notion of a partial per-offset ignore.
+//
+// This asymmetry is intentional and currently safe only because
+// saveIgnoreBits() (the sole writer of ignore_list.txt) always writes a bare
+// BDF for whole-device ignores (USB controllers) and a BDF+offsets line only
+// for partial timer-offset ignores — so the two readers happen to agree on
+// every line saveIgnoreBits produces. If a user hand-edits ignore_list.txt to
+// add a BDF+offsets line intending "only ignore these offsets", the lspci
+// path (loadIgnoreList) will silently ignore the ENTIRE device instead,
+// which is a real footgun for manual edits.
 func readIgnoreDevicesAndOffsets(filePath string) (map[string]bool, map[string]map[int]bool, error) {
 	ignoreDevices := make(map[string]bool)
 	ignoreOffsets := make(map[string]map[int]bool)
@@ -785,7 +906,12 @@ func readIgnoreDevicesAndOffsets(filePath string) (map[string]bool, map[string]m
 // stable snapshot. Bytes that fail to reach the stability threshold are flagged
 // as timer noise in UnstableBytes so that compareAndLogDeviceChanges can skip
 // them, ensuring only genuine capability changes are logged.
-func collectStableConfig(sampleCount int, intervalMs int) (map[string]StableConfig, error) {
+// collectStableConfig returns the stable per-device snapshot together with
+// the deduplicated set of BDF/error strings that failed to read during any
+// of the samples, so the caller can log exactly which device could not be
+// verified this cycle instead of that information being visible only on
+// stdout via the underlying savePCIConfigReportingFailures calls.
+func collectStableConfig(sampleCount int, intervalMs int) (map[string]StableConfig, []string, error) {
 	if sampleCount < 2 {
 		sampleCount = 2
 	}
@@ -794,7 +920,7 @@ func collectStableConfig(sampleCount int, intervalMs int) (map[string]StableConf
 	// inside cannot be pre-seeded by a local attacker.
 	sampleDir, err := os.MkdirTemp("", "lpot-stable-*")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create sample directory: %v", err)
+		return nil, nil, fmt.Errorf("failed to create sample directory: %v", err)
 	}
 	defer os.RemoveAll(sampleDir)
 
@@ -804,9 +930,14 @@ func collectStableConfig(sampleCount int, intervalMs int) (map[string]StableConf
 	}
 
 	fmt.Printf("Collecting %d stability samples (%dms apart)...\n", sampleCount, intervalMs)
+	failedSet := make(map[string]bool)
 	for i, f := range tmpFiles {
-		if err := savePCIConfig(f); err != nil {
-			return nil, fmt.Errorf("failed to collect sample %d: %v", i+1, err)
+		failedBDFs, err := savePCIConfigReportingFailures(f)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to collect sample %d: %v", i+1, err)
+		}
+		for _, entry := range failedBDFs {
+			failedSet[entry] = true
 		}
 		if i < sampleCount-1 {
 			time.Sleep(time.Duration(intervalMs) * time.Millisecond)
@@ -817,12 +948,17 @@ func collectStableConfig(sampleCount int, intervalMs int) (map[string]StableConf
 	for i, f := range tmpFiles {
 		data, err := os.ReadFile(f)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read sample %d: %v", i+1, err)
+			return nil, nil, fmt.Errorf("failed to read sample %d: %v", i+1, err)
 		}
 		samples[i] = splitDevices(data)
 	}
 
-	return analyzeStableConfig(samples), nil
+	failedBDFs := make([]string, 0, len(failedSet))
+	for entry := range failedSet {
+		failedBDFs = append(failedBDFs, entry)
+	}
+	sort.Strings(failedBDFs)
+	return analyzeStableConfig(samples), failedBDFs, nil
 }
 
 // analyzeStableConfig is the pure (I/O-free) core of collectStableConfig.
@@ -907,7 +1043,13 @@ func analyzeStableConfig(samples []map[string][]byte) map[string]StableConfig {
 	return result
 }
 
-// loadIgnoreList reads the ignore list file and returns a set of BusIDs to ignore
+// loadIgnoreList reads ignore_list.txt for the lspci comparison path
+// (processPCIDevices -> compareDeviceFiles). Unlike readIgnoreDevicesAndOffsets
+// (the raw config-space path's reader, see its comment for the full
+// semantics difference), this treats ANY line for a BDF as "ignore the whole
+// device" regardless of whether it also lists specific offsets, because
+// lspci's Dev/Lnk field comparison has no notion of ignoring individual PCI
+// config-space byte offsets.
 func loadIgnoreList(filePath string) (map[string]bool, error) {
 	ignoreSet := make(map[string]bool)
 

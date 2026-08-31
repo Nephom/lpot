@@ -24,6 +24,12 @@ func runExternal(timeout time.Duration, name string, args ...string) ([]byte, er
 	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
+		// Log the timeout here, once, regardless of whether the caller checks
+		// the returned error. Several callers (e.g. enrichLspciLinkInfo) discard
+		// the error on a bare "if err != nil { return }" path with no logging of
+		// their own, which previously made repeated lspci timeouts during
+		// classification completely invisible.
+		logWarn("%s %v timed out after %s", name, args, timeout)
 		return out, fmt.Errorf("%s timed out after %s", name, timeout)
 	}
 	return out, err

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,13 @@ const (
 	LPOTSCAN_LOG        = "/lpot/lpotscan.log"
 	PCIE_FILTER_FILE    = "/lpot/pcie_filter.txt"
 	CONFIG_DUMP_DIR     = "/lpot/config_dump"
+	// CLEAN_STREAK_STATE_FILE persists the in-progress "consecutive clean
+	// cycles" counter across reboots. Each reboot cycle runs in a brand-new
+	// process (systemd re-execs /lpot/reboot.sh), so an in-memory-only counter
+	// would reset to 0/1 every cycle and could never actually reflect a
+	// multi-cycle clean streak, contradicting the log line's own "N cycles
+	// clean (Cycle X..Y)" wording.
+	CLEAN_STREAK_STATE_FILE = "/lpot/clean_streak_state.json"
 
 	// Per-command timeouts for external tools. Chosen conservatively so a stuck
 	// child process cannot hang the overall test loop.
@@ -46,9 +54,18 @@ const (
 	// lets users correlate events by plain text search and by tools like
 	// `sort -k1,2` without translation.
 	logTimeFormat = "2006-01-02 15:04:05"
-	version       = "2.6.16"
-	serviceName   = "lpot.service"
-	servicePath   = "/etc/systemd/system/" + serviceName
+
+	// rebootFixedThreshold is the occurrence-ratio cutoff (fraction of
+	// completed reboot cycles) above which a (device, offset) config-space
+	// change is classified as benign "reboot-fixed" noise rather than a
+	// noteworthy volatile change. It is shared between generateConfigSpaceSummary
+	// (summary.go, reboot.log's human-readable table) and buildResultReport
+	// (result_helpers.go, result.json's ConfigSpace/ConfigNoise checks) so the
+	// two artifacts always agree on which rows are "benign" vs "needs review".
+	rebootFixedThreshold = 0.80
+	version              = "2.6.16"
+	serviceName          = "lpot.service"
+	servicePath          = "/etc/systemd/system/" + serviceName
 )
 
 var buildTime = "development"
@@ -184,7 +201,7 @@ func main() {
 	}
 
 	if *scanOnly && !tRequested {
-		if err := scanAndGenerateIgnoreBits(); err != nil {
+		if err := scanAndGenerateIgnoreBits(nil); err != nil {
 			fatalOperation("Scan failed", err,
 				"verify that /sys/bus/pci/devices is readable and that the process is running as root")
 		}
@@ -376,8 +393,27 @@ func main() {
 			fmt.Errorf("%d device(s) could not be read", report.Unverified),
 			"fix PCI config-space access and rerun -classify")
 	}
+	// Measure actual raw config-space readability instead of asserting a
+	// hardcoded 100%: a device whose /sys/.../config read returns fewer than
+	// the 64-byte minimum PCI header is not truly "covered" even though it is
+	// present in bdfs. This is the same readability test savePCIConfig() and
+	// parsePCIConfig() apply, so this line and the later per-device warnings
+	// (see savePCIConfig) describe the same underlying measurement.
+	readableConfigCount := 0
+	var unreadableConfigBDFs []string
+	for _, bdf := range bdfs {
+		if len(readSysfsConfig(bdf, 256)) >= 64 {
+			readableConfigCount++
+		} else {
+			unreadableConfigBDFs = append(unreadableConfigBDFs, bdf)
+		}
+	}
 	fmt.Fprintf(logFp, "%s Link classification: %d / %d link-capable; raw config coverage: %d / %d devices (%d classification skips)\n",
-		getCurrentTimestamp(), len(bdfs)-len(skipped), len(bdfs), len(bdfs), len(bdfs), len(skipped))
+		getCurrentTimestamp(), len(bdfs)-len(skipped), len(bdfs), readableConfigCount, len(bdfs), len(skipped))
+	if len(unreadableConfigBDFs) > 0 {
+		fmt.Fprintf(logFp, "%s Warning: raw config space could not be fully read (< 64 bytes) for: %s. These devices cannot be compared for config-space changes this cycle.\n",
+			getCurrentTimestamp(), strings.Join(unreadableConfigBDFs, ", "))
+	}
 	logFp.Sync()
 
 	// Scan the complete raw-config set. A normal -t run always refreshes the
@@ -389,7 +425,7 @@ func main() {
 		logFp.Sync()
 		fmt.Printf("%s Auto-scanning PCI devices to generate ignore bits...\n", timestampStr)
 
-		if err := scanAndGenerateIgnoreBits(); err != nil {
+		if err := scanAndGenerateIgnoreBits(logFp); err != nil {
 			fatalOperation("Cycle failed: automatic volatile-byte scan failed", err,
 				"run -scan separately, verify PCI config-space access, then retry the -t run")
 		} else {
@@ -434,7 +470,7 @@ func main() {
 	logFp.Sync()
 
 	// Execute config scan logic
-	if err := runConfigScan(); err != nil {
+	if err := runConfigScan(logFp); err != nil {
 		fatalOperation("Cycle failed: PCI configuration scan failed", err,
 			"verify PCI sysfs access and regenerate /lpot/ignore_list.txt with -scan")
 	}
@@ -452,7 +488,7 @@ func main() {
 	}
 	if *stopService {
 		noteworthy, configNoise := cycleChangeKind()
-		if noteworthy || configNoise {
+		if cycleRequiresStop(noteworthy, configNoise) {
 			fmt.Fprintf(logFp, "%s %s-p detected a comparison difference; stopping and disabling future reboot cycles.\n",
 				getCurrentTimestamp(), cycleTag())
 			logFp.Sync()
@@ -476,14 +512,11 @@ func main() {
 	// Topology / lspci changes are noteworthy ("changes detected"); benign
 	// config-space register noise alone leaves the cycle effectively clean so
 	// `grep '===== Cycle.*END (changes detected)'` only surfaces real issues.
+	// cycleEndStatus is the same classifier cycleRequiresStop (above) consults,
+	// so a cycle can never be labelled "clean (config noise)" here while also
+	// having triggered -p above.
 	noteworthy, configNoise := cycleChangeKind()
-	cycleStatus := "clean"
-	switch {
-	case noteworthy:
-		cycleStatus = "changes detected"
-	case configNoise:
-		cycleStatus = "clean (config noise)"
-	}
+	cycleStatus := cycleEndStatus(noteworthy, configNoise)
 	logCycleEnd(logFp, rebootCount, cycleStatus)
 	if err := writeResultReport(true); err != nil {
 		fatalOperation("Cycle failed: cannot write the result checkpoint before reboot wait", err,
