@@ -136,8 +136,6 @@ func executeLspci(bdf, suffix string) error {
 		return fmt.Errorf("invalid BDF format: %s", bdf)
 	}
 
-	debugf("Executing lspci -s %s -vv > %s", bdf, filename)
-
 	// Validate BDF before passing to lspci. The value is sourced from sysfs
 	// directory listings so it should always match bdfRegex, but refusing a
 	// malformed value here removes an argv-injection vector outright.
@@ -146,7 +144,6 @@ func executeLspci(bdf, suffix string) error {
 	}
 	output, err := runExternal(lspciTimeout, lspciPath, "-s", bdf, "-vv")
 	if err != nil {
-		debugf("lspci command failed for BDF %s: %v", bdf, err)
 		return err
 	}
 
@@ -313,7 +310,6 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 			fmt.Fprintf(logFile, "%s %sHad devices changed\n", timeStr, cycleTag())
 			logFile.Sync()
 			recordCycleChange("lspci differences detected")
-			debugf("Device changes detected")
 			filterLpotscanErrors(LPOTSCAN_LOG, logFile)
 			logFile.Sync()
 		} else {
@@ -321,7 +317,6 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 			// consecutive clean cycles into a single line with a running
 			// counter so the log stays readable across 48 h runs.
 			noteCleanCycle(logFile, timeStr)
-			debugf("No device changes detected")
 		}
 	}
 

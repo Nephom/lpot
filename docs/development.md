@@ -3,9 +3,9 @@
 ## Repository Layout
 
 - `main.go`: constants, global state, and `main()`.
-- `bdf.go`, `cli.go`, `dryrun.go`, `lifecycle.go`, `logging.go`: startup,
-  CLI, audit-mode, and lifecycle/logging helpers. See `architecture.md` for
-  the full per-file breakdown.
+- `bdf.go`, `cli.go`, `lifecycle.go`, `logging.go`: startup, CLI, and
+  lifecycle/logging helpers. See `architecture.md` for the full per-file
+  breakdown.
 - `pcie_classify.go`, `pci_config_scan.go`, `lspci_compare.go`,
   `reboot_cycle.go`, `summary.go`: PCI discovery, classification, scanning,
   comparison, and per-cycle/final reporting.
@@ -46,8 +46,7 @@ clean, so unrelated whole-file formatting changes should not be needed.
 
 Validation must not modify PCI state, reboot an unrelated machine, change
 SELinux kernel state unexpectedly, or write outside the intended runtime
-directories. Use authenticated `-g <hash>` for manual read-only audit checks
-before enabling reboot mode.
+directories.
 
 Before a real reboot run, confirm the endpoint report with `-classify`, review
 `/lpot/pcie_filter.txt`, and verify that the target host is safe to reboot.

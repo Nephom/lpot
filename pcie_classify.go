@@ -353,7 +353,7 @@ func loadPCIeFilterOverrides(path string) (pcieFilterOverrides, error) {
 }
 
 // deviceClassification captures the per-BDF decision for both the runtime
-// filter and the -classify dry-run report. KeptReason is set only for kept
+// filter and the -classify report. KeptReason is set only for kept
 // devices to record which override (if any) saved them; SkipReason is set for
 // skipped devices.
 type deviceClassification struct {
@@ -541,8 +541,7 @@ func buildClassificationReport(decisions []deviceClassification) classificationR
 
 // printClassificationReport renders a deterministic, human-readable summary of
 // every BDF and the keep/skip decision. It is used both by the -classify
-// dry-run flag and by the post-test summary so users see exactly the same
-// view.
+// flag and by the post-test summary so users see exactly the same view.
 func printClassificationReport(w io.Writer, decisions []deviceClassification) {
 	fmt.Fprintf(w, "%-12s %-9s %-9s %-7s %-8s %-18s %-18s %-18s %-18s %s\n",
 		"BDF", "Vendor", "Device", "Class", "HdrType", "Raw LnkCap", "Raw LnkSta", "lspci LnkCap", "lspci LnkSta", "Decision / Reason")

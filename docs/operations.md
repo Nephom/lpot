@@ -5,9 +5,7 @@
 LPOT is a Linux system-level test tool. A normal run requires root, writes
 under `/lpot`, stops/disables firewall services, stops/disables AppArmor when
 present, changes SELinux settings when present, installs `lpot.service`,
-and invokes `reboot`. Run it only on a reserved laboratory host. Use `-g`
-while validating command-line behavior because it performs a read-only audit
-and never changes the host or invokes the reboot command.
+and invokes `reboot`. Run it only on a reserved laboratory host.
 
 An invocation without `-t` only prints help. Use `-t 24` to explicitly start a
 reboot test; bare `-t` uses the default duration of 12 hours. `-scan` and
@@ -53,24 +51,12 @@ stopped/disabled aborts before the reboot service is created:
 
 An absent service is normal for a given distribution and is not an error.
 
-`-g <hash>` is an authenticated read-only audit mode. Use `./lpot -k` to print
-the encrypted root password value accepted by `-g`. It does not create `/lpot`, write logs or
-snapshots, modify service/SELinux state, create temporary files, or reboot. It
-does inspect the host and prints planned commands plus complete contents for
-known text files such as the reboot script, systemd unit, and SELinux config.
-Read-only command output, including `lspci`, is printed between explicit output
-delimiters. The `-k` and `-g` invocations must use the same binary; a failed
-command substitution must not be replaced with an empty authentication value.
-
 ## Command-Line Modes
 
 ```bash
 sudo ./lpot -h
 sudo ./lpot -classify
 sudo ./lpot -scan
-sudo ./lpot -g "$(sudo ./lpot -k)" -t 2 -d 10 -s 10
-sudo ./lpot -g "$(sudo ./lpot -k)" -scan
-sudo ./lpot -g "$(sudo ./lpot -k)" -classify
 ./lpot -ui
 sudo ./lpot -t 24 -s 600
 sudo ./lpot -t 24 -c /usr/bin/ping -t 192.168.1.1
@@ -100,8 +86,6 @@ installing a new version.
 | `-tm count` | Exact number of reboots; `count + 1` cycles are recorded | disabled |
 | `-p` | Stop after a comparison error | disabled |
 | `-c command ...` | Run the command and all following arguments in the background on every boot; append stdout and stderr to `/lpot/command_user_custom.log` | disabled |
-| `-g hash` | Hidden authenticated read-only audit; show commands and file contents | disabled |
-| `-k` | Show encrypted root password value used to authorize `-g` | off |
 | `-r` | Stop and remove `lpot.service`, reload systemd, and reset `/lpot` state; root only | off |
 | `-scan` | Scan USB/bridge/volatile devices into `ignore_list.txt` and exit | off |
 | `-classify` | List external PCIe endpoints and write a report | off |

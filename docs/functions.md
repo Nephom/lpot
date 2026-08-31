@@ -12,9 +12,6 @@ by responsibility first so behavior can be verified before introducing
 
 - `main`: validates the host, parses flags, initializes state, executes one
   reboot cycle, and schedules the next cycle through systemd.
-- `runDryRunAudit`: authenticates a hidden `-g <hash>` request and performs
-  read-only host inspection, printing all planned commands, mutations, and
-  known file contents without writing anything.
 - `setupSignalHandlers`: turns SIGINT/SIGTERM into `stopFlag` and context
   cancellation.
 - `sleepInterruptible`: waits for a duration while responding to context
@@ -36,9 +33,8 @@ by responsibility first so behavior can be verified before introducing
 - `runExternal`: applies the root context and command-specific timeout.
 - `installPersistentBinary`: copies the invoked binary to `/lpot/lpot` so
   systemd does not depend on the original download directory.
-- `buildRebootScript`: renders the `reboot.sh` contents shared by
-  `createRebootScript` (the real write) and `runDryRunAudit` (the `-g`
-  preview), so the two can never drift out of sync.
+- `buildRebootScript`: renders the `reboot.sh` contents written by
+  `createRebootScript`.
 - `createRebootScript`: refreshes the persistent reboot script, rejects unsafe
   existing files, and quotes every argument independently.
 - `setupSystemdService`: refreshes the systemd unit and rejects unsafe existing
@@ -57,8 +53,6 @@ by responsibility first so behavior can be verified before introducing
 - `logWarnFp`: writes the same warning to stderr and, with a timestamp and
   cycle tag, to an open cycle log file. Used for warnings that happen during
   a reboot cycle and should also be visible in `reboot.log`.
-- `debugf`: prints a `DEBUG: ...` line only when `-g`'s debug mode is active;
-  replaces ad hoc `if debugMode { fmt.Printf("DEBUG: ...") }` blocks.
 - `warnIncompleteReport`: the single call site for "could not save the
   incomplete test report" on every early-exit path in `main()`.
 - `fatalOperation` (in `runtime.go`): prints an operation, the underlying

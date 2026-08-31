@@ -55,9 +55,7 @@ var buildTime = "development"
 
 // Global variables
 var (
-	debugMode bool
-	debugHash string
-	stopFlag  atomic.Bool // set when SIGINT/SIGTERM is received or rootCtx is cancelled
+	stopFlag atomic.Bool // set when SIGINT/SIGTERM is received or rootCtx is cancelled
 
 	// rootCtx is cancelled on SIGINT/SIGTERM and is used to bound every external
 	// command so the test loop cannot be left waiting on a stuck child process.
@@ -100,8 +98,6 @@ func main() {
 		waitSeconds = flag.Int("s", 300, "Setup delay time for reboot in seconds")
 		testCycles  = flag.Int("tm", 0, "Run a fixed number of reboots instead of hours")
 		stopService = flag.Bool("p", false, "Set stop flag when error occurred")
-		debug       = flag.String("g", "", "")
-		showKey     = flag.Bool("k", false, "Show encrypted root password value")
 		reset       = flag.Bool("r", false, "Reset /lpot directory")
 		scanOnly    = flag.Bool("scan", false, "Only scan and generate ignore bits file, then exit")
 		classify    = flag.Bool("classify", false, "Print PCI link-capability report and exit")
@@ -117,12 +113,10 @@ func main() {
 	customCommandArgs = customArgs
 	applyDefaultDurationForBareT()
 	flag.Parse()
-	debugHash = *debug
-	debugRequested := flagWasProvided("g")
 	tRequested := flagWasProvided("t")
 	tmRequested := flagWasProvided("tm")
 
-	if *help || (!tRequested && !tmRequested && !debugRequested && !*showKey && !*reset && !*scanOnly && !*classify && !*ui) {
+	if *help || (!tRequested && !tmRequested && !*reset && !*scanOnly && !*classify && !*ui) {
 		showHelp(os.Args[0])
 		return
 	}
@@ -145,34 +139,15 @@ func main() {
 	// Signal handlers must be installed before any long-running operation.
 	setupSignalHandlers()
 
-	if *showKey {
-		hash, err := rootPasswordHash()
-		if err != nil {
-			fatalOperation("Startup failed: cannot compute the root password hash", err,
-				"run this as root so /etc/shadow is readable")
-		}
-		fmt.Println(hash)
-		return
-	}
-
 	// Resolve external tool paths against a sanitised PATH to prevent a
 	// writable PATH entry from shadowing standard system binaries. Reset only
 	// needs systemd tools; normal runs additionally need PCI tools.
 	{
-		requireRebootTools := *reset || tRequested || tmRequested || (*classify && !debugRequested) || (debugRequested && !*scanOnly && !*classify)
+		requireRebootTools := *reset || tRequested || tmRequested || *classify
 		if err := resolveBinaries(!*reset, requireRebootTools); err != nil {
 			fatalOperation("Startup failed: unable to resolve required Linux tools", err,
 				"install pciutils and systemd tools, then run this binary on the target Linux host")
 		}
-	}
-
-	if debugRequested {
-		if err := authenticateDebug(debugHash); err != nil {
-			fatalOperation("Authentication failed", err, "check the -g hash value and retry")
-		}
-		debugMode = true
-		runDryRunAudit(os.Args, *waitHours, *standbyTime, *waitSeconds, *stopService, *scanOnly, *classify)
-		return
 	}
 
 	// Ensure /lpot is a real root-owned directory with tight permissions. All
@@ -251,9 +226,6 @@ func main() {
 	if !validateInputParameters(*waitHours, *waitSeconds, *standbyTime) {
 		os.Exit(1)
 	}
-
-	debugf("Parameters - wait_hours: %d, reboot_wait_seconds: %d, driver_ready_time: %d, stopService: %t",
-		*waitHours, *waitSeconds, *standbyTime, *stopService)
 
 	// The test host is dedicated lab hardware. Disable host firewall and
 	// mandatory access-control services before installing the reboot service so
@@ -354,18 +326,6 @@ func main() {
 			"verify that /sys/bus/pci/devices is mounted and readable on Linux")
 	}
 
-	if debugMode {
-		debugf("Found %d PCI devices (full raw-config set)", len(bdfs))
-		for i, bdf := range bdfs {
-			if i < 10 { // Only show first 10 devices
-				debugf("PCI device %d: %s", i+1, bdf)
-			}
-		}
-		if len(bdfs) > 10 {
-			debugf("... and %d more devices", len(bdfs)-10)
-		}
-	}
-
 	// Wait for driver ready
 	fmt.Fprintf(logFp, "%s Wait %d seconds for devices driver ready.\n", timestampStr, *standbyTime)
 	logFp.Sync()
@@ -446,8 +406,6 @@ func main() {
 
 	// Create initial PCI device files if not exist
 	if !fileExists(INITIAL_PCI_DEVICES) {
-		debugf("Executing initial lspci -vv > %s", INITIAL_PCI_DEVICES)
-
 		output, err := runExternal(lspciTimeout, lspciPath, "-vv")
 		if err != nil {
 			logWarn("initial lspci command failed: %v", err)
@@ -572,12 +530,8 @@ func main() {
 	// Remove lpotscan log
 	os.Remove(LPOTSCAN_LOG)
 
-	// Execute reboot (skip in debug mode)
-	if debugMode {
-		debugf("Reboot command disabled in debug mode")
-		fmt.Fprintf(logFp, "%s DEBUG: Reboot command disabled in debug mode\n", timestampStr)
-		logFp.Sync()
-	} else {
+	// Execute reboot.
+	{
 		// reboot(8) itself typically returns before the kernel actually brings
 		// the system down, so we only surface an error if the command fails or
 		// times out. We log to both stdout and reboot.log so a stuck system is

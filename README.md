@@ -29,8 +29,6 @@ enabled. Use it only on a disposable or explicitly reserved test system.
 - PCI configuration-space scanning with volatile-byte filtering.
 - Endpoint classification with an optional `/lpot/pcie_filter.txt` override.
 - Interruptible waits and bounded external-command execution.
-- Authenticated read-only audit mode (`-g <hash>`) that prints planned commands
-  and complete text file payloads without changing the host.
 - Local read-only result dashboard (`-ui`) backed by an aggregated JSON report.
 - Root-owned runtime directory (`0755`) for readable reports, with
   root-only reboot controls and symlink-resistant writes.
@@ -103,15 +101,6 @@ sudo ./lpot -classify
 
 # Scan USB/bridge/volatile devices and write /lpot/ignore_list.txt.
 sudo ./lpot -scan
-
-# Print the complete planned flow and file contents without creating /lpot,
-# changing services, writing logs, or rebooting the host.
-# Use the same binary for -k and -g.
-sudo ./lpot -g "$(sudo ./lpot -k)" -t 2 -d 10 -s 10
-
-# Audit only scan or classify without writing their results.
-sudo ./lpot -g "$(sudo ./lpot -k)" -scan
-sudo ./lpot -g "$(sudo ./lpot -k)" -classify
 
 # Open the completed result report in the local browser.
 ./lpot -ui
@@ -198,8 +187,6 @@ Options:
 | `-s seconds` | Delay before reboot | `300` |
 | `-p` | Stop when an error is detected | disabled |
 | `-c command ...` | Run the command and all following arguments in the background on every boot; append stdout and stderr to `/lpot/command_user_custom.log` | disabled |
-| `-g hash` | Hidden authenticated read-only audit; show commands and file contents | disabled |
-| `-k` | Show encrypted root password value used to authorize `-g` | off |
 | `-r` | Reset `/lpot` runtime state | off |
 | `-scan` | Generate volatile-byte ignore data and exit | off |
 | `-classify` | Print endpoint classification and exit | off |

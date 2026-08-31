@@ -11,15 +11,12 @@ Current file boundaries are:
 - `main.go`: constants, global state, and `main()` (flag parsing, mode
   dispatch, and the top-level startup/cycle/reboot-wait sequence).
 - `bdf.go`: BDF regular expressions and `normalizeBDF()`.
-- `cli.go`: `-c` argument splitting, `-h` help text, and root-password/`-g`
-  authentication.
-- `dryrun.go`: the `-g <hash>` read-only audit implementation; prints every
-  planned command and file write without touching the host.
+- `cli.go`: `-c` argument splitting and `-h` help text.
 - `lifecycle.go`: root/tool-path resolution, `/lpot` directory safety,
   persistent binary and reboot-script installation, systemd bookkeeping
   helpers, and reboot-count/timestamp/cycle-limit persistence.
-- `logging.go`: shared `logWarn`/`logWarnFp`/`debugf`/`warnIncompleteReport`
-  helpers so warning and debug output share one prefix and format.
+- `logging.go`: shared `logWarn`/`logWarnFp`/`warnIncompleteReport`
+  helpers so warning output shares one prefix and format.
 - `pcie_classify.go`: PCIe endpoint classification (KEEP/SKIP/UNVERIFIED),
   link-capability decoding, and the classification report/baseline.
 - `pci_config_scan.go`: raw PCI configuration-space sampling, volatile-byte
@@ -47,25 +44,21 @@ if everything were still in one file.
 ## Startup Flow
 
 1. Flags are parsed before root and Linux-tool checks. An invocation without
-   `-t` only prints help, except for explicit `-k`, `-r`, `-scan`, `-classify`,
-   or `-g` modes.
+   `-t` only prints help, except for explicit `-r`, `-scan`, `-classify`,
+   or `-ui` modes.
 2. `main()` requires root for operational modes and creates a cancellable root
    context.
 3. Signal handlers cancel external commands and interrupt waits.
 4. `resolveBinaries()` sanitizes `PATH` and resolves trusted system binaries.
 5. `secureLpotDir()` verifies that `/lpot` is a root-owned, non-symlink
    directory with mode `0755`; `/lpot/tmp` has the same owner and mode.
-6. `-g <hash>` authenticates against root's `/etc/shadow` hash and runs a
-   read-only audit. With `-scan` or `-classify`, only that mode is audited;
-   otherwise the complete normal-run plan is printed without creating `/lpot`
-   or changing the host.
-7. Non-audit `-scan` and `-classify` may write their reports under `/lpot`, but
+6. `-scan` and `-classify` write their reports under `/lpot`, but
    do not change firewall, AppArmor, or SELinux policy.
-8. Normal `-t` mode stops/disables common firewall services and AppArmor when
+7. Normal `-t` mode stops/disables common firewall services and AppArmor when
    present, sets SELinux permissive for the current boot and disabled for the
    next boot, then prepares the reboot script and systemd service.
-9. The cycle state is recorded under `/lpot`.
-10. After each completed cycle, result aggregation writes an atomic
+8. The cycle state is recorded under `/lpot`.
+9. After each completed cycle, result aggregation writes an atomic
     `/lpot/result.json` checkpoint before the reboot wait starts. On expiration,
     the same report is finalized with `PASS`, `FAIL`, or `INCOMPLETE`.
 

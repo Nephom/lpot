@@ -23,15 +23,6 @@ func logWarnFp(logFp *os.File, format string, args ...interface{}) {
 	}
 }
 
-// debugf prints a DEBUG-prefixed line only when debugMode is enabled. All ad
-// hoc `if debugMode { fmt.Printf("DEBUG: ...") }` call sites should use this
-// instead so the prefix can never be forgotten or misspelled.
-func debugf(format string, args ...interface{}) {
-	if debugMode {
-		fmt.Printf("DEBUG: "+format+"\n", args...)
-	}
-}
-
 // warnIncompleteReport reports that an incomplete test result report could
 // not be saved. It is called from several places along main()'s early-exit
 // paths, all of which previously duplicated this exact message.

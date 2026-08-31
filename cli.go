@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/subtle"
 	"fmt"
 	"os"
 	"strings"
@@ -31,37 +30,6 @@ func splitCustomCommandArgs(args []string) ([]string, []string, error) {
 		return append([]string{args[0]}, args[1:index]...), custom, nil
 	}
 	return args, nil, nil
-}
-
-func rootPasswordHash() (string, error) {
-	data, err := os.ReadFile("/etc/shadow")
-	if err != nil {
-		return "", fmt.Errorf("failed to read /etc/shadow: %v", err)
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.SplitN(line, ":", 3)
-		if len(fields) >= 2 && fields[0] == "root" {
-			if fields[1] == "" || fields[1] == "!*" {
-				return "", fmt.Errorf("root account has no usable password hash")
-			}
-			return fields[1], nil
-		}
-	}
-	return "", fmt.Errorf("root entry not found in /etc/shadow")
-}
-
-func authenticateDebug(hash string) error {
-	if hash == "" {
-		return fmt.Errorf("-g requires the encrypted root password value")
-	}
-	actual, err := rootPasswordHash()
-	if err != nil {
-		return err
-	}
-	if subtle.ConstantTimeCompare([]byte(hash), []byte(actual)) != 1 {
-		return fmt.Errorf("debug authentication failed")
-	}
-	return nil
 }
 
 func flagWasProvided(name string) bool {
@@ -100,8 +68,6 @@ func showHelp(programName string) {
 	fmt.Printf("  -s <secs>    Setup delay time for reboot, default is 300 seconds.\n")
 	fmt.Printf("  -p           Stop and disable future reboots on topology, raw config, or lspci differences.\n")
 	fmt.Printf("  -c <command> Run the command and all following arguments in the background on every boot; output goes to %s. LPOT options must come before -c.\n", COMMAND_USER_LOG)
-	fmt.Printf("  -g <hash>    Preview mode (needs a password); only looks, never changes anything.\n")
-	fmt.Printf("  -k           Show encrypted root password value.\n")
 	fmt.Printf("  -r           Reset /lpot directory and clean all files.\n")
 	fmt.Printf("  -scan        Scan USB/bridge/volatile devices and write /lpot/ignore_list.txt, then exit.\n")
 	fmt.Printf("  -classify    Print and save the PCI link-capability report, then exit.\n")

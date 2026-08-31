@@ -457,9 +457,8 @@ func disableFixedCycleService() {
 // Create reboot script
 // buildRebootScript renders the reboot.sh contents that re-invoke executablePath
 // with args after reboot, optionally launching customCommand in the
-// background first. Used by both createRebootScript (the real script written
-// to disk) and runDryRunAudit (the audit preview), so the two can never drift
-// out of sync.
+// background first. It is the single source of truth used by
+// createRebootScript when writing reboot.sh to disk.
 func buildRebootScript(executablePath string, args, customCommand []string) string {
 	var script strings.Builder
 	script.WriteString("#!/bin/bash\n")

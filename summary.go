@@ -126,8 +126,9 @@ func generateFinalSummary() {
 
 	// Generate PCI Config Space summary. Pass the parsed cycle total so per-row
 	// occurrence ratios are correct even on the timestamp-expired exit path,
-	// where the global totalRebootCycles was never set. noteworthyChanges
-	// reports whether any genuinely volatile (irregular) register was seen.
+	// where actualTotalCycles is derived from parseRebootLogForStats rather
+	// than a live counter. noteworthyChanges reports whether any genuinely
+	// volatile (irregular) register was seen.
 	noteworthyConfigChanges := generateConfigSpaceSummary(logFile, actualTotalCycles)
 
 	// Final result. A test is "perfect" only when there were no topology /
@@ -157,23 +158,14 @@ func generateFinalSummary() {
 			"check /lpot permissions and available disk space before reviewing the report")
 	}
 
-	// Clean up PCI config binary files after test completion
+	// Clean up PCI config binary file after test completion
 	initialFile := "/lpot/initial.bin"
-	currentFile := "/lpot/current.bin"
 
 	if fileExists(initialFile) {
 		if err := os.Remove(initialFile); err != nil {
 			logWarn("could not delete %s: %v", initialFile, err)
 		} else {
 			fmt.Printf("Cleaned up: %s\n", initialFile)
-		}
-	}
-
-	if fileExists(currentFile) {
-		if err := os.Remove(currentFile); err != nil {
-			logWarn("could not delete %s: %v", currentFile, err)
-		} else {
-			fmt.Printf("Cleaned up: %s\n", currentFile)
 		}
 	}
 }
@@ -270,9 +262,9 @@ func parseRebootLogForStats() (time.Time, int, int, int, int) {
 //
 // totalCycles is the authoritative reboot-cycle count parsed from reboot.log;
 // it is used as the denominator for per-(device,offset) occurrence ratios. It
-// is passed in rather than read from the global totalRebootCycles because the
-// timestamp-expired exit path generates the summary before that global is set,
-// which previously left every ratio at 0% (the "82 (0%)" bug).
+// it is passed in rather than tracked as a live global counter because the
+// timestamp-expired exit path generates the summary before a live counter
+// would be set, which previously left every ratio at 0% (the "82 (0%)" bug).
 //
 // It returns true when at least one genuinely volatile (irregular, < the
 // reboot-fixed threshold) register change was observed, so the caller can pick
