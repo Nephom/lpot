@@ -238,8 +238,16 @@ The program stores persistent state under `/lpot`:
 - `ignore_list.txt`: explicit whole-device ignores for USB controllers plus
   volatile offsets. PCIe capability decode failures do not remove a device
   from raw config comparison.
-- `lpotscan.log`: lspci comparison log.
-- `pci-config-changes.log`: configuration-space comparison results.
+- `lpotscan.log`: lspci comparison log, one compact `<BDF> | <field> changed |
+  before: ... | after: ...` line per changed Dev/Lnk capability field.
+- `pci-config-changes.log`: configuration-space comparison results, diffed
+  against the one-time `/lpot/initial.bin` baseline on every cycle.
+- `config_dump/<bdf>_baseline.txt`: the first-cycle raw PCI configuration
+  bytes for each KEEP device, captured once and never overwritten.
+- `config_dump/<bdf>_latest.txt`: the current cycle's raw PCI configuration
+  bytes for each KEEP device, refreshed every cycle. The dashboard (`-ui`)
+  exposes both so a user can compare the initial and current snapshot for the
+  same device.
 - `pci_devices_classify.log`: historical `-classify` reports.
 - `pcie_filter.txt`: optional endpoint overrides.
 - `tmp/`: temporary per-device `lspci` snapshots.
@@ -265,10 +273,15 @@ dashboard on the test machine with:
 
 The dashboard binds only to `127.0.0.1`, opens Firefox when available, and
 shows the overall status, check categories,
-cycle timeline, filtered problems, and links to detailed text logs. A
-checkpoint is written after each completed cycle before the reboot wait starts;
-the final report is written when the test expires. The dashboard does not
-modify `/lpot`, systemd, security policy, or reboot state.
+cycle timeline, filtered problems, and links to detailed text logs. The PCIe
+Link Evidence table has a filter toolbar (KEEP devices only / all devices /
+changed devices only, defaulting to KEEP only so a large system doesn't render
+a wall of SKIP rows) and, per KEEP device, separate "Baseline" and "Latest"
+links to that device's raw config-space dump so the initial and current state
+can be compared directly. A checkpoint is written after each completed cycle
+before the reboot wait starts; the final report is written when the test
+expires. The dashboard does not modify `/lpot`, systemd, security policy, or
+reboot state.
 
 ## Review Notes and Known Limitations
 

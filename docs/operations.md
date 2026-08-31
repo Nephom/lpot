@@ -138,11 +138,17 @@ All persistent state is stored under `/lpot`:
 - `ignore_list.txt`: explicit whole-device ignores for USB controllers plus
   volatile configuration offsets. PCIe capability classification is evidence
   only; decode failures do not remove a device from raw config comparison.
-- `config_dump/<bdf>.txt`: current raw PCI configuration bytes for KEEP devices,
-  exposed by the dashboard for manual verification of LnkCap and LnkSta decoding.
-- `pci-config-changes.log`: configuration-space comparison results.
+- `config_dump/<bdf>_baseline.txt`: the first-cycle raw PCI configuration
+  bytes for each KEEP device, captured once and never overwritten.
+- `config_dump/<bdf>_latest.txt`: the current cycle's raw PCI configuration
+  bytes for each KEEP device, refreshed every cycle. The dashboard exposes
+  both via `/api/config?bdf=..&which=baseline|latest` for manual verification
+  and comparison of LnkCap/LnkSta decoding over time.
+- `pci-config-changes.log`: configuration-space comparison results, diffed
+  against the one-time `/lpot/initial.bin` baseline on every cycle.
 - `pci_devices_classify.log`: classification report history.
-- `lpotscan.log`: lspci comparison log.
+- `lpotscan.log`: lspci comparison log, one compact `<BDF> | <field> changed |
+  before: ... | after: ...` line per changed Dev/Lnk capability field.
 - `pcie_filter.txt`: optional endpoint overrides.
 - `tmp/`: temporary per-device `lspci` snapshots.
 - `result.json`: structured cycle checkpoint and final test report.

@@ -88,7 +88,14 @@ by responsibility first so behavior can be verified before introducing
   `DevCap2`, `DevCtl2`, `LnkCap2`, `LnkCtl2`, `LnkSta2`).
 - `compareDeviceFiles` / `compareDevices`: apply the ignore list and diff the
   selected `lspci` text fields between an `_init.txt` baseline and the current
-  snapshot.
+  snapshot; each difference is written as one compact `<BDF> | <field>
+  changed | before: ... | after: ...` line (see `isCompactLpotscanChange` /
+  `lspciChangeParts` for the shared parser both `filterLpotscanErrors` and
+  `buildResultReport` rely on).
+- `persistClassificationConfigDumps`: writes each KEEP device's raw
+  config-space bytes to `config_dump/<bdf>_latest.txt` every cycle, and to
+  `config_dump/<bdf>_baseline.txt` exactly once (first cycle that device is
+  KEEP and readable); the latter is never overwritten again.
 - `vendorDeviceFromLspciDump`: best-effort extracts the `[vendor:device]` hex
   ID from a saved `_init.txt` dump so `processPCIDevices` can recognise a
   device that disappeared at one BDF and reappeared at another (see
@@ -102,7 +109,12 @@ by responsibility first so behavior can be verified before introducing
 - `generateFinalSummary`: writes aggregate results and affected-cycle details.
 - `parseRebootLogForStats`: derives summary counters from the persisted log.
 - `buildResultReport`: aggregates the current test session into structured
-  status, checks, cycles, problems, and artifact paths.
+  status, checks, cycles, problems, and artifact paths; cross-references
+  `parseConfigResultChanges` output onto each classification device
+  (`config_changed`/`config_change_count`) and, via `parseLspciResultChanges`,
+  turns every lspci Dev/Lnk field change into a per-BDF problem with
+  before/after values, matching the fidelity config-space changes already
+  had.
 - `writeResultReport`: writes a checkpoint or final `/lpot/result.json` using
   fsync and atomic rename.
 - `startDashboard`: serves the read-only local result dashboard and fixed log

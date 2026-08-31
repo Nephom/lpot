@@ -118,6 +118,38 @@ func parseConfigResultChanges() []configResultChange {
 	return changes
 }
 
+// parseLspciResultChanges reads lpotscan.log and extracts one
+// lspciResultChange per compact "<bdf> | <field> changed | before: ... |
+// after: ..." line compareDevices() writes, mirroring
+// parseConfigResultChanges so lspci Dev/Lnk changes get the same BDF/before/
+// after fidelity in result.json.
+func parseLspciResultChanges() []lspciResultChange {
+	data, err := os.ReadFile(LPOTSCAN_LOG)
+	if err != nil {
+		return nil
+	}
+	var changes []lspciResultChange
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		bdf, field, before, after, ok := lspciChangeParts(line)
+		if !ok {
+			continue
+		}
+		changes = append(changes, lspciResultChange{
+			cycle:     lineCycleNumber(line),
+			timestamp: lineTimestamp(line),
+			device:    bdf,
+			field:     field,
+			before:    before,
+			after:     after,
+		})
+	}
+	return changes
+}
+
 // writeAffectedCyclesSection emits a deduplicated per-cycle breakdown of every
 // recorded change, sorted by cycle number. If no changes were recorded the
 // section is reduced to a single line noting perfect stability, so summaries
@@ -254,8 +286,10 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 		if strings.Contains(line, "Had devices changed") {
 			cycle.LSPCI = "FAIL"
 			cycle.Status = "FAIL"
-			problem := resultProblem{Severity: "FAIL", Category: "LSPCI", Cycle: current, Timestamp: lineTimestamp(line), Message: "lspci capability changes detected", DetailsLog: LPOTSCAN_LOG}
-			cycle.Events = append(cycle.Events, problem)
+			// Per-field detail (BDF, before/after) is attached below from
+			// parseLspciResultChanges() once lpotscan.log has been parsed, so
+			// this cycle gets one specific problem per changed field instead
+			// of a single generic line.
 		}
 	}
 	for _, cycle := range cycles {
@@ -325,16 +359,41 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 	noteworthyConfig = len(noteworthyPatterns)
 	benignConfig = len(benignPatterns)
 
+	// lspci Dev/Lnk field changes get the same per-BDF, before/after fidelity
+	// as config-space changes, parsed straight from lpotscan.log rather than
+	// the single generic "Had devices changed" line in reboot.log. Every
+	// field change is inherently noteworthy (recordCycleChange, not
+	// recordCycleNoise, is what triggers "Had devices changed" in the first
+	// place), so severity is always FAIL.
+	lspciFieldChanges := parseLspciResultChanges()
+	lspciProblems := make([]resultProblem, 0, len(lspciFieldChanges))
+	configChangeCounts := make(map[string]int, len(configChanges))
+	for _, change := range configChanges {
+		configChangeCounts[normalizeBDF(change.device)]++
+	}
+	for _, change := range lspciFieldChanges {
+		problem := resultProblem{
+			Severity: "FAIL", Category: "LSPCI", Cycle: change.cycle,
+			Timestamp: change.timestamp, BDF: change.device,
+			Message:    fmt.Sprintf("%s changed (before: %s, after: %s)", change.field, change.before, change.after),
+			DetailsLog: LPOTSCAN_LOG,
+		}
+		lspciProblems = append(lspciProblems, problem)
+		if cycle := cycles[change.cycle]; cycle != nil {
+			cycle.Events = append(cycle.Events, problem)
+		}
+	}
+
 	sort.Ints(cycleOrder)
 	orderedCycles := make([]resultCycle, 0, len(cycleOrder))
-	problems := make([]resultProblem, 0, len(configProblems))
+	problems := make([]resultProblem, 0, len(configProblems)+len(lspciProblems))
 	for _, number := range cycleOrder {
 		cycle := *cycles[number]
 		orderedCycles = append(orderedCycles, cycle)
 		problems = append(problems, cycle.Events...)
 	}
 	if len(problems) == 0 {
-		problems = configProblems
+		problems = append(append(problems, configProblems...), lspciProblems...)
 	}
 	status := "RUNNING"
 	message := "Test continues after reboot"
@@ -371,12 +430,22 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 	if startedAt.IsZero() {
 		runID = time.Now().Format(time.RFC3339)
 	}
+	// Annotate the classification list with whether raw config-space ever
+	// changed for that device, so the dashboard can offer a "changed only"
+	// filter without a second API round-trip.
+	classification := classificationReportFromBaseline()
+	for i := range classification.Devices {
+		if count := configChangeCounts[normalizeBDF(classification.Devices[i].BDF)]; count > 0 {
+			classification.Devices[i].ConfigChanged = true
+			classification.Devices[i].ConfigChangeCount = count
+		}
+	}
 	result := resultReport{
 		SchemaVersion: 1, Version: version, RunID: runID, Status: status,
 		Checkpoint: checkpoint, Message: message, UpdatedAt: time.Now().Format(time.RFC3339),
 		TotalCycles: totalCycles, CompletedCycles: completed,
 		SuccessfulCycles: completed - failed, FailedCycles: failed,
-		Classification: classificationReportFromBaseline(),
+		Classification: classification,
 		Checks: resultChecks{
 			Topology:    resultCheck{Status: resultStatus(topologyChanges), ChangedCycles: topologyChanges, Message: stabilityMessage("topology", topologyChanges)},
 			LSPCI:       resultCheck{Status: resultStatus(lspciChanges), ChangedCycles: lspciChanges, Message: stabilityMessage("Dev/Lnk", lspciChanges)},

@@ -31,19 +31,21 @@ type classificationReport struct {
 }
 
 type classificationDevice struct {
-	BDF          string `json:"bdf"`
-	Vendor       string `json:"vendor,omitempty"`
-	Device       string `json:"device,omitempty"`
-	Class        string `json:"class,omitempty"`
-	Header       string `json:"header,omitempty"`
-	PCIeCap      string `json:"pcie_capability"`
-	LinkCap      string `json:"link_capability"`
-	LinkStatus   string `json:"link_status"`
-	LspciLinkCap string `json:"lspci_link_capability,omitempty"`
-	LspciStatus  string `json:"lspci_link_status,omitempty"`
-	Decision     string `json:"decision"`
-	Reason       string `json:"reason,omitempty"`
-	Verification string `json:"verification"`
+	BDF               string `json:"bdf"`
+	Vendor            string `json:"vendor,omitempty"`
+	Device            string `json:"device,omitempty"`
+	Class             string `json:"class,omitempty"`
+	Header            string `json:"header,omitempty"`
+	PCIeCap           string `json:"pcie_capability"`
+	LinkCap           string `json:"link_capability"`
+	LinkStatus        string `json:"link_status"`
+	LspciLinkCap      string `json:"lspci_link_capability,omitempty"`
+	LspciStatus       string `json:"lspci_link_status,omitempty"`
+	Decision          string `json:"decision"`
+	Reason            string `json:"reason,omitempty"`
+	Verification      string `json:"verification"`
+	ConfigChanged     bool   `json:"config_changed"`
+	ConfigChangeCount int    `json:"config_change_count,omitempty"`
 }
 
 type resultChecks struct {
@@ -87,6 +89,19 @@ type configResultChange struct {
 	timestamp string
 	device    string
 	offset    string
+	before    string
+	after     string
+}
+
+// lspciResultChange is one Dev/Lnk capability field change parsed from
+// lpotscan.log, mirroring configResultChange so buildResultReport() can give
+// lspci changes the same BDF/before/after fidelity in result.json that
+// config-space changes already have.
+type lspciResultChange struct {
+	cycle     int
+	timestamp string
+	device    string
+	field     string
 	before    string
 	after     string
 }

@@ -206,8 +206,8 @@ func compareDevices(device1, device2 Device, logFile *os.File) ComparisonResult 
 		}
 
 		result.HasDifferences = true
-		logEntry := fmt.Sprintf("%s %s| %s | %s changed\n",
-			getCurrentTimestamp(), cycleTag(), device1.DeviceID, key)
+		logEntry := fmt.Sprintf("%s %s%s | %s changed | before: %s | after: %s\n",
+			getCurrentTimestamp(), cycleTag(), device1.DeviceID, key, value1, value2)
 
 		// Track statistics
 		deviceChangeStats[device1.DeviceID]++
@@ -250,11 +250,48 @@ func filterLpotscanErrors(errorLogPath string, logFp *os.File) {
 	}
 }
 
+// isCompactLpotscanChange reports whether line is a compact per-field change
+// record written by compareDevices(): "<...bdf> | <field> changed | before:
+// ... | after: ...". The field name lives in the second " | "-separated
+// segment now that before/after values occupy the trailing two segments, so
+// this no longer assumes the field name is the last segment.
 func isCompactLpotscanChange(line string) bool {
+	field := lspciChangeField(line)
+	return field != "" && isComparedLspciField(field)
+}
+
+// lspciChangeField extracts the field name from a compact per-field change
+// record produced by compareDevices(), or "" if line doesn't match that
+// shape. Shared by isCompactLpotscanChange and the result-report parser so
+// both agree on what a "compact change" line looks like.
+func lspciChangeField(line string) string {
 	parts := strings.Split(line, " | ")
-	if len(parts) < 3 {
-		return false
+	if len(parts) != 4 {
+		return ""
 	}
-	field := strings.TrimSpace(strings.TrimSuffix(parts[len(parts)-1], " changed"))
-	return isComparedLspciField(field)
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(parts[1]), "changed"))
+}
+
+// lspciChangeParts extracts (bdf, field, before, after) from a compact
+// per-field change record produced by compareDevices(). ok is false when line
+// doesn't match that 4-segment shape or the field isn't a compared Dev/Lnk
+// field. Used by buildResultReport() to feed per-field LSPCI changes into
+// result.json with the same fidelity CONFIG_SPACE changes already have.
+func lspciChangeParts(line string) (bdf, field, before, after string, ok bool) {
+	parts := strings.Split(line, " | ")
+	if len(parts) != 4 {
+		return "", "", "", "", false
+	}
+	field = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(parts[1]), "changed"))
+	if !isComparedLspciField(field) {
+		return "", "", "", "", false
+	}
+	// parts[0] is "<ts> [Cycle N] <bdf>" (or "<ts> <bdf>" without a cycle tag);
+	// the BDF is always the last whitespace-separated token.
+	if fields := strings.Fields(parts[0]); len(fields) > 0 {
+		bdf = fields[len(fields)-1]
+	}
+	before = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[2]), "before:"))
+	after = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(parts[3]), "after:"))
+	return bdf, field, before, after, true
 }

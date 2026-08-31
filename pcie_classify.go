@@ -586,12 +586,34 @@ func persistClassificationReport(decisions []deviceClassification) error {
 	return fp.Close()
 }
 
-func configDumpPath(bdf string) (string, error) {
+// configDumpKindSuffix maps a dump kind to its filename suffix.
+// "baseline" is the one-time initial snapshot (see persistClassificationConfigDumps);
+// "latest" is refreshed every cycle.
+func configDumpKindSuffix(kind string) (string, error) {
+	switch kind {
+	case "baseline":
+		return "_baseline.txt", nil
+	case "latest", "":
+		return "_latest.txt", nil
+	default:
+		return "", fmt.Errorf("invalid config dump kind %q", kind)
+	}
+}
+
+// configDumpPath returns the on-disk path for a device's raw config-space
+// dump. kind selects "baseline" (captured once, never overwritten) or
+// "latest" (refreshed every cycle); an empty kind means "latest" for
+// backward compatibility with callers that don't care about the baseline.
+func configDumpPath(bdf, kind string) (string, error) {
 	normalized := normalizeBDF(bdf)
 	if !shortBDFRegex.MatchString(normalized) && !bdfRegex.MatchString(normalized) {
 		return "", fmt.Errorf("invalid PCI BDF %q", bdf)
 	}
-	return filepath.Join(CONFIG_DUMP_DIR, normalized+".txt"), nil
+	suffix, err := configDumpKindSuffix(kind)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(CONFIG_DUMP_DIR, normalized+suffix), nil
 }
 
 func formatConfigDump(cfg []byte) string {
@@ -610,6 +632,14 @@ func formatConfigDump(cfg []byte) string {
 	return out.String()
 }
 
+// persistClassificationConfigDumps writes /lpot/config_dump/<bdf>_latest.txt
+// for every KEEP device on every cycle (overwritten each time, same as
+// before), and additionally captures /lpot/config_dump/<bdf>_baseline.txt
+// exactly once per device -- the first cycle that device is KEEP and
+// readable -- and never overwrites it again. This gives the dashboard a
+// stable "initial config space" page to compare the latest snapshot and the
+// pci-config-changes.log diffs against, which a constantly-overwritten
+// single file could never provide.
 func persistClassificationConfigDumps(decisions []deviceClassification) error {
 	if err := os.MkdirAll(CONFIG_DUMP_DIR, 0755); err != nil {
 		return fmt.Errorf("create %s: %w", CONFIG_DUMP_DIR, err)
@@ -619,7 +649,9 @@ func persistClassificationConfigDumps(decisions []deviceClassification) error {
 		return fmt.Errorf("read %s: %w", CONFIG_DUMP_DIR, err)
 	}
 	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".txt") {
+		// Only clear the "latest" snapshots; "_baseline.txt" files must
+		// survive for the lifetime of the test.
+		if strings.HasSuffix(entry.Name(), "_latest.txt") {
 			if err := os.Remove(filepath.Join(CONFIG_DUMP_DIR, entry.Name())); err != nil {
 				return fmt.Errorf("clear config dump %s: %w", entry.Name(), err)
 			}
@@ -629,16 +661,28 @@ func persistClassificationConfigDumps(decisions []deviceClassification) error {
 		if !decision.Kept || !decision.InfoOK {
 			continue
 		}
-		path, err := configDumpPath(decision.BDF)
-		if err != nil {
-			return err
-		}
 		cfg := readSysfsConfig(decision.BDF, 256)
 		if len(cfg) == 0 {
 			continue
 		}
-		if err := writeFileNoFollow(path, []byte(formatConfigDump(cfg)), 0644); err != nil {
-			return fmt.Errorf("write config dump for %s: %w", decision.BDF, err)
+		dump := []byte(formatConfigDump(cfg))
+
+		latestPath, err := configDumpPath(decision.BDF, "latest")
+		if err != nil {
+			return err
+		}
+		if err := writeFileNoFollow(latestPath, dump, 0644); err != nil {
+			return fmt.Errorf("write latest config dump for %s: %w", decision.BDF, err)
+		}
+
+		baselinePath, err := configDumpPath(decision.BDF, "baseline")
+		if err != nil {
+			return err
+		}
+		if !fileExists(baselinePath) {
+			if err := writeFileNoFollow(baselinePath, dump, 0644); err != nil {
+				return fmt.Errorf("write baseline config dump for %s: %w", decision.BDF, err)
+			}
 		}
 	}
 	return nil
