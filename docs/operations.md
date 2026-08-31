@@ -19,6 +19,10 @@ non-root user because it only reads `/lpot/result.json` and the allowlisted
 reports. It does not run PCI scans, modify host policy, install services, or
 reboot.
 
+`-tm n` performs exactly `n` reboots. The initial invocation and the boot after
+the final reboot are also recorded as cycles, so `-tm 2` produces three cycle
+records and two reboots.
+
 ## Requirements
 
 - Linux with effective UID 0.
@@ -32,7 +36,9 @@ reboot.
 ## Build and Validation
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o lpot .
+BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+GOOS=linux GOARCH=amd64 go build -trimpath \
+  -ldflags="-s -w -X main.buildTime=${BUILD_TIME}" -o lpot .
 ```
 
 The runtime preparation is distribution-aware across RHEL, SLES, and Ubuntu.
@@ -67,6 +73,7 @@ sudo ./lpot -g "$(sudo ./lpot -k)" -scan
 sudo ./lpot -g "$(sudo ./lpot -k)" -classify
 ./lpot -ui
 sudo ./lpot -t 24 -s 600
+sudo ./lpot -t 24 -c /usr/bin/ping -t 192.168.1.1
 sudo ./lpot -p
 sudo ./lpot -r
 ```
@@ -90,10 +97,12 @@ installing a new version.
 | `-t hours` | Test duration | `12` |
 | `-d seconds` | Driver/device preparation delay | `300` |
 | `-s seconds` | Delay before reboot | `300` |
+| `-tm count` | Exact number of reboots; `count + 1` cycles are recorded | disabled |
 | `-p` | Stop after a comparison error | disabled |
+| `-c command ...` | Run the command and all following arguments in the background on every boot; append stdout and stderr to `/lpot/command_user_custom.log` | disabled |
 | `-g hash` | Hidden authenticated read-only audit; show commands and file contents | disabled |
 | `-k` | Show encrypted root password value used to authorize `-g` | off |
-| `-r` | Reset `/lpot` state | off |
+| `-r` | Stop and remove `lpot.service`, reload systemd, and reset `/lpot` state; root only | off |
 | `-scan` | Scan USB/bridge/volatile devices into `ignore_list.txt` and exit | off |
 | `-classify` | List external PCIe endpoints and write a report | off |
 | `-ui` | Open the local read-only result dashboard | off |
@@ -126,13 +135,21 @@ All persistent state is stored under `/lpot`:
 - `rebootcount`: reboot-cycle counter.
 - `timestamp`: test expiration timestamp.
 - `initial_pci_devices.txt`: initial `lspci` snapshot.
-- `ignore_list.txt`: whole-device ignores plus volatile configuration offsets.
+- `ignore_list.txt`: explicit whole-device ignores for USB controllers plus
+  volatile configuration offsets. PCIe capability classification is evidence
+  only; decode failures do not remove a device from raw config comparison.
+- `config_dump/<bdf>.txt`: current raw PCI configuration bytes for KEEP devices,
+  exposed by the dashboard for manual verification of LnkCap and LnkSta decoding.
 - `pci-config-changes.log`: configuration-space comparison results.
 - `pci_devices_classify.log`: classification report history.
 - `lpotscan.log`: lspci comparison log.
 - `pcie_filter.txt`: optional endpoint overrides.
 - `tmp/`: temporary per-device `lspci` snapshots.
 - `result.json`: structured cycle checkpoint and final test report.
+- `pci_devices_classify_state.json`: persistent classification snapshot used to
+  report only PCIe classification changes after the first cycle.
+- `command_user_custom.log`: stdout and stderr from the optional background
+  command configured with `-c`.
 
 The repository's `logs/` directory is ignored because reports can contain
 host-specific hardware information.

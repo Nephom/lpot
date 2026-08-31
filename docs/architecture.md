@@ -47,19 +47,17 @@ Each cycle fetches PCI BDFs, applies endpoint classification and filter
 overrides, waits for drivers, samples volatile bytes when needed, and compares:
 
 - PCI device topology.
-- Per-device `lspci -vv` output.
+- The ten selected PCIe `Dev/Lnk` capability fields from per-device `lspci -vv`
+  output.
 - PCI configuration-space snapshots with ignored volatile offsets.
 
 The cycle writes a completion banner before the interruptible reboot delay. A
 cancelled context or stop signal is checked again immediately before invoking
 `reboot`, preventing a requested stop from causing an unexpected reboot.
-During the `-s` reboot wait, `monitorRebootWait()` polls PCI topology and
-`lspci -vv` output. It uses retained `/lpot/tmp/<BDF>_init.txt` files as the
-immutable baseline and keeps later observations in memory. Changes are logged;
-`-p` cancels reboot while the default behavior continues the countdown.
-Events are emitted on state transitions, so a device that disappears and later
-returns is reported as two distinct transitions rather than being suppressed
-by a permanent per-device de-duplication key.
+During the `-s` reboot wait, the program only performs an interruptible delay.
+It does not compare full lspci text during the wait; PCI changes are evaluated
+by the explicit raw config-space and selected Dev/Lnk comparisons before the
+wait.
 
 ## Persistence Across Reboots
 

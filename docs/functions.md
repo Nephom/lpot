@@ -39,8 +39,8 @@ by responsibility first so behavior can be verified before introducing
   existing files, and quotes every argument independently.
 - `setupSystemdService`: refreshes the systemd unit and rejects unsafe existing
   files at the service path.
-- `monitorRebootWait`: compares `/lpot/tmp/<BDF>_init.txt` baselines with
-  in-memory polling snapshots during the reboot wait.
+- `sleepInterruptible`: waits for the reboot delay while still responding to
+  cancellation; reboot-wait does not perform a full-output lspci poll.
 - `disableSELinux`: best-effort SELinux configuration update with symlink refusal.
 - `disableFirewall`: stops/disables common RHEL, SLES, and Ubuntu firewall
   services and invokes `ufw disable` when available.

@@ -6,9 +6,10 @@ executable and is maintained as an integrated version of
 [Nephom/lpot](https://github.com/Nephom/lpot).
 
 The tool records PCI topology, `lspci` output, and PCI configuration-space
-changes across reboot cycles. It classifies PCIe endpoints so that bridges and
-other non-endpoint devices do not create misleading failures, while allowing
-explicit per-device overrides.
+changes across reboot cycles. PCIe link classification is reported as separate
+evidence, while raw configuration sampling retains devices so a capability
+decode mismatch cannot hide changed byte offsets. Explicit per-device
+overrides remain available.
 
 ## Warning
 
@@ -23,6 +24,8 @@ enabled. Use it only on a disposable or explicitly reserved test system.
 
 - Repeated reboot testing for a configurable duration.
 - PCI device topology and `lspci -vv` comparison between cycles.
+- Raw PCI configuration-space hex dumps for KEEP devices are available from the
+  local dashboard for manual review of decoded PCIe link fields.
 - PCI configuration-space scanning with volatile-byte filtering.
 - Endpoint classification with an optional `/lpot/pcie_filter.txt` override.
 - Interruptible waits and bounded external-command execution.
@@ -33,6 +36,8 @@ enabled. Use it only on a disposable or explicitly reserved test system.
   root-only reboot controls and symlink-resistant writes.
 - Per-cycle logs and a final summary that separates noteworthy changes from
   recurring configuration noise.
+- Optional user command execution on every boot, with combined output in
+  `/lpot/command_user_custom.log`.
 
 ## Requirements
 
@@ -49,7 +54,9 @@ environment, but it must produce a Linux binary through cross-compilation.
 ## Linux Build
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o lpot .
+BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+GOOS=linux GOARCH=amd64 go build -trimpath \
+  -ldflags="-s -w -X main.buildTime=${BUILD_TIME}" -o lpot .
 ```
 
 The command above can be run from macOS or another development host. The
@@ -62,7 +69,8 @@ analysis can be run in a compatible Go environment with:
 
 ```bash
 go vet ./...
-go build -trimpath -ldflags="-s -w" -o lpot .
+BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+go build -trimpath -ldflags="-s -w -X main.buildTime=${BUILD_TIME}" -o lpot .
 ```
 
 Install the resulting binary on a Linux test host as appropriate for your
@@ -116,6 +124,10 @@ cd /root
 
 # Stop after a detected comparison error.
 sudo ./lpot -p
+
+# Run a long-lived command in the background on every boot. LPOT options must
+# appear before -c; every argument after -c belongs to the user command.
+sudo ./lpot -t 24 -c /usr/bin/ping -t 192.168.1.1
 
 # Reset the runtime directory. Review the target host before using this.
 sudo ./lpot -r
@@ -184,6 +196,7 @@ Options:
 | `-d seconds` | Driver/device preparation delay | `300` |
 | `-s seconds` | Delay before reboot | `300` |
 | `-p` | Stop when an error is detected | disabled |
+| `-c command ...` | Run the command and all following arguments in the background on every boot; append stdout and stderr to `/lpot/command_user_custom.log` | disabled |
 | `-g hash` | Hidden authenticated read-only audit; show commands and file contents | disabled |
 | `-k` | Show encrypted root password value used to authorize `-g` | off |
 | `-r` | Reset `/lpot` runtime state | off |
@@ -222,13 +235,17 @@ The program stores persistent state under `/lpot`:
 - `rebootcount`: current reboot-cycle counter.
 - `timestamp`: test expiration timestamp.
 - `initial_pci_devices.txt`: initial `lspci` snapshot.
-- `ignore_list.txt`: whole-device ignores for USB/bridges plus volatile offsets.
+- `ignore_list.txt`: explicit whole-device ignores for USB controllers plus
+  volatile offsets. PCIe capability decode failures do not remove a device
+  from raw config comparison.
 - `lpotscan.log`: lspci comparison log.
 - `pci-config-changes.log`: configuration-space comparison results.
 - `pci_devices_classify.log`: historical `-classify` reports.
 - `pcie_filter.txt`: optional endpoint overrides.
 - `tmp/`: temporary per-device `lspci` snapshots.
 - `result.json`: atomic structured checkpoint and final test report.
+- `command_user_custom.log`: stdout and stderr from the optional background
+  command configured with `-c`.
 
 `/lpot` and `/lpot/tmp` are root-owned and mode `0755` so non-root operators
 can inspect reports. The reboot executable and script remain root-owned and
@@ -246,8 +263,8 @@ dashboard on the test machine with:
 ./lpot -ui
 ```
 
-The dashboard binds only to `127.0.0.1`, opens the local browser through
-`xdg-open` when available, and shows the overall status, check categories,
+The dashboard binds only to `127.0.0.1`, opens Firefox when available, and
+shows the overall status, check categories,
 cycle timeline, filtered problems, and links to detailed text logs. A
 checkpoint is written after each completed cycle before the reboot wait starts;
 the final report is written when the test expires. The dashboard does not

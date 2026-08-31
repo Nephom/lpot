@@ -23,7 +23,6 @@
 # Go tooling and editor/OS metadata
 coverage.out
 *.test
-main_test.go
 .DS_Store
 .idea/
 .vscode/

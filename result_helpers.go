@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"strconv"
@@ -115,17 +114,4 @@ func parseConfigResultChanges() []configResultChange {
 		}
 	}
 	return changes
-}
-
-func latestTestSession(data []byte) []byte {
-	marker := []byte("#########Start to test#########")
-	markerAt := bytes.LastIndex(data, marker)
-	if markerAt < 0 {
-		return data
-	}
-	startAt := bytes.LastIndex(data[:markerAt], []byte("===== Cycle "))
-	if startAt < 0 {
-		return data[markerAt:]
-	}
-	return data[startAt:]
 }

@@ -36,8 +36,12 @@ const (
 	SYS_PCI_DEVICES     = "/sys/bus/pci/devices/"
 	TIMESTAMP_FILE      = "/lpot/timestamp"
 	REBOOTCOUNT_FILE    = "/lpot/rebootcount"
+	TM_TARGET_FILE      = "/lpot/tm_target"
+	TM_START_COUNT_FILE = "/lpot/tm_start_count"
 	INITIAL_PCI_DEVICES = "/lpot/initial_pci_devices.txt"
 	REBOOT_LOG          = "/lpot/reboot.log"
+	CLASSIFY_STATE_FILE = "/lpot/pci_devices_classify_state.json"
+	COMMAND_USER_LOG    = "/lpot/command_user_custom.log"
 	TMP_DIR             = "/lpot/tmp"
 	IGNORE_LIST_FILE    = "/lpot/ignore_list.txt"
 	CONFIG_CHANGES_LOG  = "/lpot/pci-config-changes.log"
@@ -45,6 +49,7 @@ const (
 	CLASSIFY_LOG        = "/lpot/pci_devices_classify.log"
 	LPOTSCAN_LOG        = "/lpot/lpotscan.log"
 	PCIE_FILTER_FILE    = "/lpot/pcie_filter.txt"
+	CONFIG_DUMP_DIR     = "/lpot/config_dump"
 
 	// Per-command timeouts for external tools. Chosen conservatively so a stuck
 	// child process cannot hang the overall test loop.
@@ -58,12 +63,14 @@ const (
 	// lets users correlate events by plain text search and by tools like
 	// `sort -k1,2` without translation.
 	logTimeFormat = "2006-01-02 15:04:05"
-	version       = "2.6.0"
+	version       = "2.6.15"
 	serviceName   = "lpot.service"
 	legacyService = "lpot_reboot.service"
 	servicePath   = "/etc/systemd/system/" + serviceName
 	legacyPath    = "/etc/systemd/system/" + legacyService
 )
+
+var buildTime = "development"
 
 // bdfRegex matches a canonical PCI BDF, optionally with a 4-digit domain:
 //
@@ -121,8 +128,9 @@ var (
 	// legacy code path keep working unchanged. skippedDevicesGlobal records
 	// the BDFs that were filtered out, with their classification reason, so
 	// the final summary can list them in a dedicated section.
-	endpointFilterSet    map[string]bool
-	skippedDevicesGlobal []deviceClassification
+	endpointFilterSet       map[string]bool
+	classifiedDevicesGlobal []deviceClassification
+	skippedDevicesGlobal    []deviceClassification
 
 	// Statistics tracking
 	testStartTime                   time.Time
@@ -259,18 +267,28 @@ var pciClassNames = map[byte]string{
 	0x13: "Non-Essential Instrumentation",
 }
 
-// pciDeviceInfo carries the header fields needed for endpoint classification
+// pciDeviceInfo carries the header and link fields needed for link classification
 // and for log enrichment. It is intentionally a small subset of the full
 // PCIDeviceInfo struct so callers that only need the class/header data are not
 // forced to parse the entire 256-byte config space.
 type pciDeviceInfo struct {
-	BDF        string
-	Vendor     uint16 // config offset 0x00-0x01
-	Device     uint16 // config offset 0x02-0x03
-	SubClass   byte   // config offset 0x0a
-	BaseClass  byte   // config offset 0x0b
-	HeaderType byte   // config offset 0x0e, masked with 0x7f (top bit = MFD)
-	HasPCIeCap bool   // PCI Express Capability (Cap ID 0x10) present in cap list
+	BDF           string
+	Vendor        uint16 // config offset 0x00-0x01
+	Device        uint16 // config offset 0x02-0x03
+	SubClass      byte   // config offset 0x0a
+	BaseClass     byte   // config offset 0x0b
+	HeaderType    byte   // config offset 0x0e, masked with 0x7f (top bit = MFD)
+	HasPCIeCap    bool   // PCI Express Capability (Cap ID 0x10) present in cap list
+	CapOffset     byte   // PCI Express Capability offset in config space
+	LinkSpeed     byte   // PCIe Link Capabilities speed code, zero when unavailable
+	LinkWidth     byte   // PCIe Link Capabilities width, zero when unavailable
+	LinkStaSpeed  byte   // PCIe Link Status speed code, zero when unavailable
+	LinkStaWidth  byte   // PCIe Link Status width, zero when unavailable
+	LspciLinkOK   bool   // lspci provided parseable LnkCap/LnkSta evidence
+	LspciSpeed    byte
+	LspciWidth    byte
+	LspciStaSpeed byte
+	LspciStaWidth byte
 }
 
 // readSysfsConfig reads up to n bytes from a device's PCI configuration space
@@ -297,7 +315,7 @@ func readSysfsConfig(bdf string, n int) []byte {
 }
 
 // readPCIDeviceInfo extracts the header / class / capability data needed for
-// endpoint classification. Returns ok=false on any read failure so callers can
+// link classification. Returns ok=false on any read failure so callers can
 // treat the BDF as "unknown" rather than block the test.
 func readPCIDeviceInfo(bdf string) (pciDeviceInfo, bool) {
 	cfg := readSysfsConfig(bdf, 256)
@@ -305,13 +323,18 @@ func readPCIDeviceInfo(bdf string) (pciDeviceInfo, bool) {
 		return pciDeviceInfo{BDF: bdf}, false
 	}
 	return pciDeviceInfo{
-		BDF:        bdf,
-		Vendor:     binary.LittleEndian.Uint16(cfg[0x00:0x02]),
-		Device:     binary.LittleEndian.Uint16(cfg[0x02:0x04]),
-		SubClass:   cfg[0x0a],
-		BaseClass:  cfg[0x0b],
-		HeaderType: cfg[0x0e] & 0x7f,
-		HasPCIeCap: hasPCIeCapability(cfg),
+		BDF:          bdf,
+		Vendor:       binary.LittleEndian.Uint16(cfg[0x00:0x02]),
+		Device:       binary.LittleEndian.Uint16(cfg[0x02:0x04]),
+		SubClass:     cfg[0x0a],
+		BaseClass:    cfg[0x0b],
+		HeaderType:   cfg[0x0e] & 0x7f,
+		HasPCIeCap:   hasPCIeCapability(cfg),
+		CapOffset:    byte(pciExpressCapabilityOffset(cfg)),
+		LinkSpeed:    pciExpressLinkSpeed(cfg),
+		LinkWidth:    pciExpressLinkWidth(cfg),
+		LinkStaSpeed: pciExpressLinkStatusSpeed(cfg),
+		LinkStaWidth: pciExpressLinkStatusWidth(cfg),
 	}, true
 }
 
@@ -320,48 +343,174 @@ func readPCIDeviceInfo(bdf string) (pciDeviceInfo, bool) {
 // links to avoid pointer loops on a malformed list, and short-circuits if the
 // Status register's Capabilities List bit (bit 4 of offset 0x06) is clear.
 func hasPCIeCapability(cfg []byte) bool {
+	return pciExpressCapabilityOffset(cfg) != 0
+}
+
+func pciExpressCapabilityOffset(cfg []byte) int {
 	if len(cfg) < 0x35 {
-		return false
+		return 0
 	}
 	status := binary.LittleEndian.Uint16(cfg[0x06:0x08])
 	if status&0x10 == 0 {
-		return false
+		return 0
 	}
 	next := int(cfg[0x34] & 0xfc)
 	for i := 0; i < 48 && next != 0 && next+1 < len(cfg); i++ {
 		if cfg[next] == 0x10 { // PCI Express
-			return true
+			return next
 		}
 		next = int(cfg[next+1] & 0xfc)
 	}
-	return false
+	return 0
 }
 
-// isPCIeEndpoint applies the three-layer endpoint rule:
-//  1. PCI Header Type == 0x00 (Type 0 layout — only endpoints have this)
-//  2. Base Class != 0x06 (excludes every Bridge Device subclass)
-//  3. PCI Express Capability present (excludes legacy non-PCIe devices)
+func pciExpressLinkSpeed(cfg []byte) byte {
+	offset := pciExpressCapabilityOffset(cfg)
+	if offset == 0 || offset+0x10 > len(cfg) {
+		return 0
+	}
+	return cfg[offset+0x0c] & 0x0f
+}
+
+func pciExpressLinkWidth(cfg []byte) byte {
+	offset := pciExpressCapabilityOffset(cfg)
+	if offset == 0 || offset+0x10 > len(cfg) {
+		return 0
+	}
+	// Link Capabilities is a 32-bit register at capability+0x0c. Maximum
+	// Link Width is bits 9:4: bits 7:4 of byte 0 and bits 1:0 of byte 1.
+	return (cfg[offset+0x0c] >> 4) | ((cfg[offset+0x0d] & 0x03) << 4)
+}
+
+func pciExpressLinkStatusSpeed(cfg []byte) byte {
+	offset := pciExpressCapabilityOffset(cfg)
+	if offset == 0 || offset+0x14 > len(cfg) {
+		return 0
+	}
+	return cfg[offset+0x12] & 0x0f
+}
+
+func pciExpressLinkStatusWidth(cfg []byte) byte {
+	offset := pciExpressCapabilityOffset(cfg)
+	if offset == 0 || offset+0x14 > len(cfg) {
+		return 0
+	}
+	return (cfg[offset+0x12] >> 4) | ((cfg[offset+0x13] & 0x03) << 4)
+}
+
+func lspciSpeedCode(value string) (byte, bool) {
+	value = strings.TrimSuffix(strings.TrimSpace(value), ",")
+	value = strings.TrimSuffix(value, "GT/s")
+	speed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, false
+	}
+	switch speed {
+	case 2.5:
+		return 1, true
+	case 5:
+		return 2, true
+	case 8:
+		return 3, true
+	case 16:
+		return 4, true
+	case 32:
+		return 5, true
+	case 64:
+		return 6, true
+	default:
+		return 0, false
+	}
+}
+
+func parseLspciLinkLine(output []byte, marker string) (byte, byte, bool) {
+	for _, raw := range strings.Split(string(output), "\n") {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(line, marker+":") {
+			continue
+		}
+		fields := strings.Fields(line)
+		var speed byte
+		var width byte
+		for i, field := range fields {
+			if field == "Speed" && i+1 < len(fields) {
+				if parsed, ok := lspciSpeedCode(fields[i+1]); ok {
+					speed = parsed
+				}
+			}
+			if field == "Width" && i+1 < len(fields) {
+				value := strings.TrimPrefix(strings.TrimSuffix(fields[i+1], ","), "x")
+				if parsed, err := strconv.Atoi(value); err == nil && parsed >= 0 && parsed <= 255 {
+					width = byte(parsed)
+				}
+			}
+		}
+		return speed, width, speed != 0 && width != 0
+	}
+	return 0, 0, false
+}
+
+func enrichLspciLinkInfo(info *pciDeviceInfo, bdf string) {
+	if lspciPath == "" || rootCtx == nil {
+		return
+	}
+	output, err := runExternal(lspciTimeout, lspciPath, "-s", bdf, "-vv")
+	if err != nil {
+		return
+	}
+	speed, width, capOK := parseLspciLinkLine(output, "LnkCap")
+	staSpeed, staWidth, _ := parseLspciLinkLine(output, "LnkSta")
+	if capOK {
+		info.LspciLinkOK = true
+		info.LspciSpeed = speed
+		info.LspciWidth = width
+		info.LspciStaSpeed = staSpeed
+		info.LspciStaWidth = staWidth
+	}
+}
+
+// isPCIeLinkCapable selects devices whose PCIe Link Capabilities can be
+// compared. Root ports, bridges, system peripherals and endpoints are all
+// valid candidates; their PCI header class is not a reason to exclude them.
+// Only a missing PCIe capability or missing advertised link speed/width makes
+// a device unsuitable for the link comparison.
 //
-// Returns (true, "") for endpoints and (false, reason) otherwise, where
+// Returns (true, "") for link-capable devices and (false, reason) otherwise, where
 // reason is a short human-readable string suitable for inclusion in the
 // classification report and the final summary.
-func isPCIeEndpoint(info pciDeviceInfo) (bool, string) {
-	if info.HeaderType != 0x00 {
-		return false, fmt.Sprintf("Header Type %d (bridge layout)", info.HeaderType)
-	}
-	if info.BaseClass == 0x06 {
-		return false, "Base Class 0x06 (Bridge Device)"
-	}
+func isPCIeLinkCapable(info pciDeviceInfo) (bool, string) {
 	if !info.HasPCIeCap {
-		return false, "no PCI Express capability (legacy PCI)"
+		return false, "PCIe capability not found"
+	}
+	if info.LinkSpeed == 0 || info.LinkWidth == 0 {
+		return false, "no PCIe link speed/width"
+	}
+	if !isValidPCIeSpeed(info.LinkSpeed) {
+		return false, fmt.Sprintf("possible raw PCI config capability pointer/offset decode mismatch: invalid PCIe link speed code %d", info.LinkSpeed)
+	}
+	if !isValidPCIeWidth(info.LinkWidth) {
+		if info.LinkWidth == 0 {
+			return false, "possible raw PCI config capability pointer/offset decode mismatch: no PCIe link width"
+		}
+		return false, fmt.Sprintf("possible raw PCI config capability pointer/offset decode mismatch: invalid PCIe link width code %d", info.LinkWidth)
 	}
 	return true, ""
 }
 
-// pcieFilterOverrides holds user-supplied include/exclude directives parsed
-// from PCIE_FILTER_FILE. A BDF in Include is treated as an endpoint even if
-// auto-classification would skip it; a BDF in Exclude is skipped even if
-// auto-classification would keep it. Keys are stored in short form.
+func isValidPCIeSpeed(code byte) bool { return code >= 1 && code <= 6 }
+
+func isValidPCIeWidth(width byte) bool {
+	switch width {
+	case 1, 2, 4, 8, 12, 16, 32:
+		return true
+	default:
+		return false
+	}
+}
+
+// pcieFilterOverrides holds optional user-supplied include/exclude directives
+// parsed from PCIE_FILTER_FILE. Exclude is a manual test omission; Include only
+// changes the label for a device that already has a comparable PCIe link.
 type pcieFilterOverrides struct {
 	Include map[string]bool
 	Exclude map[string]bool
@@ -423,38 +572,53 @@ type deviceClassification struct {
 	Info       pciDeviceInfo
 	InfoOK     bool
 	Kept       bool
-	KeptReason string // "endpoint", "forced by pcie_filter.txt", ""
+	KeptReason string // "link-capable", "manual include", ""
 	SkipReason string // populated when Kept == false
 }
 
-// classifyDevices runs the three-layer endpoint check on each BDF, then
-// applies pcie_filter.txt overrides (Exclude beats Include). The output is
-// stable-ordered by BDF so the dry-run report and the summary section render
-// deterministically across runs.
+// classifyDevices checks every BDF for a comparable PCIe link, then applies
+// optional pcie_filter.txt exclusions. The classification is evidence only;
+// raw config scanning retains every readable BDF so a decode mismatch cannot
+// hide a changed byte offset.
 func classifyDevices(bdfs []string, ov pcieFilterOverrides) []deviceClassification {
 	out := make([]deviceClassification, 0, len(bdfs))
 	for _, bdf := range bdfs {
 		short := normalizeBDF(bdf)
 		dc := deviceClassification{BDF: short}
 		info, ok := readPCIDeviceInfo(bdf)
+		if ok {
+			enrichLspciLinkInfo(&info, bdf)
+		}
 		dc.Info = info
 		dc.InfoOK = ok
 		switch {
-		case ov.Exclude[short]:
-			dc.Kept = false
-			dc.SkipReason = "forced by pcie_filter.txt (-)"
-		case ov.Include[short]:
-			dc.Kept = true
-			dc.KeptReason = "forced by pcie_filter.txt (+)"
 		case !ok:
 			dc.Kept = false
-			dc.SkipReason = "unreadable config space"
+			dc.SkipReason = "unreadable config space (unverified)"
 		default:
-			endpoint, reason := isPCIeEndpoint(info)
-			dc.Kept = endpoint
-			if endpoint {
-				dc.KeptReason = "endpoint"
-			} else {
+			linkCapable, reason := isPCIeLinkCapable(info)
+			mismatchReason := rawLspciLinkMismatchReason(info)
+			if !linkCapable && info.LspciLinkOK {
+				linkCapable = true
+				reason = mismatchReason
+			}
+			if mismatchReason != "" {
+				reason = mismatchReason
+			}
+			switch {
+			case ov.Exclude[short]:
+				dc.Kept = false
+				dc.SkipReason = "manual exclude (-)"
+			case linkCapable && ov.Include[short]:
+				dc.Kept = true
+				dc.KeptReason = "manual include (+)"
+			case linkCapable:
+				dc.Kept = true
+				dc.KeptReason = "link-capable"
+				if mismatchReason != "" {
+					dc.KeptReason = mismatchReason
+				}
+			default:
 				dc.SkipReason = reason
 			}
 		}
@@ -465,12 +629,13 @@ func classifyDevices(bdfs []string, ov pcieFilterOverrides) []deviceClassificati
 }
 
 // filterEndpoints applies classifyDevices() to bdfs and returns only the BDFs
-// that pass, preserving the original (sysfs / caller) BDF form so downstream
-// file paths under TMP_DIR remain unchanged. The skipped slice carries the
-// classification records for skipped devices so callers can surface them in
-// the final summary.
+// that pass. It is retained for callers that explicitly request the link-only
+// set; the normal stability run uses the complete raw-config device set.
 func filterEndpoints(bdfs []string, ov pcieFilterOverrides) (kept []string, skipped []deviceClassification) {
-	decisions := classifyDevices(bdfs, ov)
+	return filterClassifiedEndpoints(bdfs, classifyDevices(bdfs, ov))
+}
+
+func filterClassifiedEndpoints(bdfs []string, decisions []deviceClassification) (kept []string, skipped []deviceClassification) {
 	keptShort := make(map[string]bool, len(decisions))
 	for _, d := range decisions {
 		if d.Kept {
@@ -487,21 +652,125 @@ func filterEndpoints(bdfs []string, ov pcieFilterOverrides) (kept []string, skip
 	return kept, skipped
 }
 
+func pcieSpeedLabel(code byte) string {
+	labels := map[byte]string{
+		1: "2.5GT/s",
+		2: "5GT/s",
+		3: "8GT/s",
+		4: "16GT/s",
+		5: "32GT/s",
+		6: "64GT/s",
+	}
+	if label, ok := labels[code]; ok {
+		return label
+	}
+	if code == 0 {
+		return "none"
+	}
+	return fmt.Sprintf("code %d", code)
+}
+
+func pcieLinkLabel(speed, width byte) string {
+	if speed == 0 || width == 0 {
+		return "NO LINK"
+	}
+	if !isValidPCIeSpeed(speed) {
+		return fmt.Sprintf("INVALID SPEED CODE %d", speed)
+	}
+	if !isValidPCIeWidth(width) {
+		return fmt.Sprintf("INVALID WIDTH CODE %d", width)
+	}
+	return fmt.Sprintf("%s x%d", pcieSpeedLabel(speed), width)
+}
+
+func pcieLinkEvidence(info pciDeviceInfo, infoOK bool) (string, string) {
+	if !infoOK {
+		return "-", "unreadable"
+	}
+	if !info.HasPCIeCap {
+		return "no", "no PCIe capability"
+	}
+	return pcieLinkLabel(info.LinkSpeed, info.LinkWidth), pcieLinkLabel(info.LinkStaSpeed, info.LinkStaWidth)
+}
+
+func rawLspciLinkMismatchReason(info pciDeviceInfo) string {
+	if !info.LspciLinkOK {
+		return ""
+	}
+	var reasons []string
+	if rawCap := pcieLinkLabel(info.LinkSpeed, info.LinkWidth); rawCap != pcieLinkLabel(info.LspciSpeed, info.LspciWidth) {
+		reasons = append(reasons, fmt.Sprintf("raw/lspci mismatch (possible raw PCI config capability pointer/offset decode mismatch): raw LnkCap=%s, lspci LnkCap=%s",
+			rawCap, pcieLinkLabel(info.LspciSpeed, info.LspciWidth)))
+	}
+	if rawSta := pcieLinkLabel(info.LinkStaSpeed, info.LinkStaWidth); rawSta != pcieLinkLabel(info.LspciStaSpeed, info.LspciStaWidth) {
+		reasons = append(reasons, fmt.Sprintf("raw/lspci mismatch (possible raw PCI config capability pointer/offset decode mismatch): raw LnkSta=%s, lspci LnkSta=%s",
+			rawSta, pcieLinkLabel(info.LspciStaSpeed, info.LspciStaWidth)))
+	}
+	return strings.Join(reasons, "; ")
+}
+
+func buildClassificationReport(decisions []deviceClassification) classificationReport {
+	report := classificationReport{Status: "PASS", Total: len(decisions)}
+	for _, d := range decisions {
+		item := classificationDevice{
+			BDF: d.BDF, Decision: "SKIP", Verification: "VERIFIED",
+			PCIeCap: "no", LinkCap: "-", LinkStatus: "-", Reason: d.SkipReason,
+		}
+		if !d.InfoOK {
+			item.Verification = "UNVERIFIED"
+			report.Unverified++
+		} else {
+			item.Vendor = fmt.Sprintf("%04x", d.Info.Vendor)
+			item.Device = fmt.Sprintf("%04x", d.Info.Device)
+			item.Class = fmt.Sprintf("0x%02x:%02x", d.Info.BaseClass, d.Info.SubClass)
+			item.Header = fmt.Sprintf("Type %d", d.Info.HeaderType)
+			item.LinkCap, item.LinkStatus = pcieLinkEvidence(d.Info, true)
+			if d.Info.LspciLinkOK {
+				item.LspciLinkCap = pcieLinkLabel(d.Info.LspciSpeed, d.Info.LspciWidth)
+				item.LspciStatus = pcieLinkLabel(d.Info.LspciStaSpeed, d.Info.LspciStaWidth)
+			}
+			if d.Info.HasPCIeCap {
+				item.PCIeCap = fmt.Sprintf("yes @ 0x%02x", d.Info.CapOffset)
+			}
+		}
+		if d.Kept {
+			item.Decision = "KEEP"
+			report.Kept++
+		} else {
+			report.Skipped++
+		}
+		if d.KeptReason != "" {
+			item.Reason = d.KeptReason
+		}
+		report.Devices = append(report.Devices, item)
+	}
+	if report.Unverified > 0 {
+		report.Status = "UNVERIFIED"
+	}
+	return report
+}
+
 // printClassificationReport renders a deterministic, human-readable summary of
 // every BDF and the keep/skip decision. It is used both by the -classify
 // dry-run flag and by the post-test summary so users see exactly the same
 // view.
 func printClassificationReport(w io.Writer, decisions []deviceClassification) {
-	fmt.Fprintf(w, "%-12s %-9s %-9s %-7s %-8s %s\n",
-		"BDF", "Vendor", "Device", "Class", "HdrType", "Decision")
-	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 78))
+	fmt.Fprintf(w, "%-12s %-9s %-9s %-7s %-8s %-18s %-18s %-18s %-18s %s\n",
+		"BDF", "Vendor", "Device", "Class", "HdrType", "Raw LnkCap", "Raw LnkSta", "lspci LnkCap", "lspci LnkSta", "Decision / Reason")
+	fmt.Fprintf(w, "%s\n", strings.Repeat("-", 190))
 	for _, d := range decisions {
 		var ven, dev, cls, hdr string
+		linkCap, linkStatus := pcieLinkEvidence(d.Info, d.InfoOK)
+		lspciCap, lspciStatus := "-", "-"
 		if d.InfoOK {
 			ven = fmt.Sprintf("%04x", d.Info.Vendor)
 			dev = fmt.Sprintf("%04x", d.Info.Device)
 			cls = fmt.Sprintf("0x%02x", d.Info.BaseClass)
 			hdr = fmt.Sprintf("Type %d", d.Info.HeaderType)
+			if d.Info.LspciLinkOK {
+				lspciCap = pcieLinkLabel(d.Info.LspciSpeed, d.Info.LspciWidth)
+				lspciStatus = pcieLinkLabel(d.Info.LspciStaSpeed, d.Info.LspciStaWidth)
+			}
 		} else {
 			ven, dev, cls, hdr = "-", "-", "-", "-"
 		}
@@ -509,9 +778,179 @@ func printClassificationReport(w io.Writer, decisions []deviceClassification) {
 		if !d.Kept {
 			decision = "SKIP " + d.SkipReason
 		}
-		fmt.Fprintf(w, "%-12s %-9s %-9s %-7s %-8s %s\n",
-			d.BDF, ven, dev, cls, hdr, decision)
+		fmt.Fprintf(w, "%-12s %-9s %-9s %-7s %-8s %-18s %-18s %-18s %-18s %s\n",
+			d.BDF, ven, dev, cls, hdr, linkCap, linkStatus, lspciCap, lspciStatus, decision)
 	}
+}
+
+func persistClassificationReport(decisions []deviceClassification) error {
+	fp, err := openSecureAppend(CLASSIFY_LOG, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(fp, "\n===== %s classify run (%d devices) =====\n",
+		getCurrentTimestamp(), len(decisions)); err != nil {
+		fp.Close()
+		return err
+	}
+	printClassificationReport(fp, decisions)
+	return fp.Close()
+}
+
+func configDumpPath(bdf string) (string, error) {
+	normalized := normalizeBDF(bdf)
+	if !shortBDFRegex.MatchString(normalized) && !bdfRegex.MatchString(normalized) {
+		return "", fmt.Errorf("invalid PCI BDF %q", bdf)
+	}
+	return filepath.Join(CONFIG_DUMP_DIR, normalized+".txt"), nil
+}
+
+func formatConfigDump(cfg []byte) string {
+	var out strings.Builder
+	for offset := 0; offset < len(cfg); offset += 16 {
+		end := offset + 16
+		if end > len(cfg) {
+			end = len(cfg)
+		}
+		fmt.Fprintf(&out, "%02x:", offset)
+		for _, value := range cfg[offset:end] {
+			fmt.Fprintf(&out, " %02x", value)
+		}
+		out.WriteByte('\n')
+	}
+	return out.String()
+}
+
+func persistClassificationConfigDumps(decisions []deviceClassification) error {
+	if err := os.MkdirAll(CONFIG_DUMP_DIR, 0755); err != nil {
+		return fmt.Errorf("create %s: %w", CONFIG_DUMP_DIR, err)
+	}
+	entries, err := os.ReadDir(CONFIG_DUMP_DIR)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", CONFIG_DUMP_DIR, err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".txt") {
+			if err := os.Remove(filepath.Join(CONFIG_DUMP_DIR, entry.Name())); err != nil {
+				return fmt.Errorf("clear config dump %s: %w", entry.Name(), err)
+			}
+		}
+	}
+	for _, decision := range decisions {
+		if !decision.Kept || !decision.InfoOK {
+			continue
+		}
+		path, err := configDumpPath(decision.BDF)
+		if err != nil {
+			return err
+		}
+		cfg := readSysfsConfig(decision.BDF, 256)
+		if len(cfg) == 0 {
+			continue
+		}
+		if err := writeFileNoFollow(path, []byte(formatConfigDump(cfg)), 0644); err != nil {
+			return fmt.Errorf("write config dump for %s: %w", decision.BDF, err)
+		}
+	}
+	return nil
+}
+
+func writeClassificationReportToLog(logFp *os.File, decisions []deviceClassification) error {
+	current := classificationSnapshot{Devices: make(map[string]string, len(decisions))}
+	report := buildClassificationReport(decisions)
+	if report.Unverified > 0 {
+		return fmt.Errorf("classification baseline not updated: %d device(s) are unverified", report.Unverified)
+	}
+	for _, item := range report.Devices {
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			return fmt.Errorf("marshal classification snapshot for %s: %w", item.BDF, err)
+		}
+		current.Devices[item.BDF] = string(encoded)
+	}
+
+	previous := classificationSnapshot{}
+	data, readErr := os.ReadFile(CLASSIFY_STATE_FILE)
+	if readErr == nil {
+		if err := json.Unmarshal(data, &previous); err != nil {
+			readErr = err
+		}
+	}
+	if readErr != nil || len(previous.Devices) == 0 {
+		fmt.Fprintf(logFp, "\n%s===== Complete PCI link classification (%d devices) =====\n", cycleTag(), len(decisions))
+		printClassificationReport(logFp, decisions)
+		if err := writeClassificationBaseline(current); err != nil {
+			return fmt.Errorf("write classification baseline: %w", err)
+		}
+	} else {
+		changed := make([]deviceClassification, 0)
+		for _, decision := range decisions {
+			if previous.Devices[decision.BDF] != current.Devices[decision.BDF] {
+				changed = append(changed, decision)
+			}
+		}
+		removed := make([]string, 0)
+		for bdf := range previous.Devices {
+			if _, ok := current.Devices[bdf]; !ok {
+				removed = append(removed, bdf)
+			}
+		}
+		sort.Strings(removed)
+		if len(changed) == 0 && len(removed) == 0 {
+			fmt.Fprintf(logFp, "%s %sPCIe classification matches baseline.\n", getCurrentTimestamp(), cycleTag())
+		} else {
+			fmt.Fprintf(logFp, "\n%s===== PCIe classification changes from baseline =====\n", cycleTag())
+			if len(changed) > 0 {
+				printClassificationReport(logFp, changed)
+			}
+			for _, bdf := range removed {
+				fmt.Fprintf(logFp, "Removed: %s\n", bdf)
+			}
+		}
+	}
+	return nil
+}
+
+// writeClassificationBaseline publishes the first valid classification for a
+// test run. It is deliberately separate from current-cycle reporting: later
+// cycles are compared with this baseline and must never replace it.
+func writeClassificationBaseline(snapshot classificationSnapshot) error {
+	data := marshalClassificationSnapshot(snapshot)
+	tmpPath := fmt.Sprintf("%s.tmp.%d", CLASSIFY_STATE_FILE, os.Getpid())
+	if err := writeFileNoFollow(tmpPath, data, 0600); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY, 0600)
+	if err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, CLASSIFY_STATE_FILE); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+type classificationSnapshot struct {
+	Devices map[string]string `json:"devices"`
+}
+
+func marshalClassificationSnapshot(snapshot classificationSnapshot) []byte {
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return []byte("{}\n")
+	}
+	return append(data, '\n')
 }
 
 // endpointFilterAllows reports whether bdf is kept by the active endpoint
@@ -560,7 +999,7 @@ var trustedBinDirs = []string{"/usr/sbin/", "/usr/bin/", "/sbin/", "/bin/"}
 // resolveBinaries locks down PATH and resolves the external tools the test
 // harness will invoke. It must run before setupSystemdService() or any loop
 // that shells out.
-func resolveBinaries(requireRebootTools bool) error {
+func resolveBinaries(requireLSPCITools, requireRebootTools bool) error {
 	os.Setenv("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
 
 	tools := []struct {
@@ -569,22 +1008,24 @@ func resolveBinaries(requireRebootTools bool) error {
 	}{
 		{"lspci", &lspciPath},
 	}
-	for _, t := range tools {
-		p, err := exec.LookPath(t.name)
-		if err != nil {
-			return fmt.Errorf("required tool %q not found in PATH: %w", t.name, err)
-		}
-		trusted := false
-		for _, d := range trustedBinDirs {
-			if strings.HasPrefix(p, d) {
-				trusted = true
-				break
+	if requireLSPCITools {
+		for _, t := range tools {
+			p, err := exec.LookPath(t.name)
+			if err != nil {
+				return fmt.Errorf("required tool %q not found in PATH: %w", t.name, err)
 			}
+			trusted := false
+			for _, d := range trustedBinDirs {
+				if strings.HasPrefix(p, d) {
+					trusted = true
+					break
+				}
+			}
+			if !trusted {
+				return fmt.Errorf("tool %q resolved to untrusted path %q", t.name, p)
+			}
+			*t.dst = p
 		}
-		if !trusted {
-			return fmt.Errorf("tool %q resolved to untrusted path %q", t.name, p)
-		}
-		*t.dst = p
 	}
 	if requireRebootTools {
 		for _, t := range []struct {
@@ -846,11 +1287,35 @@ func installPersistentBinary(source string) error {
 	if err != nil {
 		return fmt.Errorf("read executable %q: %w", resolved, err)
 	}
-	if err := writeFileNoFollow(PERSISTENT_BINARY, data, 0755); err != nil {
-		return fmt.Errorf("install executable at %s: %w", PERSISTENT_BINARY, err)
+	if target, targetErr := filepath.EvalSymlinks(PERSISTENT_BINARY); targetErr == nil && target == resolved {
+		if err := os.Chmod(PERSISTENT_BINARY, 0755); err != nil {
+			return fmt.Errorf("set executable mode on %s: %w", PERSISTENT_BINARY, err)
+		}
+		return nil
 	}
-	if err := os.Chmod(PERSISTENT_BINARY, 0755); err != nil {
-		return fmt.Errorf("set executable mode on %s: %w", PERSISTENT_BINARY, err)
+
+	// Install through a closed temporary inode and rename it into place. Directly
+	// truncating /lpot/lpot fails with ETXTBSY when the service is already running
+	// that same binary.
+	tmp, err := os.CreateTemp(LPOT_DIR, ".lpot-install-*")
+	if err != nil {
+		return fmt.Errorf("create temporary executable in %s: %w", LPOT_DIR, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0755); err != nil {
+		tmp.Close()
+		return fmt.Errorf("set temporary executable mode: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temporary executable: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary executable: %w", err)
+	}
+	if err := os.Rename(tmpName, PERSISTENT_BINARY); err != nil {
+		return fmt.Errorf("install executable at %s: %w", PERSISTENT_BINARY, err)
 	}
 	return nil
 }
@@ -951,6 +1416,94 @@ func updateRebootCount() (int, error) {
 	return count, nil
 }
 
+func readRebootCount() (int, error) {
+	data, err := os.ReadFile(REBOOTCOUNT_FILE)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read reboot count: %w", err)
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("parse reboot count: %w", err)
+	}
+	return count, nil
+}
+
+func resetClassificationBaseline() error {
+	err := os.Remove(CLASSIFY_STATE_FILE)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+func prepareTestCycleLimit(limit int) (bool, error) {
+	current, err := readRebootCount()
+	if err != nil {
+		return false, err
+	}
+	target, targetErr := readOptionalInteger(TM_TARGET_FILE)
+	start, startErr := readOptionalInteger(TM_START_COUNT_FILE)
+	cycleTarget := cycleTargetForReboots(limit)
+	if targetErr != nil || startErr != nil || target <= 0 || start < 0 || current < start || current >= start+target {
+		if err := resetClassificationBaseline(); err != nil {
+			return false, fmt.Errorf("reset classification baseline: %w", err)
+		}
+		target = cycleTarget
+		start = current
+		if err := writeFileNoFollow(TM_TARGET_FILE, []byte(fmt.Sprintf("%d\n", target)), 0600); err != nil {
+			return false, fmt.Errorf("write test cycle target: %w", err)
+		}
+		if err := writeFileNoFollow(TM_START_COUNT_FILE, []byte(fmt.Sprintf("%d\n", start)), 0600); err != nil {
+			return false, fmt.Errorf("write test cycle start count: %w", err)
+		}
+	}
+	return current-start >= target, nil
+}
+
+func cycleTargetForReboots(reboots int) int {
+	return reboots + 1
+}
+
+func readOptionalInteger(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
+func fixedCycleLimitReached(current int) (bool, error) {
+	target, err := readOptionalInteger(TM_TARGET_FILE)
+	if err != nil {
+		return false, err
+	}
+	start, err := readOptionalInteger(TM_START_COUNT_FILE)
+	if err != nil {
+		return false, err
+	}
+	return target > 0 && current-start >= target, nil
+}
+
+func disableFixedCycleService() {
+	if systemctlPath != "" {
+		if _, err := runExternal(systemctlTimeout, systemctlPath, "disable", serviceName); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: unable to disable %s after -tm completion: %v\n", serviceName, err)
+		}
+	}
+	os.Remove(TM_TARGET_FILE)
+	os.Remove(TM_START_COUNT_FILE)
+}
+
 // Log initial test information. Emits a clearly delimited cycle-start banner
 // so `grep '===== Cycle'` pulls out every cycle boundary, and every event
 // between two banners is known to belong to the enclosing cycle.
@@ -959,6 +1512,7 @@ func logInitialInfo(logFp *os.File, rebootCount int) {
 	fmt.Fprintf(logFp, "\n\n%s ===== Cycle %d START =====\n", timeStr, rebootCount)
 	fmt.Fprintf(logFp, "%s #########Start to test#########\n", timeStr)
 	fmt.Fprintf(logFp, "\t\t\tReboot Count: %d\n", rebootCount)
+	fmt.Fprintf(logFp, "\t\t\tLPOT Version: %s (built %s)\n", version, buildTime)
 	logFp.Sync()
 }
 
@@ -987,155 +1541,6 @@ func fetchPCIBDFs() ([]string, error) {
 	}
 
 	return bdfs, nil
-}
-
-func readLspciSnapshot(bdf string) (string, error) {
-	if !bdfRegex.MatchString(bdf) {
-		return "", fmt.Errorf("refusing to monitor malformed BDF %q", bdf)
-	}
-	out, err := runExternal(lspciTimeout, lspciPath, "-s", bdf, "-vv")
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
-}
-
-func loadRebootMonitorBaseline(bdfs []string) map[string]string {
-	baseline := make(map[string]string, len(bdfs))
-	for _, bdf := range bdfs {
-		path := filepath.Join(TMP_DIR, bdf+"_init.txt")
-		data, err := os.ReadFile(path)
-		if err == nil {
-			baseline[bdf] = string(data)
-			continue
-		}
-		fmt.Printf("Warning: reboot monitor baseline unavailable for %s: %v\n", bdf, err)
-	}
-	return baseline
-}
-
-func snapshotSet(bdfs []string) map[string]bool {
-	set := make(map[string]bool, len(bdfs))
-	for _, bdf := range bdfs {
-		set[bdf] = true
-	}
-	return set
-}
-
-func lineDiff(before, after string) string {
-	beforeLines := strings.Split(before, "\n")
-	afterLines := strings.Split(after, "\n")
-	var diff strings.Builder
-	for _, line := range beforeLines {
-		if line != "" && !containsLine(afterLines, line) {
-			fmt.Fprintf(&diff, "- %s\n", line)
-		}
-	}
-	for _, line := range afterLines {
-		if line != "" && !containsLine(beforeLines, line) {
-			fmt.Fprintf(&diff, "+ %s\n", line)
-		}
-	}
-	return diff.String()
-}
-
-func containsLine(lines []string, want string) bool {
-	for _, line := range lines {
-		if line == want {
-			return true
-		}
-	}
-	return false
-}
-
-func logRebootMonitorEvent(logFp *os.File, event, bdf, before, after string, stopService bool) {
-	action := "CONTINUE_REBOOT"
-	if stopService {
-		action = "CANCEL_REBOOT"
-	}
-	message := fmt.Sprintf("%s [Cycle %d] Reboot-wait PCI change\nEvent: %s\nBDF: %s\nAction: %s\n",
-		getCurrentTimestamp(), currentCycle.Load(), event, bdf, action)
-	if before != "" || after != "" {
-		message += "----- BASELINE/PREVIOUS -----\n" + before + "----- CURRENT -----\n" + after
-		message += "----- DIFF -----\n" + lineDiff(before, after)
-	}
-	fmt.Fprint(logFp, message)
-	logFp.Sync()
-	fmt.Print(message)
-}
-
-// monitorRebootWait polls PCI topology and lspci output while waiting for the
-// reboot. It keeps the immutable _init.txt contents as baseline and only keeps
-// subsequent observations in memory. It returns false when -p requires reboot
-// cancellation or the context is interrupted.
-func monitorRebootWait(ctx context.Context, wait time.Duration, bdfs []string, logFp *os.File, stopService bool) bool {
-	baseline := loadRebootMonitorBaseline(bdfs)
-	previous := make(map[string]string, len(baseline))
-	for bdf, content := range baseline {
-		previous[bdf] = content
-	}
-	previousSet := snapshotSet(bdfs)
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-timer.C:
-			return true
-		case <-ticker.C:
-			currentBDFs, err := fetchPCIBDFs()
-			if err != nil {
-				fmt.Fprintf(logFp, "%s [Cycle %d] Reboot-wait PCI monitor read failed: %v\n", getCurrentTimestamp(), currentCycle.Load(), err)
-				logFp.Sync()
-				continue
-			}
-			filteredBDFs := make([]string, 0, len(currentBDFs))
-			for _, bdf := range currentBDFs {
-				if endpointFilterAllows(bdf) {
-					filteredBDFs = append(filteredBDFs, bdf)
-				}
-			}
-			currentSet := snapshotSet(filteredBDFs)
-			for bdf := range currentSet {
-				if !previousSet[bdf] {
-					content, readErr := readLspciSnapshot(bdf)
-					if readErr != nil {
-						content = fmt.Sprintf("lspci read failed: %v\n", readErr)
-					}
-					logRebootMonitorEvent(logFp, "NEW_DEVICE", bdf, "", content, stopService)
-					if stopService {
-						return false
-					}
-				}
-			}
-			for bdf := range previousSet {
-				if !currentSet[bdf] {
-					logRebootMonitorEvent(logFp, "REMOVED_DEVICE", bdf, previous[bdf], "", stopService)
-					if stopService {
-						return false
-					}
-				}
-			}
-			for bdf := range currentSet {
-				content, readErr := readLspciSnapshot(bdf)
-				if readErr != nil {
-					continue
-				}
-				if old, ok := previous[bdf]; ok && old != content {
-					logRebootMonitorEvent(logFp, "LSPCI_OUTPUT_CHANGED", bdf, baseline[bdf], content, stopService)
-					if stopService {
-						return false
-					}
-				}
-				previous[bdf] = content
-			}
-			previousSet = currentSet
-		}
-	}
 }
 
 // Execute lspci command safely
@@ -1173,8 +1578,34 @@ func executeLspci(bdf, suffix string) error {
 	return writeFileNoFollow(filename, output, 0644)
 }
 
+// splitCustomCommandArgs removes -c and treats every following token as the
+// custom command argv. LPOT flags must therefore appear before -c.
+func splitCustomCommandArgs(args []string) ([]string, []string, error) {
+	for i, arg := range args[1:] {
+		if arg != "-c" && !strings.HasPrefix(arg, "-c=") {
+			continue
+		}
+
+		index := i + 1
+		var custom []string
+		if strings.HasPrefix(arg, "-c=") {
+			if value := strings.TrimPrefix(arg, "-c="); value != "" {
+				custom = append(custom, value)
+			}
+			custom = append(custom, args[index+1:]...)
+		} else {
+			custom = append(custom, args[index+1:]...)
+		}
+		if len(custom) == 0 || custom[0] == "" {
+			return nil, nil, fmt.Errorf("-c requires a command and optional arguments")
+		}
+		return append([]string{args[0]}, args[1:index]...), custom, nil
+	}
+	return args, nil, nil
+}
+
 // Create reboot script
-func createRebootScript(args []string) error {
+func createRebootScript(args, customCommand []string) error {
 	scriptPath := filepath.Join(LPOT_DIR, "reboot.sh")
 	if err := verifyRootRegularFileIfPresent(scriptPath); err != nil {
 		return err
@@ -1198,11 +1629,30 @@ func createRebootScript(args []string) error {
 	}
 
 	var script strings.Builder
-	script.WriteString("#!/bin/sh\nexec ")
+	script.WriteString("#!/bin/bash\n")
+	if len(customCommand) > 0 {
+		for i, arg := range customCommand {
+			if i > 0 {
+				script.WriteString(" ")
+			}
+			script.WriteString(shellQuote(arg))
+		}
+		script.WriteString(" >> ")
+		script.WriteString(shellQuote(COMMAND_USER_LOG))
+		script.WriteString(" 2>&1 &\n")
+	}
+	script.WriteString("exec ")
 	script.WriteString(shellQuote(executablePath))
 	for _, arg := range args[1:] {
 		script.WriteString(" ")
 		script.WriteString(shellQuote(arg))
+	}
+	if len(customCommand) > 0 {
+		script.WriteString(" -c")
+		for _, arg := range customCommand {
+			script.WriteString(" ")
+			script.WriteString(shellQuote(arg))
+		}
 	}
 	script.WriteByte('\n')
 	if err := writeFileNoFollow(scriptPath, []byte(script.String()), 0700); err != nil {
@@ -1212,6 +1662,18 @@ func createRebootScript(args []string) error {
 		return fmt.Errorf("set reboot script mode on %s: %w", scriptPath, err)
 	}
 	return nil
+}
+
+func persistentRebootArgs(args []string) []string {
+	filtered := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == "-scan" || strings.HasPrefix(arg, "-scan=") ||
+			arg == "-classify" || strings.HasPrefix(arg, "-classify=") {
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+	return filtered
 }
 
 // disableSELinux best-effort puts SELinux into permissive mode immediately and
@@ -1244,6 +1706,24 @@ func createRebootScript(args []string) error {
 // Reset lpot directory
 func resetLpotDirectory() error {
 	fmt.Println("Resetting /lpot directory...")
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("reset requires effective uid 0")
+	}
+	if systemctlPath == "" {
+		return fmt.Errorf("systemctl path was not resolved")
+	}
+	if err := verifyRootRegularFileIfPresent(servicePath); err != nil {
+		return err
+	}
+	if err := stopAndDisableUnit(serviceName); err != nil {
+		return fmt.Errorf("failed to stop and disable %s: %w", serviceName, err)
+	}
+	if err := os.Remove(servicePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove %s: %w", servicePath, err)
+	}
+	if _, err := runExternal(systemctlTimeout, systemctlPath, "daemon-reload"); err != nil {
+		return fmt.Errorf("failed to reload systemd after removing %s: %w", servicePath, err)
+	}
 
 	// Refuse to operate on LPOT_DIR if it is a symlink or not owned by root,
 	// to avoid inadvertently deleting files outside of /lpot.
@@ -1435,11 +1915,30 @@ func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stop
 	}
 
 	var script strings.Builder
-	script.WriteString("#!/bin/sh\nexec ")
+	script.WriteString("#!/bin/bash\n")
+	if len(customCommandArgs) > 0 {
+		for i, arg := range customCommandArgs {
+			if i > 0 {
+				script.WriteString(" ")
+			}
+			script.WriteString(shellQuote(arg))
+		}
+		script.WriteString(" >> ")
+		script.WriteString(shellQuote(COMMAND_USER_LOG))
+		script.WriteString(" 2>&1 &\n")
+	}
+	script.WriteString("exec ")
 	script.WriteString(shellQuote(PERSISTENT_BINARY))
 	for _, arg := range args[1:] {
 		script.WriteString(" ")
 		script.WriteString(shellQuote(arg))
+	}
+	if len(customCommandArgs) > 0 {
+		script.WriteString(" -c")
+		for _, arg := range customCommandArgs {
+			script.WriteString(" ")
+			script.WriteString(shellQuote(arg))
+		}
 	}
 	script.WriteByte('\n')
 	printDryRunFile(PERSISTENT_BINARY, "replace", 0755, "[binary copied from the invoked executable]\n")
@@ -1499,7 +1998,7 @@ func runDryRunAudit(args []string, waitHours, standbyTime, waitSeconds int, stop
 
 	for _, path := range []string{
 		INITIAL_PCI_DEVICES, IGNORE_LIST_FILE, "/lpot/initial.bin", "/lpot/current.bin",
-		CONFIG_CHANGES_LOG, CLASSIFY_LOG, LPOTSCAN_LOG, REBOOT_LOG, RESULT_FILE,
+		CONFIG_CHANGES_LOG, CLASSIFY_LOG, LPOTSCAN_LOG, REBOOT_LOG, RESULT_FILE, COMMAND_USER_LOG,
 	} {
 		fmt.Printf("[DRY-RUN] WOULD WRITE/UPDATE %s (content generated from read-only PCI scan and comparison)\n", path)
 	}
@@ -1550,6 +2049,8 @@ func flagWasProvided(name string) bool {
 	return false
 }
 
+var customCommandArgs []string
+
 func applyDefaultDurationForBareT() {
 	for i := 1; i < len(os.Args); i++ {
 		if os.Args[i] != "-t" {
@@ -1569,24 +2070,28 @@ func showHelp(programName string) {
 	fmt.Printf("Running without -t only shows this help menu.\n")
 	fmt.Printf("OPTIONS:\n")
 	fmt.Printf("  -t <hours>   Setup runtime, default is 12 hours.\n")
+	fmt.Printf("  -tm <count>  Reboot exactly this many times (test mode).\n")
 	fmt.Printf("  -d <secs>    Setup delay time for driver ready, default is 300 seconds.\n")
 	fmt.Printf("  -s <secs>    Setup delay time for reboot, default is 300 seconds.\n")
-	fmt.Printf("  -p           Set stop flag when Error occurred!\n")
+	fmt.Printf("  -p           Stop and disable future reboots on topology, raw config, or lspci differences.\n")
+	fmt.Printf("  -c <command> Run the command and all following arguments in the background on every boot; output goes to %s. LPOT options must come before -c.\n", COMMAND_USER_LOG)
 	fmt.Printf("  -g <hash>    Authenticated read-only audit; never changes the host.\n")
 	fmt.Printf("  -k           Show encrypted root password value.\n")
 	fmt.Printf("  -r           Reset /lpot directory and clean all files.\n")
 	fmt.Printf("  -scan        Scan USB/bridge/volatile devices and write /lpot/ignore_list.txt, then exit.\n")
-	fmt.Printf("  -classify    Print and save the PCI endpoint classification report, then exit.\n")
+	fmt.Printf("  -classify    Print and save the PCI link-capability report, then exit.\n")
 	fmt.Printf("  -ui          Open the local read-only result dashboard.\n")
 	fmt.Printf("  -h, --help   Show Help menu\n")
-	fmt.Printf("\nNOTE: PCI device scanning is automatically performed after driver ready time if ignore_list.txt doesn't exist.\n")
-	fmt.Printf("NOTE: Bridges and legacy PCI devices are filtered automatically. Override via %s.\n", PCIE_FILTER_FILE)
+	fmt.Printf("\nNOTE: PCI link-capability classification and volatile-byte scanning run automatically during every -t run.\n")
+	fmt.Printf("NOTE: Link classification is reported separately; raw config scanning retains devices. Optional manual exclusions use %s.\n", PCIE_FILTER_FILE)
 	fmt.Printf("\nExample:\n")
 	fmt.Printf("  %s -t 24 -s 600    Run reboot during 24 hours and each reboot wait for 600 seconds\n", programName)
 	fmt.Printf("  %s -r              Reset /lpot directory to clean state\n", programName)
 	fmt.Printf("  %s -scan           Only scan PCI devices and generate ignore bits file\n", programName)
-	fmt.Printf("  %s -classify       Print and save endpoint keep/skip decisions\n", programName)
+	fmt.Printf("  %s -classify       Print and save link-capability keep/skip decisions\n", programName)
 	fmt.Printf("  %s -t              Run the default 12-hour reboot test\n", programName)
+	fmt.Printf("  %s -tm 2           Reboot exactly two times\n", programName)
+	fmt.Printf("  %s -t 24 -c /usr/bin/ping -t 192.168.1.1    Run ping in the background on every boot\n", programName)
 }
 
 func main() {
@@ -1597,22 +2102,31 @@ func main() {
 		waitHours   = flag.Int("t", 12, "Setup runtime in hours")
 		standbyTime = flag.Int("d", 300, "Setup delay time for driver ready in seconds")
 		waitSeconds = flag.Int("s", 300, "Setup delay time for reboot in seconds")
+		testCycles  = flag.Int("tm", 0, "Run a fixed number of reboots instead of hours")
 		stopService = flag.Bool("p", false, "Set stop flag when error occurred")
 		debug       = flag.String("g", "", "")
 		showKey     = flag.Bool("k", false, "Show encrypted root password value")
 		reset       = flag.Bool("r", false, "Reset /lpot directory")
 		scanOnly    = flag.Bool("scan", false, "Only scan and generate ignore bits file, then exit")
-		classify    = flag.Bool("classify", false, "Print PCI endpoint classification report and exit")
+		classify    = flag.Bool("classify", false, "Print PCI link-capability report and exit")
 		ui          = flag.Bool("ui", false, "Open the local read-only result dashboard")
 		help        = flag.Bool("h", false, "Show help menu")
 	)
+	parsedArgs, customArgs, err := splitCustomCommandArgs(os.Args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Args = parsedArgs
+	customCommandArgs = customArgs
 	applyDefaultDurationForBareT()
 	flag.Parse()
 	debugHash = *debug
 	debugRequested := flagWasProvided("g")
 	tRequested := flagWasProvided("t")
+	tmRequested := flagWasProvided("tm")
 
-	if *help || (!tRequested && !debugRequested && !*showKey && !*reset && !*scanOnly && !*classify && !*ui) {
+	if *help || (!tRequested && !tmRequested && !debugRequested && !*showKey && !*reset && !*scanOnly && !*classify && !*ui) {
 		showHelp(os.Args[0])
 		return
 	}
@@ -1649,10 +2163,10 @@ func main() {
 
 	// Resolve external tool paths against a sanitised PATH to prevent a
 	// writable PATH entry from shadowing standard system binaries. Reset only
-	// touches local runtime state and does not need Linux command dependencies.
-	if !*reset {
-		requireRebootTools := tRequested || (debugRequested && !*scanOnly && !*classify)
-		if err := resolveBinaries(requireRebootTools); err != nil {
+	// needs systemd tools; normal runs additionally need PCI tools.
+	{
+		requireRebootTools := *reset || tRequested || tmRequested || (*classify && !debugRequested) || (debugRequested && !*scanOnly && !*classify)
+		if err := resolveBinaries(!*reset, requireRebootTools); err != nil {
 			fmt.Fprintf(os.Stderr, "Startup failed: unable to resolve required Linux tools: %v\n", err)
 			fmt.Fprintln(os.Stderr, "Suggestion: install pciutils and systemd tools, then run this binary on the target Linux host.")
 			os.Exit(1)
@@ -1684,8 +2198,29 @@ func main() {
 		}
 		return
 	}
+	if err := compactLegacyRebootLog(REBOOT_LOG); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: unable to compact legacy verbose lspci entries: %v\n", err)
+	}
 
-	if *scanOnly {
+	if *testCycles < 0 {
+		fmt.Fprintln(os.Stderr, "-tm must be greater than zero when provided")
+		os.Exit(1)
+	}
+	if *testCycles > 0 {
+		reached, err := prepareTestCycleLimit(*testCycles)
+		if err != nil {
+			fatalOperation("Startup failed: cannot prepare -tm cycle limit", err,
+				"check /lpot/rebootcount and /lpot permissions")
+		}
+		if reached {
+			fmt.Printf("-tm reboot limit reached; no further reboot will start\n")
+			generateFinalSummary()
+			disableFixedCycleService()
+			return
+		}
+	}
+
+	if *scanOnly && !tRequested {
 		if err := scanAndGenerateIgnoreBits(); err != nil {
 			fmt.Fprintf(os.Stderr, "Scan failed: %v\n", err)
 			fmt.Fprintln(os.Stderr, "Suggestion: verify that /sys/bus/pci/devices is readable and that the process is running as root.")
@@ -1694,9 +2229,9 @@ func main() {
 		return
 	}
 
-	// -classify prints how every PCI BDF would be treated by the endpoint filter
+	// -classify prints how every PCI BDF would be treated by the link-capability filter
 	// and appends the same report to /lpot. It does not change host policies.
-	if *classify {
+	if *classify && !tRequested {
 		bdfs, err := fetchPCIBDFs()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Classification failed: unable to read PCI devices: %v\n", err)
@@ -1712,21 +2247,17 @@ func main() {
 		decisions := classifyDevices(bdfs, ov)
 		printClassificationReport(os.Stdout, decisions)
 
-		// Persist the same report to /lpot/pci_devices_classify.log (alongside
-		// reboot.log / pci-config-changes.log) so the keep/skip decisions can be
-		// reviewed later. Appended with a timestamped banner so repeated runs
-		// build a history instead of silently overwriting the prior report. A
-		fp, err := openSecureAppend(CLASSIFY_LOG, 0644)
-		if err != nil {
+		if err := persistClassificationReport(decisions); err != nil {
 			fatalOperation("Classification failed: cannot write the report", err,
-				"check /lpot permissions and available disk space")
-		}
-		fmt.Fprintf(fp, "\n===== %s classify run (%d devices) =====\n",
-			getCurrentTimestamp(), len(decisions))
-		printClassificationReport(fp, decisions)
-		if err := fp.Close(); err != nil {
-			fatalOperation("Classification failed: cannot close the report", err,
 				"check the filesystem and /lpot permissions")
+		}
+		if err := persistClassificationConfigDumps(decisions); err != nil {
+			fatalOperation("Classification failed: cannot write config dumps", err,
+				"check /lpot/config_dump permissions and PCI sysfs access")
+		}
+		if report := buildClassificationReport(decisions); report.Unverified > 0 {
+			fmt.Fprintf(os.Stderr, "Classification failed: %d PCI devices could not be verified\n", report.Unverified)
+			os.Exit(1)
 		}
 		return
 	}
@@ -1750,50 +2281,57 @@ func main() {
 	}
 
 	// Create reboot script if not exists
-	if err := createRebootScript(os.Args); err != nil {
+	if err := createRebootScript(persistentRebootArgs(os.Args), customCommandArgs); err != nil {
 		fatalOperation("Startup failed: cannot install the persistent reboot executable/script", err,
 			"keep the downloaded binary readable and executable, and verify that /lpot is root-owned")
 	}
 
-	// Check timestamp
-	if !fileExists(TIMESTAMP_FILE) {
-		if err := writeTimestamp(*waitHours); err != nil {
-			fatalOperation("Startup failed: cannot write the test expiration timestamp", err,
-				"check /lpot permissions and available disk space")
-		}
-	} else {
-		currentTime := time.Now()
-		timestamp, err := readTimestamp()
-		if err != nil {
-			fatalOperation("Startup failed: cannot read the existing test expiration timestamp", err,
-				"remove the corrupt /lpot/timestamp only after confirming the previous test is no longer running")
-		}
-
-		if currentTime.After(timestamp) {
-			timestampStr := getCurrentTimestamp()
-			errorMsg := fmt.Sprintf("%s Execution halted: timestamp expired.\n", timestampStr)
-
-			if logFp, err := openSecureAppend(REBOOT_LOG, 0644); err == nil {
-				logFp.WriteString(errorMsg)
-				logFp.Close()
+	// Hour-based runs use the timestamp; -tm runs stop only at their cycle limit.
+	if *testCycles == 0 {
+		// Check timestamp
+		if !fileExists(TIMESTAMP_FILE) {
+			if err := resetClassificationBaseline(); err != nil {
+				fatalOperation("Startup failed: cannot reset classification baseline", err,
+					"check /lpot permissions before starting a new test run")
+			}
+			if err := writeTimestamp(*waitHours); err != nil {
+				fatalOperation("Startup failed: cannot write the test expiration timestamp", err,
+					"check /lpot permissions and available disk space")
+			}
+		} else {
+			currentTime := time.Now()
+			timestamp, err := readTimestamp()
+			if err != nil {
+				fatalOperation("Startup failed: cannot read the existing test expiration timestamp", err,
+					"remove the corrupt /lpot/timestamp only after confirming the previous test is no longer running")
 			}
 
-			// Clean up temporary files
-			os.RemoveAll(TMP_DIR)
+			if currentTime.After(timestamp) {
+				timestampStr := getCurrentTimestamp()
+				errorMsg := fmt.Sprintf("%s Execution halted: timestamp expired.\n", timestampStr)
 
-			// Execute configscan_log.sh if it was located at a trusted absolute
-			// path during startup. Skip silently otherwise; this helper is
-			// optional and its absence must not be mistaken for a PATH lookup.
-			if configScanLogPath != "" {
-				if _, err := runExternal(configScanLogTimeout, configScanLogPath); err != nil {
-					fmt.Fprintf(os.Stderr, "configscan_log.sh failed: %v\n", err)
+				if logFp, err := openSecureAppend(REBOOT_LOG, 0644); err == nil {
+					logFp.WriteString(errorMsg)
+					logFp.Close()
 				}
+
+				// Clean up temporary files
+				os.RemoveAll(TMP_DIR)
+
+				// Execute configscan_log.sh if it was located at a trusted absolute
+				// path during startup. Skip silently otherwise; this helper is
+				// optional and its absence must not be mistaken for a PATH lookup.
+				if configScanLogPath != "" {
+					if _, err := runExternal(configScanLogTimeout, configScanLogPath); err != nil {
+						fmt.Fprintf(os.Stderr, "configscan_log.sh failed: %v\n", err)
+					}
+				}
+
+				// Generate final summary before exit
+				generateFinalSummary()
+
+				os.Exit(1)
 			}
-
-			// Generate final summary before exit
-			generateFinalSummary()
-
-			os.Exit(1)
 		}
 	}
 
@@ -1835,29 +2373,8 @@ func main() {
 			"verify that /sys/bus/pci/devices is mounted and readable on Linux")
 	}
 
-	// Apply endpoint classification (three-layer rule) plus the optional
-	// pcie_filter.txt overrides so bridges and legacy non-PCIe devices are
-	// excluded from every per-cycle comparison and from the config-space
-	// snapshots. The skipped set is remembered for the final summary so
-	// users see exactly which BDFs were dropped and why.
-	overrides, err := loadPCIeFilterOverrides(PCIE_FILTER_FILE)
-	if err != nil {
-		fatalOperation("Startup failed: cannot read the PCI endpoint filter", err,
-			"fix the permissions on /lpot/pcie_filter.txt or remove it to use automatic classification")
-	}
-	kept, skipped := filterEndpoints(bdfs, overrides)
-	skippedDevicesGlobal = skipped
-	endpointFilterSet = make(map[string]bool, len(kept))
-	for _, bdf := range kept {
-		endpointFilterSet[normalizeBDF(bdf)] = true
-	}
-	fmt.Fprintf(logFp, "%s Endpoint filter: kept %d / %d devices (%d skipped)\n",
-		getCurrentTimestamp(), len(kept), len(bdfs), len(skipped))
-	logFp.Sync()
-	bdfs = kept
-
 	if debugMode {
-		fmt.Printf("DEBUG: Found %d PCI devices (after endpoint filter)\n", len(bdfs))
+		fmt.Printf("DEBUG: Found %d PCI devices (full raw-config set)\n", len(bdfs))
 		for i, bdf := range bdfs {
 			if i < 10 { // Only show first 10 devices
 				fmt.Printf("DEBUG: PCI device %d: %s\n", i+1, bdf)
@@ -1880,11 +2397,53 @@ func main() {
 
 	if stopFlag.Load() {
 		fmt.Fprintf(logFp, "Received stop signal, exiting gracefully.\n")
+		if err := writeResultReportWithStatus(false, "INCOMPLETE"); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: unable to publish incomplete result report: %v\n", err)
+		}
 		return
 	}
 
-	// Auto-scan after driver ready time (if ignore_list.txt doesn't exist)
-	if !fileExists(IGNORE_LIST_FILE) {
+	// Classify only after the driver-ready wait so raw and lspci link evidence
+	// reflects the settled post-boot device state.
+	overrides, err := loadPCIeFilterOverrides(PCIE_FILTER_FILE)
+	if err != nil {
+		fatalOperation("Startup failed: cannot read the optional PCI link filter", err,
+			"fix the permissions on /lpot/pcie_filter.txt or remove it to use automatic classification")
+	}
+	decisions := classifyDevices(bdfs, overrides)
+	_, skipped := filterClassifiedEndpoints(bdfs, decisions)
+	classifiedDevicesGlobal = decisions
+	skippedDevicesGlobal = skipped
+	endpointFilterSet = make(map[string]bool, len(bdfs))
+	for _, bdf := range bdfs {
+		endpointFilterSet[normalizeBDF(bdf)] = true
+	}
+	if err := persistClassificationReport(decisions); err != nil {
+		fatalOperation("Startup failed: cannot write the PCI link-capability report", err,
+			"check /lpot permissions and available disk space")
+	}
+	if err := persistClassificationConfigDumps(decisions); err != nil {
+		fatalOperation("Startup failed: cannot write config dumps", err,
+			"check /lpot/config_dump permissions and PCI sysfs access")
+	}
+	if err := writeClassificationReportToLog(logFp, decisions); err != nil {
+		fatalOperation("Startup failed: cannot publish PCI link classification", err,
+			"fix PCI config-space access and verify the classification baseline file")
+	}
+	logFp.Sync()
+	if report := buildClassificationReport(decisions); report.Unverified > 0 {
+		fatalOperation("Startup failed: PCI link classification is unverified",
+			fmt.Errorf("%d device(s) could not be read", report.Unverified),
+			"fix PCI config-space access and rerun -classify")
+	}
+	fmt.Fprintf(logFp, "%s Link classification: %d / %d link-capable; raw config coverage: %d / %d devices (%d classification skips)\n",
+		getCurrentTimestamp(), len(bdfs)-len(skipped), len(bdfs), len(bdfs), len(bdfs), len(skipped))
+	logFp.Sync()
+
+	// Scan the complete raw-config set. A normal -t run always refreshes the
+	// generated ignore list; -scan remains available as a standalone debugging
+	// mode above.
+	{
 		timestampStr = getCurrentTimestamp()
 		fmt.Fprintf(logFp, "%s Auto-scanning PCI devices to generate ignore bits...\n", timestampStr)
 		logFp.Sync()
@@ -1901,8 +2460,8 @@ func main() {
 	}
 
 	if len(bdfs) == 0 {
-		fatalOperation("Cycle failed: no PCI endpoint devices were found", errors.New("empty endpoint set"),
-			"run -classify to review filtering and check /lpot/pcie_filter.txt")
+		fatalOperation("Cycle failed: no PCIe link-capable devices were found", errors.New("empty link-capable set"),
+			"run -classify to review Link Capabilities and check /lpot/pcie_filter.txt")
 	}
 
 	// Create initial PCI device files if not exist
@@ -1953,7 +2512,24 @@ func main() {
 		timestampStr = getCurrentTimestamp()
 		fmt.Fprintf(logFp, "%s PCI devices check failed\n", timestampStr)
 		fatalOperation("Cycle failed: PCI device comparison failed", err,
-			"review /lpot/reboot.log and verify that pciutils can query every endpoint")
+			"review /lpot/reboot.log and verify that pciutils can query every link-capable device")
+	}
+	if *stopService {
+		noteworthy, configNoise := cycleChangeKind()
+		if noteworthy || configNoise {
+			fmt.Fprintf(logFp, "%s %s-p detected a comparison difference; stopping and disabling future reboot cycles.\n",
+				getCurrentTimestamp(), cycleTag())
+			logFp.Sync()
+			if err := stopAndDisableService(serviceName); err != nil {
+				fatalOperation("Cycle failed: unable to stop test service after -p comparison failure", err,
+					"manually run systemctl stop and systemctl disable lpot.service")
+			}
+			if err := writeResultReportWithStatus(false, "INCOMPLETE"); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: unable to publish incomplete result report: %v\n", err)
+			}
+			generateFinalSummary()
+			return
+		}
 	}
 
 	// Clean up tmp directory files
@@ -1977,18 +2553,25 @@ func main() {
 		fatalOperation("Cycle failed: cannot write the result checkpoint before reboot wait", err,
 			"check /lpot permissions and available disk space; reboot was not started")
 	}
+	if *testCycles > 0 {
+		reached, err := fixedCycleLimitReached(rebootCount)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: unable to evaluate -tm cycle limit: %v\n", err)
+		} else if reached {
+			fmt.Fprintf(logFp, "%s -tm reboot limit reached; reboot not started.\n", getCurrentTimestamp())
+			logFp.Sync()
+			generateFinalSummary()
+			disableFixedCycleService()
+			return
+		}
+	}
 
 	// Prepare for reboot. The wait is interruptible so SIGINT/SIGTERM does not
 	// force the operator to sit through the full waitSeconds (up to 3600).
 	timestampStr = getCurrentTimestamp()
 	fmt.Fprintf(logFp, "%s Wait %d seconds for reboot SUT. \n", timestampStr, *waitSeconds)
 	logFp.Sync()
-	if !monitorRebootWait(rootCtx, time.Duration(*waitSeconds)*time.Second, bdfs, logFp, *stopService) {
-		if *stopService && !stopFlag.Load() {
-			fmt.Fprintf(logFp, "%s [Cycle %d] Reboot skipped because -p stopped the reboot wait after a PCI change.\n",
-				getCurrentTimestamp(), currentCycle.Load())
-			logFp.Sync()
-		}
+	if !sleepInterruptible(rootCtx, time.Duration(*waitSeconds)*time.Second) {
 		if err := writeResultReportWithStatus(false, "INCOMPLETE"); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: unable to publish incomplete result report: %v\n", err)
 		}
@@ -2147,6 +2730,9 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 
 		// Compare each device using lpotscan logic
 		for _, bdf := range bdfs {
+			if ignoreSet[normalizeBDF(bdf)] {
+				continue
+			}
 			initFile := filepath.Join(TMP_DIR, bdf+"_init.txt")
 			currentFile := filepath.Join(TMP_DIR, bdf+".txt")
 
@@ -2182,14 +2768,6 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 			}
 			filterLpotscanErrors(LPOTSCAN_LOG, logFile)
 			logFile.Sync()
-			if stopService {
-				fmt.Fprintf(logFile, "%s %sYou setting -p parameter, I will stop reboot test.\n", timeStr, cycleTag())
-				logFile.Sync()
-				if debugMode {
-					fmt.Printf("DEBUG: Stop service flag is set, exiting due to device changes\n")
-				}
-				os.Exit(1)
-			}
 		} else {
 			// "No devices changed" is repeated every cycle; collapse
 			// consecutive clean cycles into a single line with a running
@@ -2354,20 +2932,10 @@ func detectVolatileBytesWithSamples() (map[string]DeviceIgnoreBits, []map[string
 			continue
 		}
 
-		// USB controllers, bridges, and legacy/non-endpoint devices are not part
-		// of the external PCIe test set. Record them as whole-device ignores so
-		// -scan produces the reusable ignore_list.txt requested by the operator.
-		if info, ok := readPCIDeviceInfo(busID); ok {
-			if endpoint, reason := isPCIeEndpoint(info); !endpoint {
-				ignoreBits[busID] = DeviceIgnoreBits{
-					BusID:        busID,
-					IgnoreBytes:  make(map[int]bool),
-					IgnoreDevice: true,
-				}
-				fmt.Printf("Device %s: %s, ignoring entire device\n", busID, reason)
-				continue
-			}
-		}
+		// Do not ignore a device because PCIe capability decoding failed or
+		// produced an unexpected value. Raw config samples are still useful for
+		// finding changed byte offsets, and lspci can report a separate mismatch
+		// during link classification.
 
 		// Check if it's a USB Controller. Keep this explicit classification in
 		// the record for readable diagnostics even though IgnoreDevice is the
@@ -2550,7 +3118,7 @@ func savePCIConfig(outputFile string) error {
 	var buffer bytes.Buffer
 	for _, file := range files {
 		busID := file.Name()
-		// Skip bridges / legacy PCI when an endpoint filter is active so the
+		// Skip devices without comparable Link Capabilities when a link filter is active so the
 		// initial snapshot (and every cycle's stable snapshot) contains only
 		// the BDFs the rest of the pipeline cares about. When the filter is
 		// nil this is a no-op.
@@ -2683,8 +3251,7 @@ func saveIgnoreBits(filePath string, ignoreBits map[string]DeviceIgnoreBits) err
 	for _, busID := range busIDs {
 		device := normalised[busID]
 
-		// Whole-device ignores include USB controllers, bridges, and other
-		// non-endpoint devices.
+		// Whole-device ignores currently include USB controllers only.
 		if device.IgnoreDevice || device.IsUSBController {
 			buffer.WriteString(busID + "\n")
 		} else if len(device.IgnoreBytes) > 0 {
@@ -3174,12 +3741,12 @@ func loadIgnoreList(filePath string) (map[string]bool, error) {
 
 // compareDeviceFiles compares two device files using lspci logic
 func compareDeviceFiles(filePath1, filePath2 string, ignoreSet map[string]bool, stopServiceEnabled bool) ComparisonResult {
-	device1, err := parseDeviceFile(filePath1, ignoreSet)
+	device1, err := parseDeviceFile(filePath1)
 	if err != nil {
 		return ComparisonResult{Error: err}
 	}
 
-	device2, err := parseDeviceFile(filePath2, ignoreSet)
+	device2, err := parseDeviceFile(filePath2)
 	if err != nil {
 		return ComparisonResult{Error: err}
 	}
@@ -3189,12 +3756,15 @@ func compareDeviceFiles(filePath1, filePath2 string, ignoreSet map[string]bool, 
 			Error: fmt.Errorf("device IDs do not match: %s vs %s", device1.DeviceID, device2.DeviceID),
 		}
 	}
+	if ignoreSet[normalizeBDF(device1.DeviceID)] {
+		return ComparisonResult{ScannedDeviceIDs: []string{device1.DeviceID}}
+	}
 
 	return compareDevices(device1, device2, stopServiceEnabled)
 }
 
 // parseDeviceFile reads and parses a device file containing lspci output
-func parseDeviceFile(filePath string, ignoreSet map[string]bool) (Device, error) {
+func parseDeviceFile(filePath string) (Device, error) {
 	var currentDevice Device
 	currentDevice.Capabilities.DevLnkFields = make(map[string]string)
 
@@ -3208,11 +3778,21 @@ func parseDeviceFile(filePath string, ignoreSet map[string]bool) (Device, error)
 	inCapabilities := false
 	var currentFieldName string
 	var currentFieldValue strings.Builder
+	currentFieldIndent := -1
 	isDevLnk := false
+	finishField := func() {
+		if currentFieldName != "" && currentFieldValue.Len() > 0 {
+			currentDevice.Capabilities.DevLnkFields[currentFieldName] = strings.TrimSpace(currentFieldValue.String())
+		}
+		currentFieldName = ""
+		currentFieldValue.Reset()
+		currentFieldIndent = -1
+	}
 
 	for scanner.Scan() {
 		rawLine := scanner.Text()
 		line := strings.TrimSpace(rawLine)
+		indent := leadingWhitespace(rawLine)
 
 		// Extract device ID from the first line
 		if currentDevice.DeviceID == "" && len(line) >= 7 {
@@ -3226,11 +3806,6 @@ func parseDeviceFile(filePath string, ignoreSet map[string]bool) (Device, error)
 			remainingDesc := ""
 			if len(fields) > 0 {
 				remainingDesc = strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
-			}
-
-			// Check if this device should be ignored
-			if ignoreSet[normalizeBDF(currentDevice.DeviceID)] {
-				return currentDevice, fmt.Errorf("device %s is in ignore list", currentDevice.DeviceID)
 			}
 
 			// Skip virtual USB devices
@@ -3247,62 +3822,73 @@ func parseDeviceFile(filePath string, ignoreSet map[string]bool) (Device, error)
 		}
 
 		if inCapabilities {
-			// Process Dev/Lnk fields
-			if (strings.HasPrefix(line, "Dev") || strings.HasPrefix(line, "Lnk")) && !strings.HasPrefix(line, "Device") {
+			if len(line) == 0 {
+				finishField()
+				continue
+			}
+			if strings.HasPrefix(line, "Capabilities") && isDevLnk {
+				finishField()
+				break
+			}
+
+			isDevLnkField := (strings.HasPrefix(line, "Dev") || strings.HasPrefix(line, "Lnk")) && !strings.HasPrefix(line, "Device")
+			if isDevLnkField && indent <= currentFieldIndent {
+				finishField()
+			}
+			if isDevLnkField && (currentFieldName == "" || indent <= currentFieldIndent) {
 				isDevLnk = true
-
-				// Save previous field if exists
-				if currentFieldName != "" && currentFieldValue.Len() > 0 {
-					currentDevice.Capabilities.DevLnkFields[currentFieldName] = strings.TrimSpace(currentFieldValue.String())
-					currentFieldValue.Reset()
+				colonIndex := strings.Index(line, ":")
+				if colonIndex == -1 {
+					continue
 				}
-
-				// Parse new field
-				if colonIndex := strings.Index(line, ":"); colonIndex != -1 {
-					currentFieldName = strings.TrimSpace(line[:colonIndex])
+				fieldName := strings.TrimSpace(line[:colonIndex])
+				if isComparedLspciField(fieldName) {
+					currentFieldName = fieldName
+					currentFieldIndent = indent
 					currentFieldValue.WriteString(strings.TrimSpace(line[colonIndex+1:]))
 				}
 				continue
 			}
 
-			// Handle continuation lines (indented with tab)
-			if strings.HasPrefix(rawLine, "\t") && currentFieldName != "" {
-				currentFieldValue.WriteString(" " + strings.TrimSpace(rawLine))
-				continue
-			}
-
-			// Handle empty lines - finalize current field
-			if len(line) == 0 && currentFieldName != "" {
-				if currentFieldValue.Len() > 0 {
-					currentDevice.Capabilities.DevLnkFields[currentFieldName] = strings.TrimSpace(currentFieldValue.String())
-					currentFieldValue.Reset()
-				}
-				currentFieldName = ""
-				continue
-			}
-
-			// Break if another Capabilities section is found after Dev/Lnk fields
-			if strings.HasPrefix(line, "Capabilities") && isDevLnk {
-				break
-			}
-
-			// Append to current field value if we have an active field
-			if currentFieldName != "" {
+			// Any deeper-indented line is a continuation, even when its text
+			// contains colons (for example AtomicOpsCap: or Transmit Margin:).
+			if currentFieldName != "" && indent > currentFieldIndent {
 				currentFieldValue.WriteString(" " + line)
+				continue
 			}
+			finishField()
 		}
 	}
 
 	// Save the last field if exists
-	if currentFieldName != "" && currentFieldValue.Len() > 0 {
-		currentDevice.Capabilities.DevLnkFields[currentFieldName] = strings.TrimSpace(currentFieldValue.String())
-	}
+	finishField()
 
 	if err := scanner.Err(); err != nil {
 		return currentDevice, fmt.Errorf("error reading file %s: %w", filePath, err)
 	}
 
 	return currentDevice, nil
+}
+
+func leadingWhitespace(line string) int {
+	count := 0
+	for _, r := range line {
+		if r != ' ' && r != '\t' {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+func isComparedLspciField(field string) bool {
+	switch field {
+	case "DevCap", "DevCtl", "DevSta", "LnkCap", "LnkCtl", "LnkSta",
+		"DevCap2", "DevCtl2", "LnkCtl2", "LnkSta2":
+		return true
+	default:
+		return false
+	}
 }
 
 // compareDevices compares two devices and returns the comparison result
@@ -3321,21 +3907,36 @@ func compareDevices(device1, device2 Device, stopServiceEnabled bool) Comparison
 	defer logFile.Close()
 	logger := log.New(logFile, "", log.LstdFlags)
 
-	// Compare device capabilities
-	for key, value1 := range device1.Capabilities.DevLnkFields {
-		value2, exists := device2.Capabilities.DevLnkFields[key]
-		if !exists || value1 == value2 {
+	// Compare the union of both snapshots. A missing Dev/Lnk field is itself a
+	// change; silently skipping it would hide a disappeared LnkCap or LnkSta.
+	keys := make(map[string]bool, len(device1.Capabilities.DevLnkFields)+len(device2.Capabilities.DevLnkFields))
+	for key := range device1.Capabilities.DevLnkFields {
+		keys[key] = true
+	}
+	for key := range device2.Capabilities.DevLnkFields {
+		keys[key] = true
+	}
+	orderedKeys := make([]string, 0, len(keys))
+	for key := range keys {
+		orderedKeys = append(orderedKeys, key)
+	}
+	sort.Strings(orderedKeys)
+	for _, key := range orderedKeys {
+		value1, exists1 := device1.Capabilities.DevLnkFields[key]
+		value2, exists2 := device2.Capabilities.DevLnkFields[key]
+		if exists1 && exists2 && value1 == value2 {
 			continue
+		}
+		if !exists1 {
+			value1 = "<missing>"
+		}
+		if !exists2 {
+			value2 = "<missing>"
 		}
 
 		result.HasDifferences = true
-		logEntry := fmt.Sprintf("%s %s| %s | %s\nBefore: %s\nAfter: %s\n",
-			logTimestamp(), cycleTag(), device1.DeviceID, key, value1, value2)
-
-		// Add detailed differences
-		if differences := findDifferences(value1, value2); differences != "" {
-			logEntry += fmt.Sprintf("\tDifferences: %s\n", differences)
-		}
+		logEntry := fmt.Sprintf("%s %s| %s | %s changed\n",
+			logTimestamp(), cycleTag(), device1.DeviceID, key)
 
 		// Track statistics
 		deviceChangeStats[device1.DeviceID]++
@@ -3345,13 +3946,6 @@ func compareDevices(device1, device2 Device, stopServiceEnabled bool) Comparison
 		logger.Println(logEntry)
 		fmt.Print(logEntry)
 
-		// Stop service if enabled and no previous error
-		if stopServiceEnabled && result.Error == nil {
-			if err := stopService(serviceName); err != nil {
-				result.Error = fmt.Errorf("failed to stop service: %w", err)
-				logger.Printf("Service stop error: %v\n", result.Error)
-			}
-		}
 	}
 
 	return result
@@ -3403,10 +3997,13 @@ func findDifferences(value1, value2 string) string {
 }
 
 // stopService stops a systemd service
-func stopService(serviceName string) error {
+func stopAndDisableService(serviceName string) error {
 	output, err := runExternal(systemctlTimeout, systemctlPath, "stop", serviceName)
 	if err != nil {
 		return fmt.Errorf("failed to stop service %s: %w, output: %s", serviceName, err, string(output))
+	}
+	if _, err := runExternal(systemctlTimeout, systemctlPath, "disable", serviceName); err != nil {
+		return fmt.Errorf("failed to disable service %s: %w", serviceName, err)
 	}
 	fmt.Printf("Service %s stopped successfully\n", serviceName)
 	return nil
@@ -3425,8 +4022,6 @@ func filterLpotscanErrors(errorLogPath string, logFp *os.File) {
 	defer errorLog.Close()
 
 	scanner := bufio.NewScanner(errorLog)
-	writeLine := false
-
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -3435,17 +4030,63 @@ func filterLpotscanErrors(errorLogPath string, logFp *os.File) {
 			continue
 		}
 
-		// Lines with '|' symbol represent device change information
-		if strings.Contains(line, "|") {
+		// Preserve every approved Dev/Lnk change, including invalid raw values
+		// and mismatch details. Do not discard a record merely because its raw
+		// width/speed decode looks invalid.
+		if isCompactLpotscanChange(line) || strings.Contains(line, "raw/lspci mismatch") {
 			fmt.Fprintln(logFp, line)
-			writeLine = true
-		} else if writeLine {
-			// If we previously output a BDF info line, allow continuing to output change content
-			if strings.Contains(line, "Before") || strings.Contains(line, "After") || strings.Contains(line, "Differences") {
-				fmt.Fprintln(logFp, line)
-			}
 		}
 	}
+}
+
+func isCompactLpotscanChange(line string) bool {
+	parts := strings.Split(line, " | ")
+	if len(parts) < 3 {
+		return false
+	}
+	field := strings.TrimSpace(strings.TrimSuffix(parts[len(parts)-1], " changed"))
+	return isComparedLspciField(field)
+}
+
+func compactLegacyRebootLog(path string) error {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var kept []string
+	changed := false
+	skipVerboseBlock := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "----- BASELINE/PREVIOUS -----") {
+			skipVerboseBlock = true
+			changed = true
+			continue
+		}
+		if skipVerboseBlock {
+			if strings.HasPrefix(trimmed, "=====") {
+				skipVerboseBlock = false
+				kept = append(kept, line)
+				continue
+			}
+			if strings.HasPrefix(trimmed, "----- DIFF -----") {
+				skipVerboseBlock = false
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Before:") || strings.HasPrefix(trimmed, "After:") || strings.HasPrefix(trimmed, "Differences:") {
+			changed = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if !changed {
+		return nil
+	}
+	return writeFileNoFollow(path, []byte(strings.Join(kept, "\n")), 0644)
 }
 
 // writeAffectedCyclesSection emits a deduplicated per-cycle breakdown of every
@@ -3496,30 +4137,26 @@ func writeAffectedCyclesSection(logFile *os.File) {
 	fmt.Fprintf(logFile, "  Total affected cycles: %d\n", len(order))
 }
 
-// writeFilteredDevicesSection prints the BDFs that the endpoint filter excluded
-// from the run, with vendor/device IDs and the reason. It is intentionally
-// terse (one device per line) so even a 200-device system fits on one screen.
-// When the filter was inactive (e.g. legacy callers) or every device was kept,
-// the section is suppressed entirely so it doesn't add noise to clean runs.
+// writeFilteredDevicesSection prints the compact link-classification evidence
+// used to decide which devices entered both comparison paths.
 func writeFilteredDevicesSection(logFile *os.File) {
-	if len(skippedDevicesGlobal) == 0 {
+	report := buildClassificationReport(classifiedDevicesGlobal)
+	if report.Total == 0 {
 		return
 	}
-	fmt.Fprintf(logFile, "\nFiltered Devices (excluded by endpoint classifier / pcie_filter.txt):\n")
-	// classifyDevices already sorts by BDF, but copy + re-sort defensively
-	// so the section is deterministic even if a caller mutated the slice.
-	snap := make([]deviceClassification, len(skippedDevicesGlobal))
-	copy(snap, skippedDevicesGlobal)
-	sort.Slice(snap, func(i, j int) bool { return snap[i].BDF < snap[j].BDF })
-	for _, d := range snap {
-		ven, dev := "----", "----"
-		if d.InfoOK {
-			ven = fmt.Sprintf("%04x", d.Info.Vendor)
-			dev = fmt.Sprintf("%04x", d.Info.Device)
-		}
-		fmt.Fprintf(logFile, "  %-12s %s:%s  %s\n", d.BDF, ven, dev, d.SkipReason)
+	fmt.Fprintf(logFile, "\nLink Classification: %s (KEEP %d, SKIP %d, UNVERIFIED %d / %d)\n",
+		report.Status, report.Kept, report.Skipped, report.Unverified, report.Total)
+	for _, d := range report.Devices {
+		fmt.Fprintf(logFile, "  %-12s %-12s cap=%-12s LnkCap=%-16s LnkSta=%-16s %s\n",
+			d.BDF, d.Decision, d.PCIeCap, d.LinkCap, d.LinkStatus, d.Reason)
 	}
-	fmt.Fprintf(logFile, "  Total filtered: %d device(s)\n", len(snap))
+}
+
+func stabilityMessage(name string, changes int) string {
+	if changes == 0 {
+		return fmt.Sprintf("%s stable", name)
+	}
+	return fmt.Sprintf("%s changed in %d cycle(s)", name, changes)
 }
 
 func buildResultReport(checkpoint bool, statusOverride string) resultReport {
@@ -3528,13 +4165,14 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 	cyclesWithChanges := 0
 	topologyChanges := 0
 	lspciChanges := 0
-	rebootWaitChanges := 0
 	cycles := make(map[int]*resultCycle)
+	completedCycles := make(map[int]bool)
 	var cycleOrder []int
 	allLogData, _ := os.ReadFile(REBOOT_LOG)
-	data := latestTestSession(allLogData)
+	// Every Start to test marker belongs to a reboot cycle. The report must
+	// account for the complete run instead of trimming to the last cycle.
+	data := allLogData
 	current := 0
-	var pendingMonitor *resultProblem
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" {
@@ -3562,6 +4200,7 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 			}
 		}
 		if strings.Contains(line, "===== Cycle") && strings.Contains(line, " END (") {
+			completedCycles[current] = true
 			cycle.FinishedAt = lineTimestamp(line)
 			if strings.Contains(line, "changes detected") {
 				cycle.Status = "FAIL"
@@ -3588,16 +4227,6 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 			problem := resultProblem{Severity: "FAIL", Category: "LSPCI", Cycle: current, Timestamp: lineTimestamp(line), Message: "lspci capability changes detected", DetailsLog: LPOTSCAN_LOG}
 			cycle.Events = append(cycle.Events, problem)
 		}
-		if strings.Contains(line, "Event: ") {
-			pendingMonitor = &resultProblem{Severity: "FAIL", Category: "REBOOT_WAIT", Cycle: current, Timestamp: lineTimestamp(line), Message: strings.TrimSpace(strings.TrimPrefix(line, "Event: ")), DetailsLog: REBOOT_LOG}
-		}
-		if strings.HasPrefix(line, "BDF: ") && pendingMonitor != nil {
-			pendingMonitor.BDF = strings.TrimSpace(strings.TrimPrefix(line, "BDF: "))
-			cycle.Events = append(cycle.Events, *pendingMonitor)
-			rebootWaitChanges++
-			cycle.Status = "FAIL"
-			pendingMonitor = nil
-		}
 	}
 	for _, cycle := range cycles {
 		totalCycles++
@@ -3613,26 +4242,33 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 	}
 
 	configChanges := parseConfigResultChanges()
-	counts := make(map[string]int)
+	cycleSets := make(map[string]map[int]struct{})
 	for _, change := range configChanges {
-		counts[change.device+"\x00"+change.offset]++
+		key := change.device + "\x00" + change.offset
+		if cycleSets[key] == nil {
+			cycleSets[key] = make(map[int]struct{})
+		}
+		cycleSets[key][change.cycle] = struct{}{}
 	}
 	configProblems := make([]resultProblem, 0, len(configChanges))
 	noteworthyConfig := 0
 	benignConfig := 0
+	noteworthyPatterns := make(map[string]bool)
+	benignPatterns := make(map[string]bool)
 	for _, change := range configChanges {
 		ratio := 0.0
-		if totalCycles > 0 {
-			ratio = float64(counts[change.device+"\x00"+change.offset]) / float64(totalCycles)
+		completedCount := len(completedCycles)
+		if completedCount > 0 {
+			ratio = float64(len(cycleSets[change.device+"\x00"+change.offset])) / float64(completedCount)
 		}
 		severity := "INFO"
 		classification := "benign reboot-fixed register reset"
 		if ratio < 0.80 {
-			severity = "FAIL"
+			severity = "NOTICE"
 			classification = "noteworthy config-space change"
-			noteworthyConfig++
+			noteworthyPatterns[change.device+"\x00"+change.offset] = true
 		} else {
-			benignConfig++
+			benignPatterns[change.device+"\x00"+change.offset] = true
 		}
 		problem := resultProblem{
 			Severity: severity, Category: "CONFIG_SPACE", Cycle: change.cycle,
@@ -3642,9 +4278,11 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 		}
 		configProblems = append(configProblems, problem)
 		if cycle := cycles[change.cycle]; cycle != nil {
-			if severity == "FAIL" {
-				cycle.ConfigSpace = "FAIL"
-				cycle.Status = "FAIL"
+			if severity == "NOTICE" {
+				cycle.ConfigSpace = "NOTICE"
+				if cycle.Status == "PASS" {
+					cycle.Status = "NOTICE"
+				}
 			} else if cycle.ConfigSpace == "PASS" {
 				cycle.ConfigSpace = "INFO"
 				if cycle.Status == "PASS" {
@@ -3654,6 +4292,8 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 			cycle.Events = append(cycle.Events, problem)
 		}
 	}
+	noteworthyConfig = len(noteworthyPatterns)
+	benignConfig = len(benignPatterns)
 
 	sort.Ints(cycleOrder)
 	orderedCycles := make([]resultCycle, 0, len(cycleOrder))
@@ -3672,9 +4312,12 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 		if totalCycles == 0 {
 			status = "INCOMPLETE"
 			message = "No completed reboot cycle was recorded"
-		} else if cyclesWithChanges > 0 || noteworthyConfig > 0 {
+		} else if cyclesWithChanges > 0 {
 			status = "FAIL"
 			message = "Noteworthy PCI topology, lspci, or config-space changes were detected"
+		} else if noteworthyConfig > 0 {
+			status = "PASS"
+			message = "PCI topology and lspci capability are stable; config-space notices require review"
 		} else {
 			status = "PASS"
 			message = "PCI topology, lspci capability, and PCI config are stable"
@@ -3684,9 +4327,12 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 		status = statusOverride
 		message = "Test stopped before the planned reboot cycle completed"
 	}
-	completed := len(orderedCycles)
+	completed := 0
 	failed := 0
 	for _, cycle := range orderedCycles {
+		if completedCycles[cycle.Number] {
+			completed++
+		}
 		if cycle.Status == "FAIL" {
 			failed++
 		}
@@ -3700,12 +4346,12 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 		Checkpoint: checkpoint, Message: message, UpdatedAt: time.Now().Format(time.RFC3339),
 		TotalCycles: totalCycles, CompletedCycles: completed,
 		SuccessfulCycles: completed - failed, FailedCycles: failed,
+		Classification: classificationReportFromBaseline(),
 		Checks: resultChecks{
-			Topology:    resultCheck{Status: resultStatus(topologyChanges), ChangedCycles: topologyChanges},
-			LSPCI:       resultCheck{Status: resultStatus(lspciChanges), ChangedCycles: lspciChanges},
-			ConfigSpace: resultCheck{Status: resultStatus(noteworthyConfig), Noteworthy: noteworthyConfig},
-			ConfigNoise: resultCheck{Status: resultInfoStatus(benignConfig), BenignChanges: benignConfig},
-			RebootWait:  resultCheck{Status: resultStatus(rebootWaitChanges), ChangedCycles: rebootWaitChanges},
+			Topology:    resultCheck{Status: resultStatus(topologyChanges), ChangedCycles: topologyChanges, Message: stabilityMessage("topology", topologyChanges)},
+			LSPCI:       resultCheck{Status: resultStatus(lspciChanges), ChangedCycles: lspciChanges, Message: stabilityMessage("Dev/Lnk", lspciChanges)},
+			ConfigSpace: resultCheck{Status: configSpaceResultStatus(noteworthyConfig), Noteworthy: noteworthyConfig, Message: configSpaceStabilityMessage(noteworthyConfig)},
+			ConfigNoise: resultCheck{Status: resultInfoStatus(benignConfig), BenignChanges: benignConfig, Message: fmt.Sprintf("%d recurring benign register change(s)", benignConfig)},
 		},
 		Cycles: orderedCycles, Problems: problems,
 		Artifacts: map[string]string{"result": RESULT_FILE, "summary": REBOOT_LOG, "lspci": LPOTSCAN_LOG, "config_space": CONFIG_CHANGES_LOG},
@@ -3717,6 +4363,53 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 		result.FinishedAt = time.Now().Format(time.RFC3339)
 	}
 	return result
+}
+
+func configSpaceResultStatus(notices int) string {
+	if notices > 0 {
+		return "NOTICE"
+	}
+	return "PASS"
+}
+
+func configSpaceStabilityMessage(notices int) string {
+	if notices > 0 {
+		return fmt.Sprintf("raw config has %d notice pattern(s) requiring review", notices)
+	}
+	return "raw config stable"
+}
+
+func classificationReportFromBaseline() classificationReport {
+	data, err := os.ReadFile(CLASSIFY_STATE_FILE)
+	if err != nil {
+		return classificationReport{Status: "UNVERIFIED"}
+	}
+	var snapshot classificationSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil || len(snapshot.Devices) == 0 {
+		return classificationReport{Status: "UNVERIFIED"}
+	}
+	report := classificationReport{Status: "PASS", Total: len(snapshot.Devices)}
+	for _, encoded := range snapshot.Devices {
+		var device classificationDevice
+		if err := json.Unmarshal([]byte(encoded), &device); err != nil {
+			report.Status = "UNVERIFIED"
+			report.Unverified++
+			continue
+		}
+		report.Devices = append(report.Devices, device)
+		switch device.Decision {
+		case "KEEP":
+			report.Kept++
+		case "SKIP":
+			report.Skipped++
+		}
+		if device.Verification != "VERIFIED" {
+			report.Unverified++
+			report.Status = "UNVERIFIED"
+		}
+	}
+	sort.Slice(report.Devices, func(i, j int) bool { return report.Devices[i].BDF < report.Devices[j].BDF })
+	return report
 }
 
 func writeResultReportWithStatus(checkpoint bool, statusOverride string) error {
@@ -3769,21 +4462,31 @@ const dashboardHTML = `<!doctype html>
 main { max-width:1280px; margin:0 auto; padding:28px 20px 60px; } h1,h2 { margin:0; } h1 { font-size:28px; letter-spacing:.02em; } h2 { font-size:16px; margin-bottom:14px; }
 .sub { color:var(--muted); margin:4px 0 24px; } .hero,.panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:20px; }
 .hero { display:flex; align-items:center; justify-content:space-between; gap:20px; margin-bottom:18px; } .status { font-size:30px; font-weight:800; letter-spacing:.06em; }
-.PASS { color:var(--green); } .FAIL { color:var(--red); } .INFO,.RUNNING { color:var(--yellow); } .INCOMPLETE { color:var(--blue); }
+ .PASS,.KEEP { color:var(--green); } .FAIL,.UNVERIFIED { color:var(--red); } .INFO,.NOTICE,.RUNNING { color:var(--yellow); } .INCOMPLETE,.SKIP { color:var(--blue); }
 .reason { color:var(--muted); text-align:right; max-width:560px; } .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:18px; }
 .metric { background:#121a24; border:1px solid var(--line); border-radius:10px; padding:14px; } .metric b { display:block; font-size:22px; } .metric span { color:var(--muted); }
 .columns { display:grid; grid-template-columns:1fr 1.35fr; gap:18px; margin-bottom:18px; } .check { display:flex; justify-content:space-between; border-bottom:1px solid var(--line); padding:10px 0; } .check:last-child { border:0; }
-.table-wrap { overflow:auto; } table { border-collapse:collapse; width:100%; min-width:680px; } th,td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; } th { color:var(--muted); font-weight:600; }
-select { background:#121a24; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:7px 10px; margin-bottom:10px; } .empty { color:var(--muted); padding:12px 0; }
+ .table-wrap { overflow:auto; } table { border-collapse:collapse; width:100%; min-width:680px; } th,td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; } th { color:var(--muted); font-weight:600; }
+ select { background:#121a24; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:7px 10px; margin-bottom:10px; } .empty { color:var(--muted); padding:12px 0; }
+ .help-button { float:right; width:28px; height:28px; border:1px solid var(--blue); border-radius:50%; background:transparent; color:var(--blue); font-weight:800; cursor:pointer; }
+ .help-backdrop { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; padding:20px; background:rgba(0,0,0,.7); z-index:10; }
+ .help-backdrop[hidden] { display:none; }
+ .help-dialog { max-width:680px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:22px; box-shadow:0 18px 60px rgba(0,0,0,.45); }
+ .help-dialog h2 { margin-bottom:12px; } .help-dialog p { color:var(--muted); } .help-dialog code { color:var(--text); }
+ .help-close { float:right; border:0; background:transparent; color:var(--muted); font-size:20px; cursor:pointer; }
+ .config-button { display:inline-block; padding:4px 8px; border:1px solid var(--blue); border-radius:5px; color:var(--blue); text-decoration:none; white-space:nowrap; }
+ .config-button.disabled { border-color:var(--line); color:var(--muted); opacity:.55; cursor:not-allowed; }
 a { color:var(--blue); } code { color:#cbd8e8; } @media (max-width:800px) { .hero { display:block; } .reason { text-align:left; margin-top:10px; } .grid { grid-template-columns:repeat(2,1fr); } .columns { grid-template-columns:1fr; } }
 </style></head>
 <body><main>
 <div class="hero"><div><h1>LPOT PCIe Stability Test</h1><div class="sub" id="run">Loading result...</div></div><div class="status" id="status">...</div><div class="reason" id="reason"></div></div>
 <div class="grid" id="metrics"></div>
 <div class="columns"><section class="panel"><h2>Checks</h2><div id="checks"></div></section><section class="panel"><h2>Run Information</h2><div id="info"></div></section></div>
-<section class="panel" style="margin-bottom:18px"><h2>Problems and Events</h2><select id="severity"><option value="ALL">All severities</option><option value="FAIL">FAIL only</option><option value="INFO">INFO only</option></select><div class="table-wrap" id="problems"></div></section>
+<section class="panel" style="margin-bottom:18px"><h2>PCIe Link Evidence <button class="help-button" id="linkHelp" title="Explain PCIe link fields">?</button></h2><div class="sub">Source: sysfs raw PCI configuration space. lspci capability comparison is shown separately in Checks.</div><div class="table-wrap" id="classificationDevices"></div></section>
+ <section class="panel" style="margin-bottom:18px"><h2>Problems and Events</h2><select id="severity"><option value="ALL">All severities</option><option value="FAIL">FAIL only</option><option value="NOTICE">NOTICE only</option><option value="INFO">INFO only</option></select><div class="table-wrap" id="problems"></div></section>
 <section class="panel" style="margin-bottom:18px"><h2>Artifacts</h2><div id="artifacts"></div></section>
 <section class="panel"><h2>Cycle Timeline</h2><div class="table-wrap" id="cycles"></div></section>
+<div class="help-backdrop" id="linkHelpDialog" hidden><div class="help-dialog" role="dialog" aria-modal="true" aria-labelledby="linkHelpTitle"><button type="button" class="help-close" id="linkHelpClose" aria-label="Close" onclick="document.getElementById('linkHelpDialog').hidden=true; return false;">x</button><h2 id="linkHelpTitle">PCIe Link Field Guide</h2><p><b>PCIe Cap</b> means the PCI Express capability was found in the raw PCI configuration space. The value is the capability offset, not a speed or bandwidth.</p><p><b>LnkCap (Max)</b> is the link capability advertised by the device: the maximum supported link speed and width, such as <code>16GT/s x16</code>.</p><p><b>LnkSta (Current)</b> is the currently negotiated link speed and width, such as <code>8GT/s x8</code>. <code>NO LINK</code> means no active width or speed was reported. An invalid width code is not treated as a usable link.</p><p>The table values come from sysfs raw PCI configuration bytes. The lspci check separately compares the selected <code>Dev*</code> and <code>Lnk*</code> capability fields.</p></div></div>
 </main><script>
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const badge = s => '<b class="'+esc(s)+'">'+esc(s)+'</b>';
@@ -3792,15 +4495,18 @@ function render(d) {
   document.getElementById('reason').textContent=d.message||'';
   document.getElementById('run').textContent='Run '+(d.run_id||'unknown')+' | Updated '+(d.updated_at||'unknown');
   document.getElementById('metrics').innerHTML=[['Total cycles',d.total_cycles],['Completed',d.completed_cycles],['Successful',d.successful_cycles],['Failed',d.failed_cycles]].map(x=>'<div class="metric"><b>'+esc(x[1])+'</b><span>'+x[0]+'</span></div>').join('');
-  const checks=[['Topology',d.checks?.topology],['lspci',d.checks?.lspci],['Config space',d.checks?.config_space],['Config noise',d.checks?.config_noise],['Reboot wait',d.checks?.reboot_wait]];
-  document.getElementById('checks').innerHTML=checks.map(x=>'<div class="check"><span>'+x[0]+'</span>'+badge(x[1]?.status||'UNKNOWN')+'</div>').join('');
+  const checks=[['Topology',d.checks?.topology],['lspci',d.checks?.lspci],['Config space',d.checks?.config_space],['Config noise',d.checks?.config_noise]];
+  document.getElementById('checks').innerHTML=checks.map(x=>'<div class="check"><span>'+x[0]+'<small style="display:block;color:var(--muted)">'+esc(x[1]?.message||'')+'</small></span>'+badge(x[1]?.status||'UNKNOWN')+'</div>').join('');
   document.getElementById('info').innerHTML='<div class="check"><span>Started</span><code>'+esc(d.started_at||'-')+'</code></div><div class="check"><span>Finished</span><code>'+esc(d.finished_at||'-')+'</code></div><div class="check"><span>Checkpoint</span><code>'+esc(d.checkpoint)+'</code></div>';
+  const cl=d.classification||{};
+  const devices=cl.devices||[]; document.getElementById('classificationDevices').innerHTML=devices.length?'<table><thead><tr><th>BDF</th><th>Decision</th><th>PCIe Cap</th><th>Raw LnkCap</th><th>Raw LnkSta</th><th>lspci LnkCap</th><th>lspci LnkSta</th><th>Config Space</th><th>Reason</th></tr></thead><tbody>'+devices.map(x=>{const keep=x.decision==='KEEP'; const view=keep?'<a class="config-button" href="/api/config?bdf='+encodeURIComponent(x.bdf)+'" target="_blank" rel="noopener">View</a>':'<span class="config-button disabled" aria-disabled="true">View</span>'; return '<tr><td><code>'+esc(x.bdf)+'</code></td><td>'+badge(x.decision||'UNKNOWN')+'</td><td>'+esc(x.pcie_capability||'-')+'</td><td>'+esc(x.link_capability||'-')+'</td><td>'+esc(x.link_status||'-')+'</td><td>'+esc(x.lspci_link_capability||'-')+'</td><td>'+esc(x.lspci_link_status||'-')+'</td><td>'+view+'</td><td>'+esc(x.reason||x.verification||'-')+'</td></tr>'}).join('')+'</tbody></table>':'<div class="empty">No classification data.</div>';
   const filter=document.getElementById('severity').value; const problems=(d.problems||[]).filter(p=>filter==='ALL'||p.severity===filter);
   document.getElementById('problems').innerHTML=problems.length?'<table><thead><tr><th>Severity</th><th>Category</th><th>Cycle</th><th>Device</th><th>Message</th><th>Log</th></tr></thead><tbody>'+problems.map(p=>'<tr><td>'+badge(p.severity)+'</td><td>'+esc(p.category)+'</td><td>'+esc(p.cycle)+'</td><td>'+esc(p.bdf||'-')+'</td><td>'+esc(p.message)+'</td><td><code>'+esc(p.details_log||'-')+'</code></td></tr>').join('')+'</tbody></table>':'<div class="empty">No matching problems.</div>';
   document.getElementById('artifacts').innerHTML=Object.entries(d.artifacts||{}).map(([name,path])=>'<div class="check"><span>'+esc(name)+'</span><a href="/api/log?name='+encodeURIComponent(name)+'" target="_blank">'+esc(path)+'</a></div>').join('')||'<div class="empty">No artifacts.</div>';
   const cycles=d.cycles||[]; document.getElementById('cycles').innerHTML=cycles.length?'<table><thead><tr><th>Cycle</th><th>Status</th><th>Topology</th><th>lspci</th><th>Config</th><th>Events</th></tr></thead><tbody>'+cycles.slice().reverse().map(c=>'<tr><td>'+String(c.number).padStart(3,'0')+'</td><td>'+badge(c.status)+'</td><td>'+badge(c.topology)+'</td><td>'+badge(c.lspci)+'</td><td>'+badge(c.config_space)+'</td><td>'+esc((c.events||[]).length)+'</td></tr>').join('')+'</tbody></table>':'<div class="empty">No completed cycles.</div>';
 }
 document.getElementById('severity').addEventListener('change',()=>window.current&&render(window.current));
+const linkHelp=document.getElementById('linkHelpDialog'); document.getElementById('linkHelp').addEventListener('click',()=>linkHelp.hidden=false); document.getElementById('linkHelpClose').addEventListener('click',()=>linkHelp.hidden=true); linkHelp.addEventListener('click',e=>{if(e.target===linkHelp)linkHelp.hidden=true}); document.addEventListener('keydown',e=>{if(e.key==='Escape')linkHelp.hidden=true});
 fetch('/api/result',{cache:'no-store'}).then(r=>r.json()).then(d=>{window.current=d;render(d)}).catch(e=>{document.getElementById('reason').textContent='Unable to load /lpot/result.json: '+e});
 </script></body></html>`
 
@@ -3882,6 +4588,23 @@ func generateFinalSummary() {
 	fmt.Fprintf(logFile, "  \n")
 	fmt.Fprintf(logFile, "  Device topology changes: %d cycles\n", actualTopologyChanges)
 	fmt.Fprintf(logFile, "  lspci capability changes: %d cycles\n", actualLspciChanges)
+	classification := classificationReportFromBaseline()
+	rawConfigStatus := "STABLE"
+	if cyclesWithConfigChanges > 0 {
+		rawConfigStatus = "CHANGED"
+	}
+	lspciStatus := "STABLE"
+	if actualLspciChanges > 0 {
+		lspciStatus = "CHANGED"
+	}
+	fmt.Fprintf(logFile, "\nValidation Coverage:\n")
+	fmt.Fprintf(logFile, "  PCIe Link-capable devices: KEEP %d / SKIP %d / UNVERIFIED %d\n",
+		classification.Kept, classification.Skipped, classification.Unverified)
+	fmt.Fprintf(logFile, "  Raw config-space comparison: %s\n", rawConfigStatus)
+	fmt.Fprintf(logFile, "  lspci Dev/Lnk comparison: %s\n", lspciStatus)
+	if classification.Unverified > 0 {
+		fmt.Fprintf(logFile, "  WARNING: classification evidence is incomplete; PASS is not trustworthy\n")
+	}
 
 	if mostAffectedDevice != "" {
 		fmt.Fprintf(logFile, "    - Most affected device: %s (%d changes)\n", mostAffectedDevice, maxDeviceChanges)
@@ -3896,7 +4619,7 @@ func generateFinalSummary() {
 	// investigate without searching the full reboot.log.
 	writeAffectedCyclesSection(logFile)
 
-	// Filtered devices section: lists every BDF the endpoint filter dropped
+	// Link classification section: lists every BDF the link filter dropped
 	// (bridges, legacy PCI, pcie_filter.txt excludes) so the user knows
 	// exactly what the test did NOT cover and why.
 	writeFilteredDevicesSection(logFile)
@@ -3922,8 +4645,8 @@ func generateFinalSummary() {
 			fmt.Fprintf(logFile, "System demonstrated excellent PCI device stability with zero changes across %d reboot cycles.\n", actualTotalCycles)
 		}
 	case actualCyclesWithChanges == 0 && noteworthyConfigChanges:
-		fmt.Fprintf(logFile, "\nTest Result: COMPLETED - REVIEW NOTEWORTHY CHANGES\n")
-		fmt.Fprintf(logFile, "Device topology was stable across %d reboot cycles, but irregular config-space changes were detected (see 'Noteworthy changes' above).\n", actualTotalCycles)
+		fmt.Fprintf(logFile, "\nTest Result: COMPLETED WITH NOTICE\n")
+		fmt.Fprintf(logFile, "Device topology and lspci capability were stable across %d reboot cycles; irregular config-space changes require review (see 'Noteworthy changes' above).\n", actualTotalCycles)
 	default:
 		fmt.Fprintf(logFile, "\nTest Result: COMPLETED - REVIEW NOTEWORTHY CHANGES\n")
 		fmt.Fprintf(logFile, "Device topology and/or capability changes were detected across %d reboot cycles (see 'Affected Cycles' above).\n", actualTotalCycles)

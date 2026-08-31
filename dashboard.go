@@ -75,6 +75,24 @@ func startDashboard() error {
 		}
 		w.Write(data)
 	})
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		path, err := configDumpPath(r.URL.Query().Get("bdf"))
+		if err != nil {
+			http.Error(w, "invalid BDF", http.StatusBadRequest)
+			return
+		}
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write(data)
+	})
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("start dashboard listener: %w", err)
@@ -102,10 +120,13 @@ func startDashboard() error {
 }
 
 func openDashboardBrowser(url string) {
-	for _, path := range []string{"/usr/bin/xdg-open", "/bin/xdg-open"} {
-		if _, err := os.Stat(path); err != nil {
-			continue
+	candidates := []string{"/usr/bin/firefox", "/usr/bin/firefox-esr"}
+	for _, name := range []string{"firefox", "firefox-esr"} {
+		if path, err := exec.LookPath(name); err == nil {
+			candidates = append(candidates, path)
 		}
+	}
+	for _, path := range candidates {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := exec.CommandContext(ctx, path, url).Run()
 		cancel()
@@ -113,5 +134,5 @@ func openDashboardBrowser(url string) {
 			return
 		}
 	}
-	fmt.Fprintln(os.Stderr, "Suggestion: open the dashboard URL manually because xdg-open was unavailable or failed.")
+	fmt.Fprintf(os.Stderr, "Suggestion: open the dashboard URL manually in Firefox: %s\n", url)
 }
