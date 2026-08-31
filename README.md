@@ -193,6 +193,7 @@ Options:
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `-t hours` | Test duration in hours | `12` |
+| `-tm count` | Reboot exactly this many times; `count + 1` cycles are recorded | disabled |
 | `-d seconds` | Driver/device preparation delay | `300` |
 | `-s seconds` | Delay before reboot | `300` |
 | `-p` | Stop when an error is detected | disabled |
@@ -234,6 +235,8 @@ The program stores persistent state under `/lpot`:
 - `reboot.log`: per-cycle events and final summary.
 - `rebootcount`: current reboot-cycle counter.
 - `timestamp`: test expiration timestamp.
+- `tm_target` / `tm_start_count`: `-tm` reboot-limit target and start cycle,
+  written for fixed-count runs and removed when the limit completes.
 - `initial_pci_devices.txt`: initial `lspci` snapshot.
 - `ignore_list.txt`: explicit whole-device ignores for USB controllers plus
   volatile offsets. PCIe capability decode failures do not remove a device

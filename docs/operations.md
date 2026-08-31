@@ -134,6 +134,8 @@ All persistent state is stored under `/lpot`:
 - `reboot.log`: per-cycle events and final summary.
 - `rebootcount`: reboot-cycle counter.
 - `timestamp`: test expiration timestamp.
+- `tm_target` / `tm_start_count`: `-tm` reboot-limit target and start cycle,
+  written for fixed-count runs and removed when the limit completes.
 - `initial_pci_devices.txt`: initial `lspci` snapshot.
 - `ignore_list.txt`: explicit whole-device ignores for USB controllers plus
   volatile configuration offsets. PCIe capability classification is evidence
@@ -169,5 +171,7 @@ reboot wait begins, and again as the final aggregated report when the test
 expires. Writes use a temporary file, `fsync`, and atomic rename so the
 dashboard never intentionally reads a partially written JSON document.
 Its top-level status is `RUNNING` for a checkpoint, `PASS` when the completed
-test has no noteworthy changes, `FAIL` when a noteworthy change is found, and
-`INCOMPLETE` when the test is interrupted or reboot fails.
+test has no noteworthy changes, `NOTICE` when PCI topology and lspci
+capability are stable but a genuinely volatile (non-reboot-fixed) raw
+config-space change requires review, `FAIL` when a noteworthy change is
+found, and `INCOMPLETE` when the test is interrupted or reboot fails.

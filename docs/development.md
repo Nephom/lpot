@@ -33,8 +33,8 @@ The command may be run from the macOS development environment and produces a
 Linux `amd64` executable. The supported runtime target is Linux; macOS is not a
 runtime target. No full unit-test suite is maintained for this system-level
 tool. The required local verification is a successful Linux-target compilation;
-GitHub Actions also runs amd64 Linux `go vet`, formatting, and stripped-binary
-checks.
+GitHub Actions also runs amd64 Linux `go vet`, formatting, and a stripped-binary
+check (ELF x86-64 target verification).
 
 Run `go vet ./...` only when a compatible Go static-analysis environment is
 available. It is not a substitute for the Linux-target build.
