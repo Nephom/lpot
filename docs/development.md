@@ -58,8 +58,23 @@ The result dashboard is intentionally local-only. It reads the atomic
 `/lpot/result.json` checkpoint/final report and fixed diagnostic logs; it is not
 part of the reboot loop and does not perform live PCI polling.
 
-## Issue Tracking
+## Behavioral Contract and Issue Tracking
 
-Behavior changes, security fixes, parser limitations, and future host-manager
-or dashboard work belong in GitHub Issues. Keep this directory focused on
-stable technical documentation rather than maintaining a second change log.
+The test compares every cycle with the immutable first-valid-cycle baseline;
+`-tm n` means exactly n cycles and at most n-1 reboots. Baselines must not be
+rebased after a detected change. Separate current/previous observation state
+may de-duplicate persistent transition messages, but it must not change the
+comparison baseline. A device disappearing and later returning are two
+separate changes; a BDF change is recorded as removal plus addition.
+
+Without `-p`, an unreadable device is recorded as an incomplete observation
+and the reboot cycle continues. With `-p`, the current cycle is recorded and
+future reboots stop. Raw config-space changes with unchanged same-BDF lspci
+capability fields are NOTICE; topology changes and changes to required lspci
+fields are FAIL. The six required fields are `DevCap`, `DevCtl`, `DevSta`,
+`LnkCap`, `LnkCtl`, and `LnkSta`; `*2` fields are optional.
+
+Behavior changes, bugs, security fixes, parser limitations, and future
+host-manager or dashboard work belong in GitHub Issues. Keep this directory
+focused on stable technical documentation rather than maintaining a second
+change log.

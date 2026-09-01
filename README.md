@@ -179,7 +179,7 @@ Options:
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `-t hours` | Test duration in hours | `12` |
-| `-tm count` | Reboot exactly this many times; `count + 1` cycles are recorded | disabled |
+| `-tm count` | Run exactly `count` cycles; at most `count - 1` reboots are started | disabled |
 | `-d seconds` | Driver/device preparation delay | `300` |
 | `-s seconds` | Delay before reboot | `300` |
 | `-p` | Stop when an error is detected | disabled |
@@ -219,8 +219,8 @@ The program stores persistent state under `/lpot`:
 - `reboot.log`: per-cycle events and final summary.
 - `rebootcount`: current reboot-cycle counter.
 - `timestamp`: test expiration timestamp.
-- `tm_target` / `tm_start_count`: `-tm` reboot-limit target and start cycle,
-  written for fixed-count runs and removed when the limit completes.
+- `tm_target` / `tm_start_count`: `-tm` cycle target and start counter,
+  written for fixed-cycle runs and removed when the limit completes.
 - `initial_pci_devices.txt`: initial `lspci` snapshot.
 - `ignore_list.txt`: explicit whole-device ignores for USB controllers plus
   volatile offsets. PCIe capability decode failures do not remove a device
@@ -228,10 +228,10 @@ The program stores persistent state under `/lpot`:
 - `lpotscan.log`: lspci comparison log, one compact `<BDF> | <field> changed |
   before: ... | after: ...` line per changed Dev/Lnk capability field,
   accumulated for the entire run (not truncated between cycles).
-- `pci-config-changes.log`: configuration-space comparison results, diffed
-  against the one-time `/lpot/initial.bin` baseline on every cycle.
-  `initial.bin` is rebased in place whenever a NEW/REMOVED topology event is
-  logged, so the same event is reported once, not every subsequent cycle.
+- `pci-config-changes.log`: configuration-space comparison results, always
+  diffed against the immutable first-valid-cycle `/lpot/initial.bin` baseline.
+  Event de-duplication uses separate current/previous observation state; the
+  original baseline is never rewritten during a test.
 - `config_dump/<bdf>_baseline.txt`: the first-cycle raw PCI configuration
   bytes for each KEEP device, captured once and never overwritten.
 - `config_dump/<bdf>_latest.txt`: the current cycle's raw PCI configuration
@@ -240,9 +240,10 @@ The program stores persistent state under `/lpot`:
   same device.
 - `pci_devices_classify.log`: historical `-classify` reports.
 - `pcie_filter.txt`: optional endpoint overrides.
-- `tmp/`: temporary per-device `lspci` snapshots. `<bdf>_init.txt` is rebased
-  in place whenever a Dev/Lnk field change or topology event is logged for
-  that device, for the same "report once" reason as `initial.bin`.
+- `tmp/`: temporary per-device `lspci` snapshots. `<bdf>_init.txt` is the
+  immutable first-valid-cycle Dev/Lnk baseline and must not be rebased after a
+  change. Separate observation state avoids repeating the same persistent
+  event while retaining comparison against the original baseline.
 - `change_log.jsonl` / `test_stats.json`: whole-run persisted event log and
   counters that back the final summary's "Affected Cycles", "Most affected
   device", and "Most changed field" sections across the brand-new process
@@ -268,8 +269,10 @@ dashboard on the test machine with:
 ```
 
 The dashboard binds only to `127.0.0.1`, opens Firefox when available, and
-shows the overall status, check categories,
-cycle timeline, filtered problems, and links to detailed text logs. The PCIe
+shows the current checkpoint or final overall status, check categories,
+cycle timeline, filtered problems, and links to detailed text logs. A page
+opened during a run shows the latest checkpoint available when it is loaded;
+reload it to see later cycles. The PCIe
 Link Evidence table has a filter toolbar (KEEP devices only / all devices /
 changed devices only, defaulting to KEEP only so a large system doesn't render
 a wall of SKIP rows) and, per KEEP device, separate "Baseline" and "Latest"

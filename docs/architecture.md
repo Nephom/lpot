@@ -30,19 +30,16 @@ Current file boundaries are:
 - `logging.go`: shared `logWarn`/`logWarnFp`/`warnIncompleteReport`
   helpers so warning output shares one prefix and format.
 - `pcie_classify.go`: PCIe endpoint classification (KEEP/SKIP/UNVERIFIED),
-  link-capability decoding, and the classification report/baseline (rebased
-  in place on every classification change so a change is reported exactly
-  once, not every subsequent cycle).
+  link-capability decoding, and the classification report/baseline.
 - `pci_config_scan.go`: raw PCI configuration-space sampling, volatile-byte
-  detection, and `-scan`/config-space comparison, including the
-  `initial.bin` NEW/REMOVED-device baseline rebase.
+  detection, and `-scan`/config-space comparison against a fixed baseline.
 - `lspci_compare.go`: per-device `lspci -vv` text parsing and the selected
-  Dev/Lnk capability-field comparison.
-- `reboot_cycle.go`: per-cycle orchestration (`processPCIDevices`, including
-  its `<bdf>_init.txt` topology/Dev-Lnk baseline rebase), cycle
-  change/noise bookkeeping (persisted to `change_log.jsonl` and
-  `test_stats.json` so a multi-cycle summary survives the brand-new
-  process each reboot cycle runs in), and clean-streak log compaction.
+  Dev/Lnk capability-field comparison against a fixed baseline.
+- `reboot_cycle.go`: per-cycle orchestration (`processPCIDevices`), event
+  transition bookkeeping, cycle change/noise bookkeeping, and clean-streak log
+  compaction. Change/noise bookkeeping is persisted to
+  `change_log.jsonl` and `test_stats.json` so a multi-cycle summary survives
+  the brand-new process each reboot cycle runs in.
 - `summary.go`: the final test summary and PCI config-space summary sections
   appended to `reboot.log`.
 - `result_types.go` / `result_helpers.go`: structured result data model and
@@ -66,10 +63,11 @@ points and are never compiled together).
 ## Startup Flow
 
 1. Flags are parsed before root and Linux-tool checks. An invocation without
-   `-t` only prints help, except for explicit `-r`, `-scan`, `-classify`,
+   `-t` or `-tm` only prints help, except for explicit `-r`, `-scan`, `-classify`,
    or `-ui` modes. `-t` and `-tm` are mutually exclusive run modes (hour-based
-   duration vs. a fixed reboot count); supplying both is rejected before any
-   host mutation begins.
+   duration vs. a fixed cycle count); supplying both is rejected before any
+   host mutation begins. `-tm n` records exactly n cycles and starts at most
+   n-1 reboots.
 2. `main()` requires root for operational modes and creates a cancellable root
    context.
 3. Signal handlers cancel external commands and interrupt waits.
@@ -100,9 +98,10 @@ KEEP set; after the retry limit, an empty set is reported as a startup failure.
 It then samples volatile bytes when needed and compares:
 
 - PCI device topology.
-- The eleven selected PCIe `Dev/Lnk` capability fields (`DevCap`, `DevCtl`,
-  `DevSta`, `LnkCap`, `LnkCtl`, `LnkSta`, `DevCap2`, `DevCtl2`, `LnkCap2`,
-  `LnkCtl2`, `LnkSta2`) from per-device `lspci -vv` output.
+- The six required PCIe `Dev/Lnk` capability fields (`DevCap`, `DevCtl`,
+  `DevSta`, `LnkCap`, `LnkCtl`, `LnkSta`) from per-device `lspci -vv` output;
+  optional `DevCap2`, `DevCtl2`, `LnkCap2`, `LnkCtl2`, and `LnkSta2` are compared
+  when present.
 - PCI configuration-space snapshots with ignored volatile offsets.
 
 The cycle writes a completion banner before the interruptible reboot delay. A
@@ -123,44 +122,34 @@ ID and appends a single `NOTE: device ... may have relocated from ... to ...`
 line; this is a readability aid only and never changes whether `-p` stops the
 service.
 
-## Baseline Rebasing
+## Baseline and Observation State
 
-Every comparison baseline that tracks device *presence* or a *discrete
-capability value* (as opposed to a raw config-space byte's occurrence
-ratio; see below) is rebased in place to the just-logged new state the
-moment a change is reported:
+Every test compares the current cycle with the **immutable first-valid-cycle
+baseline**. The baseline must never be replaced by a changed or missing state:
+otherwise a later cycle would compare against the previous error instead of
+answering whether reboot preserved the original state.
 
-- `processPCIDevices()` rewrites a device's `<bdf>_init.txt` to its current
-  `<bdf>.txt` snapshot whenever a Dev/Lnk field change is logged, and
-  removes/creates `<bdf>_init.txt` whenever a REMOVED/NEW topology event is
-  logged.
-- `compareDeviceConfigs()` folds a NEW device into its in-memory
-  `initialDevices` map (later rewritten to `initial.bin`) and drops a
-  REMOVED device from that same map.
-- `writeClassificationReportToLog()` rewrites `CLASSIFY_STATE_FILE` to the
-  current cycle's classification snapshot whenever any change/removal is
-  logged.
+The three baseline classes are:
 
-This is required, not cosmetic: without it, a device that disappears (or a
-Dev/Lnk field that changes) exactly once would be permanently absent from
-(or different from) its comparison baseline for the rest of the run, so
-every subsequent cycle would rediscover the SAME disappearance/change and
-re-log it, permanently keeping `allUnchanged` false (silently disabling the
-lspci Dev/Lnk comparison for the rest of the run) and pinning the
-cycle-end banner to "changes detected" long after the underlying state had
-actually stabilised.
+- `<bdf>_init.txt`: first-valid-cycle `lspci` Dev/Lnk fields.
+- `initial.bin`: first-valid-cycle raw PCI configuration bytes.
+- `CLASSIFY_STATE_FILE`: first-valid-cycle classification and device presence.
 
-The one deliberate exception is `compareAndLogDeviceChanges()`'s raw
-config-space BYTE-level diff, which stays anchored to the original
-one-time `initial.bin` for the entire run by design:
-`classifyConfigChangeRatio` (shared by `summary.go` and
-`result_helpers.go`) classifies a `(device, offset)` row as benign
-"reboot-fixed" noise specifically because it recurs in
-`>= rebootFixedThreshold` (80%) of ALL completed cycles when compared
-against that fixed baseline — rebasing after the first detected change
-would make that register look "clean" from the very next cycle onward,
-permanently hiding the classic every-boot-reset pattern this ratio-based
-classification exists to surface.
+Event de-duplication is separate from comparison. A persisted current/previous
+observation state may suppress a repeated `present -> absent` event while the
+device remains absent, but it must not alter the immutable baseline or hide the
+fact that the current cycle still differs from it. A later `absent -> present`
+transition is a separate event. A BDF change is recorded as the old BDF
+removed and the new BDF added, even if their vendor/device IDs match.
+
+The six required `lspci` fields are `DevCap`, `DevCtl`, `DevSta`, `LnkCap`,
+`LnkCtl`, and `LnkSta`; they must be present and comparable. The optional `*2`
+fields are compared when present and may be omitted when absent.
+
+When a device cannot be read during a cycle, LPOT records an incomplete
+observation and retries for a bounded period. Without `-p`, the cycle sequence
+continues to the next reboot cycle after recording the failure. With `-p`, the
+current cycle is recorded and future reboots are stopped.
 
 ## Persistence Across Reboots
 

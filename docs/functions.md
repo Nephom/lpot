@@ -11,8 +11,9 @@ by responsibility first so behavior can be verified before introducing
 ## Lifecycle and Signals
 
 - `main` (`cli_main.go`, build tag `!simulate`): validates the host, parses
-  flags — rejecting `-t`/`-tm` used together — initializes state, executes
-  one reboot cycle, and schedules the next cycle through systemd.
+  flags — rejecting `-t`/`-tm` used together and invalid `-tm` counts —
+  initializes state, executes one cycle, and schedules the next cycle through
+  systemd. `-tm n` means n cycles and at most n-1 reboots.
 - `main` (`simulate_main.go`, build tag `simulate`): drives an offline
   10-cycle simulation against a synthetic PCI device model, calling the
   same production comparison/reporting functions `cli_main.go`'s `main`
@@ -79,16 +80,13 @@ by responsibility first so behavior can be verified before introducing
 - `savePCIConfig` / `compareDeviceConfigs`: persist and compare binary PCI
   configuration snapshots.
 - `executeLspci`: captures one device's `lspci -vv` output.
-- `processPCIDevices`: compares topology and per-device text snapshots; opens
-  `lpotscan.log` once per cycle and passes it to `compareDeviceFiles`/
-  `compareDevices` instead of reopening it per device. Rebases each
-  device's `<bdf>_init.txt` baseline in place after logging a Dev/Lnk
-  change or a NEW/REMOVED topology event, so the same event is reported
-  exactly once rather than every subsequent cycle (see `architecture.md`'s
-  "Baseline Rebasing" section).
-- `isComparedLspciField`: the eleven `Dev`/`Lnk` capability field names that
-  are compared (`DevCap`, `DevCtl`, `DevSta`, `LnkCap`, `LnkCtl`, `LnkSta`,
-  `DevCap2`, `DevCtl2`, `LnkCap2`, `LnkCtl2`, `LnkSta2`).
+- `processPCIDevices`: compares topology and per-device text snapshots against
+  immutable first-valid-cycle baselines; opens `lpotscan.log` once per cycle
+  and passes it to `compareDeviceFiles`/`compareDevices`. Separate observation
+  state de-duplicates persistent transitions without changing the baseline.
+- `isComparedLspciField`: the six required `Dev`/`Lnk` capability fields
+  (`DevCap`, `DevCtl`, `DevSta`, `LnkCap`, `LnkCtl`, `LnkSta`) plus optional
+  `*2` fields, which are compared when present.
 - `compareDeviceFiles` / `compareDevices`: apply the ignore list and diff the
   selected `lspci` text fields between an `_init.txt` baseline and the current
   snapshot; each difference is written as one compact `<BDF> | <field>
@@ -103,7 +101,8 @@ by responsibility first so behavior can be verified before introducing
   ID from a saved `_init.txt` dump so `processPCIDevices` can recognise a
   device that disappeared at one BDF and reappeared at another (see
   `architecture.md`).
-- `cleanupBDFFiles`: removes current snapshots while keeping initial baselines.
+- `cleanupBDFFiles`: removes current snapshots while keeping immutable initial
+  baselines and persisted observation state.
 
 ## Reporting
 

@@ -17,9 +17,10 @@ non-root user because it only reads `/lpot/result.json` and the allowlisted
 reports. It does not run PCI scans, modify host policy, install services, or
 reboot.
 
-`-tm n` performs exactly `n` reboots. The initial invocation and the boot after
-the final reboot are also recorded as cycles, so `-tm 2` produces three cycle
-records and two reboots.
+`-tm n` performs exactly `n` cycles. The initial invocation is the first cycle,
+so at most `n - 1` reboots are started; `-tm 2` produces two cycle records and
+one reboot. `-t` continues while its time window remains active; after a reboot,
+it runs another cycle only when the time window has not expired.
 
 ## Requirements
 
@@ -89,7 +90,7 @@ updated binary with `-t` again when installing a new version.
 | `-t hours` | Test duration | `12` |
 | `-d seconds` | Driver/device preparation delay | `300` |
 | `-s seconds` | Delay before reboot | `300` |
-| `-tm count` | Exact number of reboots; `count + 1` cycles are recorded | disabled |
+| `-tm count` | Exact number of cycles; at most `count - 1` reboots are started | disabled |
 | `-p` | Stop after a comparison error | disabled |
 | `-c command ...` | Run the command and all following arguments in the background on every boot; append stdout and stderr to `/lpot/command_user_custom.log` | disabled |
 | `-r` | Stop and remove `lpot.service`, reload systemd, and reset `/lpot` state; root only | off |
@@ -124,8 +125,8 @@ All persistent state is stored under `/lpot`:
 - `reboot.log`: per-cycle events and final summary.
 - `rebootcount`: reboot-cycle counter.
 - `timestamp`: test expiration timestamp.
-- `tm_target` / `tm_start_count`: `-tm` reboot-limit target and start cycle,
-  written for fixed-count runs and removed when the limit completes.
+- `tm_target` / `tm_start_count`: `-tm` cycle target and start counter,
+  written for fixed-cycle runs and removed when the limit completes.
 - `initial_pci_devices.txt`: initial `lspci` snapshot.
 - `ignore_list.txt`: explicit whole-device ignores for USB controllers plus
   volatile configuration offsets. PCIe capability classification is evidence
@@ -136,12 +137,10 @@ All persistent state is stored under `/lpot`:
   bytes for each KEEP device, refreshed every cycle. The dashboard exposes
   both via `/api/config?bdf=..&which=baseline|latest` for manual verification
   and comparison of LnkCap/LnkSta decoding over time.
-- `pci-config-changes.log`: configuration-space comparison results, diffed
-  against the one-time `/lpot/initial.bin` baseline on every cycle. Not
-  truncated between cycles; `initial.bin` itself is rebased (a
-  disappeared/appeared device is removed/added in place) whenever a
-  NEW/REMOVED topology event is logged, so the same event is reported
-  exactly once instead of being rediscovered on every later cycle.
+- `pci-config-changes.log`: configuration-space comparison results, always
+  diffed against the immutable first-valid-cycle `/lpot/initial.bin` baseline.
+  Event de-duplication uses separate current/previous observation state; the
+  original baseline is never rewritten during a test.
 - `pci_devices_classify.log`: classification report history.
 - `lpotscan.log`: lspci comparison log, one compact `<BDF> | <field> changed |
   before: ... | after: ...` line per changed Dev/Lnk capability field,
@@ -149,15 +148,13 @@ All persistent state is stored under `/lpot`:
   truncated between cycles; every line is tagged with `[Cycle N]`).
 - `pcie_filter.txt`: optional endpoint overrides.
 - `tmp/`: temporary per-device `lspci` snapshots. `<bdf>_init.txt` is the
-  per-device Dev/Lnk comparison baseline; it is rebased in place to the
-  current snapshot whenever a genuine field change or topology event
-  (NEW/REMOVED) is logged for that device, for the same "report once, not
-  every cycle" reason as `initial.bin` above.
+  immutable first-valid-cycle Dev/Lnk baseline. Separate observation state
+  prevents repeated transition messages without changing the original
+  comparison baseline.
 - `result.json`: structured cycle checkpoint and final test report.
-- `pci_devices_classify_state.json`: persistent classification snapshot used to
-  report only PCIe classification changes after the first cycle. Rebased to
-  the current snapshot every time a change/removal is logged, so a
-  classification change is likewise reported exactly once.
+- `pci_devices_classify_state.json`: first-valid-cycle classification baseline;
+  it is not rewritten when a classification changes. Separate observation
+  state records present/absent and classification transitions.
 - `change_log.jsonl`: one JSON line per recorded topology/lspci/config-space
   change event, accumulated for the entire run. Because each reboot cycle
   runs in a brand-new process, this file (not an in-memory list) is what lets
@@ -180,11 +177,13 @@ inspection. Reboot controls remain root-only: `/lpot/lpot` and
 reboot wait begins, and again as the final aggregated report when the test
 expires. Writes use a temporary file, `fsync`, and atomic rename so the
 dashboard never intentionally reads a partially written JSON document.
-Its top-level status is `RUNNING` for a checkpoint, `PASS` when the completed
-test has no noteworthy changes, `NOTICE` when PCI topology and lspci
-capability are stable but a genuinely volatile (non-reboot-fixed) raw
-config-space change requires review, `FAIL` when a noteworthy change is
-found, and `INCOMPLETE` when the test is interrupted or reboot fails. Every interrupted,
+Its top-level status is `RUNNING` for a checkpoint, `PASS` only when the
+completed test has no changes, `NOTICE` when raw config-space changed but the
+same-BDF lspci capability fields did not, `FAIL` when topology or required
+lspci capability fields changed, and `INCOMPLETE` when the planned run is
+stopped before completion. A read failure is recorded as an incomplete
+observation; without `-p` the next reboot cycle still proceeds, while `-p`
+stops future reboots after the current cycle is recorded. Every interrupted,
 stop-requested, or failed-reboot exit also appends a final `Test Session Summary`
 to `reboot.log`; the summary is marked `INCOMPLETE` and contains all statistics
 available from the cycles recorded before the interruption.
