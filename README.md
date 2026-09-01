@@ -1,9 +1,6 @@
 # LPOT
 
-LPOT is a Go implementation of a Linux PCIe reboot-stability test tool. It
-combines the original LPOT, `configscan`, and `lpotscan` workflow into one
-executable and is maintained as an integrated version of
-[Nephom/lpot](https://github.com/Nephom/lpot).
+LPOT is a Go implementation of a Linux PCIe reboot-stability test tool. 
 
 The tool records PCI topology, `lspci` output, and PCI configuration-space
 changes across reboot cycles. PCIe link classification is reported as separate
@@ -282,39 +279,11 @@ before the reboot wait starts; the final report is written when the test
 expires. The dashboard does not modify `/lpot`, systemd, security policy, or
 reboot state.
 
-## Offline Simulation (Development Only)
-
-A `simulate`-tagged build exercises the real comparison/reporting pipeline
-(`classifyDevices`, `runConfigScan`, `processPCIDevices`,
-`generateFinalSummary`, `writeResultReport`) against a synthetic 10-cycle
-reboot run, entirely offline — no root, no systemd, no real PCI hardware,
-and no actual reboot:
-
-```bash
-go build -tags simulate -o /tmp/lpot-sim .
-/tmp/lpot-sim -out ./test
-```
-
-This writes a full simulated `/lpot`-shaped tree under `./test/lpot`
-(`reboot.log`, `lpotscan.log`, `pci-config-changes.log`, `result.json`, ...),
-a `./test/VERIFICATION_TRACKING.md` table recording exactly what was
-injected each cycle, what the logs were expected to show, and whether that
-expectation held (PASS/FAIL) against the real output, and a
-`./test/dashboard.html` snapshot of the same `-ui` dashboard pre-loaded with
-the simulated result so it can be opened directly in a browser. `./test/` is
-gitignored and must never be committed.
-
 ## Review Notes and Known Limitations
 
 The implementation targets Linux. Confirm the Linux-target build succeeds
 before deployment, then validate the full reboot workflow on the intended Linux
-hardware. The macOS role is limited to local development and cross-compilation;
-the binary must not be run there.
-
-Technical documentation is organized under [`docs/`](docs/README.md). Ongoing
-changes, known parser limitations, security history, and the planned remote
-host/report/dashboard management layer are tracked in
-[GitHub Issues](https://github.com/Nephom/lpot/issues).
+hardware. 
 
 ## License and Relationship to Upstream
 
