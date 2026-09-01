@@ -401,7 +401,7 @@ func resetClassificationBaseline() error {
 	// cli_main.go); without this reset, a brand-new run would silently
 	// merge its own events with whatever a previous, unrelated run left
 	// behind.
-	for _, path := range []string{CHANGE_LOG_FILE, TEST_STATS_FILE, LPOTSCAN_LOG} {
+	for _, path := range []string{CLEAN_STREAK_STATE_FILE, CHANGE_LOG_FILE, TEST_STATS_FILE, LPOTSCAN_LOG} {
 		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
 			return rmErr
 		}
