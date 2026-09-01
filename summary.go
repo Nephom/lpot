@@ -241,6 +241,7 @@ func parseRebootLogForStats() (time.Time, int, int, int, int) {
 	lines := strings.Split(string(data), "\n")
 	cycleHasChanges := false
 	cycleHasTopologyChanges := false
+	cycleHasLspciChanges := false
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -305,13 +306,17 @@ func parseRebootLogForStats() (time.Time, int, int, int, int) {
 				cyclesWithChanges++
 				cycleHasChanges = true
 			}
-			lspciChanges++
+			if !cycleHasLspciChanges {
+				lspciChanges++
+				cycleHasLspciChanges = true
+			}
 		}
 
 		// Reset flags at start of new cycle
 		if strings.Contains(line, "#########Start to test#########") && totalCycles > 0 {
 			cycleHasChanges = false
 			cycleHasTopologyChanges = false
+			cycleHasLspciChanges = false
 		}
 	}
 
