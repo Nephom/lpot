@@ -621,6 +621,21 @@ func saveIgnoreBits(filePath string, ignoreBits map[string]DeviceIgnoreBits) err
 // compareDeviceConfigs compares the initial PCI config snapshot against the
 // current state. Multiple live samples are collected via collectStableConfig
 // to filter out timer noise, so only genuine capability changes are logged.
+//
+// Baseline immutability (Issue #21): initialFile (initial.bin) is the
+// one-time, immutable raw config-space baseline for the lifetime of the
+// run. initialDevices (parsed from it) is NEVER written back to disk by
+// this function — a device going absent does not erase its baseline entry,
+// and a device reappearing does not adopt a new baseline. Present/absent
+// transition dedup for the human-readable log and recordCycleChange is
+// instead tracked in topologyState (device_state.go, "rawconfig"
+// namespace), completely independent of the baseline file's contents.
+//
+// Read-failure handling (Issue #23): a baselined BDF that is still
+// enumerated (endpointFilterAllows) but has no stable sample this cycle is
+// distinguished from one that has genuinely left sysfs, and reported as
+// UNAVAILABLE (NOTICE severity, retried by collectStableConfig's own
+// sampling) rather than REMOVED.
 func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error {
 	initialData, err := os.ReadFile(initialFile)
 	if err != nil {
@@ -656,31 +671,33 @@ func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error 
 	fmt.Fprintf(logFile, "%s %sParsed %d initial devices, %d current devices\n",
 		timestamp, cycleTag(), len(initialDevices), len(stableConfigs))
 
-	// Track if any config changes are found in this cycle
+	// Track if any NOTICE-or-worse config change is found in this cycle, so
+	// the final recordCycleNoise/recordCycleNotice call below (Issue #25)
+	// picks the right severity: only when EVERY byte change this cycle is
+	// confirmed recurring boot-time noise does this stay pure INFO.
+	// changedThisCycle collects every (bdf, offset) changed this cycle so
+	// noteworthiness can be evaluated ONCE, after the per-device loop below,
+	// with a single CONFIG_CHANGES_LOG read — rather than re-reading the
+	// whole file inside the loop for every device that changed.
 	configChangesFoundInThisCycle := false
-	// topologyBaselineChanged is set whenever a device is added to or
-	// removed from initialDevices below (a NEW/REMOVED event). initial.bin
-	// is rewritten from the updated initialDevices map at the end of this
-	// function whenever this is true, so a disappearance/appearance is
-	// reported exactly once instead of being rediscovered every subsequent
-	// cycle for the rest of the run (see the rewrite call below for the
-	// full rationale, mirroring the lspci-text path's own baseline rebase
-	// in processPCIDevices()).
-	topologyBaselineChanged := false
+	var changedThisCycle []struct{ bdf, offset string }
+
+	topoState := loadTopologyState()
+	topoStateDirty := false
+	unavailState := loadUnavailableState()
+	unavailStateDirty := false
+	nowTs := time.Now()
+	currentCycleNum := currentCycle.Load()
 
 	// Check for new devices. This is the raw config-space path's own
 	// topology check, independent of the lspci-text path in
-	// processPCIDevices(). It must call recordCycleChange (noteworthy=true)
-	// AND write a "NEW Device:"/"REMOVED Device:" line to reboot.log (logFp)
-	// in the same shape processPCIDevices() uses, exactly like
-	// processPCIDevices' own NEW/REMOVED Device handling does: without this,
-	// a device that only this path noticed (e.g. because its _init.txt
-	// lspci snapshot happened to fail while its raw config sample
-	// succeeded) would never flip the cycle-end banner to "changes
-	// detected", never trigger -p, and never appear in result.json's
-	// TOPOLOGY problems or the Affected Cycles summary — a genuinely
-	// concerning event silently visible only in pci-config-changes.log,
-	// which neither buildResultReport() nor parseRebootLogForStats() scans.
+	// processPCIDevices(). It must call recordCycleChange AND write a
+	// "NEW Device:"/"REMOVED Device:" line to reboot.log (logFp) in the same
+	// shape processPCIDevices() uses: without this, a device that only this
+	// path noticed (e.g. because its _init.txt lspci snapshot happened to
+	// fail while its raw config sample succeeded) would never flip the
+	// cycle-end banner, never trigger -p, and never appear in result.json's
+	// TOPOLOGY problems.
 	for busID, stableCfg := range stableConfigs {
 		if _, exists := initialDevices[busID]; !exists {
 			if ignoreDevices[busID] {
@@ -694,43 +711,83 @@ func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error 
 				fmt.Fprintf(logFp, "%s %sNEW Device: %s (raw config-space)\n", getCurrentTimestamp(), cycleTag(), bdf)
 			}
 			recordCycleChange(fmt.Sprintf("raw config-space: device added: %s", bdf))
-			// Adopt this cycle's snapshot into the baseline map so the
-			// initial.bin rewrite below (and every later cycle's
-			// comparison) treats this device as "known, starting from
-			// this snapshot" instead of "new" forever.
-			initialDevices[busID] = stableCfg.Data
-			topologyBaselineChanged = true
+			// A genuinely new BDF never had a baseline entry, so it is simply
+			// not tracked as "absent" — no topology-state update needed. Note
+			// initialDevices itself is deliberately NOT updated here (Issue
+			// #21): initial.bin is never rewritten, so this BDF has no raw
+			// config-space comparison baseline for the rest of the run (it
+			// remains visible only via the lspci-text path's own baseline).
 		}
 	}
 
-	// For each initial device, either it disappeared (not present in the
-	// current stable snapshot) or it is still present and gets compared for
-	// configuration changes. These two outcomes are mutually exclusive, so a
-	// single walk over initialDevices with an if/else covers both cases.
-	// disappearedBusIDs is collected during the walk and removed from
-	// initialDevices AFTER the loop (rather than deleting while ranging),
-	// so the baseline rewrite below never carries a since-vanished device.
-	var disappearedBusIDs []string
+	// For each baselined device, determine this cycle's transition: still
+	// present & readable (compare), freshly REMOVED (dedup via topoState),
+	// still absent (already recorded), REAPPEARED (dedup via topoState), or
+	// UNAVAILABLE (still enumerated in sysfs but unreadable this cycle,
+	// distinct from REMOVED — Issue #23).
 	for busID, configData := range initialDevices {
-		stableCfg, exists := stableConfigs[busID]
-		if !exists {
-			if ignoreDevices[busID] {
-				continue
-			}
-			initialInfo := parsePCIConfig(configData)
-			initialInfo.BusID = busID
-			logDeviceChange(logFile, &initialInfo, nil, "DEVICE DISAPPEARED")
-			bdf := normalizeBDF(busID)
-			if logFp != nil {
-				fmt.Fprintf(logFp, "%s %sREMOVED Device: %s (raw config-space)\n", getCurrentTimestamp(), cycleTag(), bdf)
-			}
-			recordCycleChange(fmt.Sprintf("raw config-space: device removed: %s", bdf))
-			disappearedBusIDs = append(disappearedBusIDs, busID)
-			topologyBaselineChanged = true
-			continue
-		}
+		normBusID := normalizeBDF(busID)
 		if ignoreDevices[busID] {
 			continue
+		}
+		stableCfg, exists := stableConfigs[busID]
+		if !exists {
+			stillEnumerated := endpointFilterAllows(busID)
+			if stillEnumerated {
+				// Present in sysfs (still in the KEEP set) but no stable
+				// sample this cycle: UNAVAILABLE, not REMOVED. This mirrors
+				// processPCIDevices()' lspci-side UNAVAILABLE handling but is
+				// evaluated independently, since a device's raw config-space
+				// sample and its lspci snapshot can fail independently of
+				// each other.
+				unavailDesc := unavailableMark(&unavailState, topologyNamespaceRawConfig, normBusID, currentCycleNum, nowTs)
+				unavailStateDirty = true
+				if logFp != nil {
+					fmt.Fprintf(logFp, "%s %sUNAVAILABLE Device: %s (raw config-space unreadable this cycle; %s)\n",
+						getCurrentTimestamp(), cycleTag(), normBusID, unavailDesc)
+				}
+				recordCycleNotice(fmt.Sprintf("device unreadable (raw config-space): %s (%s)", normBusID, unavailDesc))
+				continue
+			}
+			// Genuinely gone from sysfs: REMOVED, deduped against topoState so
+			// a device absent for many cycles is reported exactly once.
+			wasAbsent := topologyIsAbsent(topoState, topologyNamespaceRawConfig, normBusID)
+			if !wasAbsent {
+				initialInfo := parsePCIConfig(configData)
+				initialInfo.BusID = busID
+				logDeviceChange(logFile, &initialInfo, nil, "DEVICE DISAPPEARED")
+				if logFp != nil {
+					fmt.Fprintf(logFp, "%s %sREMOVED Device: %s (raw config-space)\n", getCurrentTimestamp(), cycleTag(), normBusID)
+				}
+				recordCycleChange(fmt.Sprintf("raw config-space: device removed: %s", normBusID))
+				topologyMarkAbsent(&topoState, topologyNamespaceRawConfig, normBusID)
+				topoStateDirty = true
+			}
+			// Also clear any stale UNAVAILABLE marker: a device that goes
+			// fully absent is no longer merely "unavailable".
+			if recovered := unavailableClear(&unavailState, topologyNamespaceRawConfig, normBusID, nowTs); recovered != "" {
+				unavailStateDirty = true
+			}
+			continue
+		}
+
+		// This BDF has a stable sample this cycle: clear any UNAVAILABLE
+		// marker and, if it was previously marked REMOVED, report REAPPEARED
+		// exactly once (still comparing against the SAME immutable baseline,
+		// per Issue #21 — no rebase).
+		if recovered := unavailableClear(&unavailState, topologyNamespaceRawConfig, normBusID, nowTs); recovered != "" {
+			unavailStateDirty = true
+			if logFp != nil {
+				fmt.Fprintf(logFp, "%s %sDevice %s is readable again (raw config-space) — %s\n", getCurrentTimestamp(), cycleTag(), normBusID, recovered)
+			}
+		}
+		if topologyIsAbsent(topoState, topologyNamespaceRawConfig, normBusID) {
+			if logFp != nil {
+				fmt.Fprintf(logFp, "%s %sREAPPEARED Device: %s (raw config-space; comparing against original baseline)\n", getCurrentTimestamp(), cycleTag(), normBusID)
+			}
+			recordCycleChange(fmt.Sprintf("raw config-space: device reappeared: %s", normBusID))
+			topologyMarkPresent(&topoState, topologyNamespaceRawConfig, normBusID)
+			topoStateDirty = true
 		}
 
 		initialInfo := parsePCIConfig(configData)
@@ -748,11 +805,9 @@ func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error 
 
 		// Pass stableCfg.UnstableBytes for live timer filtering.
 		//
-		// Deliberately NOT rebased on change (unlike the topology
-		// NEW/REMOVED handling above and the lspci Dev/Lnk baseline in
-		// processPCIDevices()): compareAndLogDeviceChanges' byte-level diffs
-		// stay anchored to the ORIGINAL one-time initial.bin for the
-		// lifetime of the run by design. classifyConfigChangeRatio
+		// Deliberately NOT rebased on change (Issue #21): compareAndLogDeviceChanges'
+		// byte-level diffs stay anchored to the ORIGINAL one-time initial.bin
+		// for the lifetime of the run by design. classifyConfigChangeRatio
 		// (result_helpers.go/summary.go) classifies a (device, offset) row
 		// as benign "reboot-fixed" noise specifically because it recurs in
 		// >= rebootFixedThreshold (80%) of ALL completed cycles when
@@ -762,55 +817,63 @@ func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error 
 		// change would make that register look "clean" from the very next
 		// cycle onward, permanently hiding the fixed/reproducible pattern
 		// this ratio-based classification exists to surface.
-		hasChanges := compareAndLogDeviceChanges(logFile, initialInfo, currentInfo, combinedIgnore, stableCfg.UnstableBytes)
-		if hasChanges {
+		changedOffsets := compareAndLogDeviceChanges(logFile, initialInfo, currentInfo, combinedIgnore, stableCfg.UnstableBytes)
+		if len(changedOffsets) > 0 {
 			configChangesFoundInThisCycle = true
+			normBusID := normalizeBDF(busID)
+			for _, offset := range changedOffsets {
+				changedThisCycle = append(changedThisCycle, struct{ bdf, offset string }{normBusID, offset})
+			}
 		}
 	}
 
-	// Increment cycle counter only once per cycle if any config changes were
-	// found. These are recorded as noise (not noteworthy): the vast majority
-	// are vendor registers a controller resets to the same value on every
-	// boot. The final summary partitions them into reboot-fixed vs. truly
-	// volatile; only the latter warrants attention. Persisted immediately
-	// (not an in-memory `cyclesWithConfigChanges++`) because
-	// generateFinalSummary()'s raw-config STABLE/CHANGED line must reflect
-	// the entire multi-cycle run, and each reboot cycle runs in a
-	// brand-new process.
+	// Issue #25: re-evaluate THIS cycle's changed (device, offset) rows
+	// against the whole-run occurrence ratio, using the SAME
+	// classifyConfigChangeRatio() function result_helpers.go and
+	// buildResultReport() use. If any row is not yet confirmed recurring
+	// noise (below rebootFixedThreshold, OR fewer than 2 completed cycles
+	// have run so far — a single-cycle 100% occurrence must never be
+	// classified as benign), this cycle's raw config-space contribution is a
+	// NOTICE, not silent INFO noise, and must satisfy the -p stop condition.
+	configNoticeFoundInThisCycle := false
+	if len(changedThisCycle) > 0 {
+		completedCyclesSoFar := 0
+		if current := currentCycle.Load(); current > 0 {
+			completedCyclesSoFar = int(current)
+		}
+		counts := configChangeOccurrenceCounts()
+		for _, row := range changedThisCycle {
+			count := counts[row.bdf+"\x00"+row.offset]
+			if _, noteworthy := classifyConfigChangeRatio(count, completedCyclesSoFar); noteworthy {
+				configNoticeFoundInThisCycle = true
+				break
+			}
+		}
+	}
+
+	if topoStateDirty {
+		saveTopologyState(topoState)
+	}
+	if unavailStateDirty {
+		saveUnavailableState(unavailState)
+	}
+
+	// Persisted immediately (not an in-memory `cyclesWithConfigChanges++`)
+	// because generateFinalSummary()'s raw-config STABLE/CHANGED line must
+	// reflect the entire multi-cycle run, and each reboot cycle runs in a
+	// brand-new process. Severity (Issue #25): a config-space change is only
+	// ever recorded as benign INFO noise when EVERY changed (device, offset)
+	// row this cycle is already confirmed recurring noise; if even one row
+	// is not yet confirmed (or there have been fewer than 2 completed
+	// cycles), the whole cycle's raw config-space contribution is a NOTICE,
+	// satisfying the -p stop condition and never collapsing to a clean/PASS
+	// banner.
 	if configChangesFoundInThisCycle {
 		recordConfigSpaceChangeCycle()
-		recordCycleNoise("PCI config-space byte changes detected")
-	}
-
-	// Rebase initial.bin (the one-time raw config-space baseline) whenever
-	// a NEW/REMOVED device was found this cycle, exactly mirroring
-	// processPCIDevices()' lspci-text baseline rebase and for the identical
-	// reason: without this, a device that disappears once would remain
-	// permanently absent from the CURRENT snapshot while staying in
-	// initial.bin forever, so every subsequent cycle's "for each initial
-	// device" walk above would rediscover the same absence and re-log
-	// "DEVICE DISAPPEARED"/"REMOVED Device: ... (raw config-space)" and
-	// re-call recordCycleChange on every cycle for the rest of the run —
-	// permanently keeping this path's contribution to "changes detected"
-	// active even though nothing further actually changed. Symmetrically, a
-	// newly-appeared device is folded into initialDevices above the moment
-	// it is found, so this rewrite simply persists that already-updated map
-	// (with vanished devices removed) back to disk as the new baseline.
-	if topologyBaselineChanged {
-		for _, busID := range disappearedBusIDs {
-			delete(initialDevices, busID)
-		}
-		var rebased bytes.Buffer
-		var busIDs []string
-		for busID := range initialDevices {
-			busIDs = append(busIDs, busID)
-		}
-		sort.Strings(busIDs)
-		for _, busID := range busIDs {
-			writeDeviceConfigXXD(&rebased, normalizeBDF(busID), initialDevices[busID])
-		}
-		if err := writeFileNoFollow(initialFile, rebased.Bytes(), 0644); err != nil {
-			logWarnFp(logFp, "could not rebase raw config-space topology baseline %s: %v", initialFile, err)
+		if configNoticeFoundInThisCycle {
+			recordCycleNotice("PCI config-space byte change(s) not yet confirmed as recurring noise")
+		} else {
+			recordCycleNoise("PCI config-space byte changes detected")
 		}
 	}
 
@@ -863,7 +926,8 @@ func formatDeviceInfo(info PCIDeviceInfo) string {
 	return sb.String()
 }
 
-// compareAndLogDeviceChanges compares two devices' PCI config data and logs differences.
+// compareAndLogDeviceChanges compares two devices' PCI config data and logs
+// differences.
 //
 // Filter priority (highest to lowest):
 //  1. unstableBytes: bytes flagged as timer noise by live stability analysis (collectStableConfig)
@@ -871,9 +935,13 @@ func formatDeviceInfo(info PCIDeviceInfo) string {
 //  3. timerRelatedOffsets: hardcoded known timer registers
 //  4. volatileStatusBits: volatile status bits masked in the Status register
 //
-// Returns true if non-timer changes were found, false otherwise.
+// Returns the hex-string offsets ("0xNN", matching parseConfigResultChanges'
+// output) of every non-timer byte that changed this cycle, or nil if none
+// did. The caller (compareDeviceConfigs) uses this to evaluate Issue #25's
+// per-row noteworthy/recurring-noise classification for THIS cycle's changes
+// without waiting for a later result.json build.
 func compareAndLogDeviceChanges(logFile *os.File, initialInfo, currentInfo PCIDeviceInfo,
-	timerPatterns map[int]bool, unstableBytes map[int]bool) bool {
+	timerPatterns map[int]bool, unstableBytes map[int]bool) []string {
 	// A truncated read (< 64 bytes) cannot be meaningfully diffed byte-by-byte
 	// against a full header; report the read failure explicitly instead of
 	// silently comparing whatever partial bytes happen to overlap, which could
@@ -884,9 +952,10 @@ func compareAndLogDeviceChanges(logFile *os.File, initialInfo, currentInfo PCIDe
 		fmt.Fprintf(logFile, "%s %sDevice: %s (config read incomplete, comparison skipped this cycle)\n",
 			timestamp, cycleTag(), formatDeviceInfo(currentInfo))
 		fmt.Fprintln(logFile, "---")
-		return false
+		return nil
 	}
 	var changes []string
+	var changedOffsets []string
 
 	for i := 0; i < len(initialInfo.ConfigData) && i < len(currentInfo.ConfigData); i++ {
 		// 1. Live stability filter: byte was unstable during sampling → timer noise
@@ -919,6 +988,7 @@ func compareAndLogDeviceChanges(logFile *os.File, initialInfo, currentInfo PCIDe
 		if initialInfo.ConfigData[i] != currentInfo.ConfigData[i] {
 			changes = append(changes, fmt.Sprintf("Value at offset 0x%02x changed from 0x%02x to 0x%02x",
 				i, initialInfo.ConfigData[i], currentInfo.ConfigData[i]))
+			changedOffsets = append(changedOffsets, fmt.Sprintf("0x%02x", i))
 		}
 	}
 
@@ -931,9 +1001,9 @@ func compareAndLogDeviceChanges(logFile *os.File, initialInfo, currentInfo PCIDe
 			fmt.Fprintln(logFile, change)
 		}
 		fmt.Fprintln(logFile, "---")
-		return true
+		return changedOffsets
 	}
-	return false
+	return nil
 }
 
 // logDeviceChange logs device appearance/disappearance

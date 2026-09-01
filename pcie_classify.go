@@ -710,64 +710,113 @@ func writeClassificationReportToLog(logFp *os.File, decisions []deviceClassifica
 	if readErr != nil || len(previous.Devices) == 0 {
 		fmt.Fprintf(logFp, "\n%s===== Complete PCI link classification (%d devices) =====\n", cycleTag(), len(decisions))
 		printClassificationReport(logFp, decisions)
+		// Written exactly once, the first cycle a valid classification baseline
+		// exists (Issue #21): CLASSIFY_STATE_FILE is never rebased again after
+		// this, so every later cycle keeps comparing against this SAME
+		// original snapshot for the lifetime of the run.
 		if err := writeClassificationBaseline(current); err != nil {
 			return fmt.Errorf("write classification baseline: %w", err)
 		}
-	} else {
-		changed := make([]deviceClassification, 0)
-		for _, decision := range decisions {
-			if previous.Devices[decision.BDF] != current.Devices[decision.BDF] {
-				changed = append(changed, decision)
+		return nil
+	}
+
+	changed := make([]deviceClassification, 0)
+	for _, decision := range decisions {
+		if previous.Devices[decision.BDF] != current.Devices[decision.BDF] {
+			changed = append(changed, decision)
+		}
+	}
+	removed := make([]string, 0)
+	for bdf := range previous.Devices {
+		if _, ok := current.Devices[bdf]; !ok {
+			removed = append(removed, bdf)
+		}
+	}
+	sort.Strings(removed)
+
+	// CLASSIFY_STATE_FILE (the comparison baseline) is deliberately NEVER
+	// rewritten past this point (Issue #21): every cycle for the rest of the
+	// run keeps comparing against the SAME original snapshot written above,
+	// so a device that deviates once and stays deviated is not silently
+	// re-baselined as "the new normal". Repeat-event dedup for the log/
+	// recordCycleChange narrative is instead handled via
+	// classifyReportedState (device_state.go-style persisted map), which only
+	// tracks "what was last reported", never the comparison target itself.
+	reported := loadClassifyReportedState()
+	reportedDirty := false
+
+	// A device that reverted to EXACTLY the immutable baseline value (no
+	// longer in `changed`) must have its dedup entry cleared here, BEFORE the
+	// "matches baseline" early return below: otherwise, if it later deviates
+	// again to a value that happens to match what was reported before the
+	// revert, the dedup check further down would incorrectly treat the fresh
+	// deviation as already-reported and silently skip it.
+	changedBDFs := make(map[string]bool, len(changed))
+	for _, decision := range changed {
+		changedBDFs[decision.BDF] = true
+	}
+	for bdf := range reported.Devices {
+		if !changedBDFs[bdf] {
+			if _, stillTracked := current.Devices[bdf]; stillTracked {
+				delete(reported.Devices, bdf)
+				reportedDirty = true
 			}
 		}
-		removed := make([]string, 0)
-		for bdf := range previous.Devices {
-			if _, ok := current.Devices[bdf]; !ok {
-				removed = append(removed, bdf)
+	}
+
+	if len(changed) == 0 && len(removed) == 0 {
+		fmt.Fprintf(logFp, "%s %sPCIe classification matches baseline.\n", getCurrentTimestamp(), cycleTag())
+		if reportedDirty {
+			saveClassifyReportedState(reported)
+		}
+		return nil
+	}
+
+	fmt.Fprintf(logFp, "\n%s===== PCIe classification changes from baseline =====\n", cycleTag())
+	if len(changed) > 0 {
+		// Only devices whose CURRENT encoding differs from what was last
+		// reported are re-logged/re-recorded; a device that deviated from
+		// baseline once and has stayed at that SAME deviated value since is
+		// not reported again every cycle. A device that deviates, is reported,
+		// then deviates AGAIN to a third value is still reported (its current
+		// encoding differs from the last reported one), matching the
+		// topology present/absent/present dedup semantics used elsewhere.
+		var newlyChanged []deviceClassification
+		for _, decision := range changed {
+			if reported.Devices[decision.BDF] == current.Devices[decision.BDF] {
+				continue
+			}
+			newlyChanged = append(newlyChanged, decision)
+			reported.Devices[decision.BDF] = current.Devices[decision.BDF]
+			reportedDirty = true
+		}
+		if len(newlyChanged) > 0 {
+			printClassificationReport(logFp, newlyChanged)
+			// A classification change (e.g. KEEP -> SKIP, or an LnkCap value
+			// shift) is a real topology/link-capability difference, exactly
+			// like the NEW/REMOVED Device handling in processPCIDevices().
+			// Without this, the change was written to reboot.log but never
+			// entered changedCycles, so it was invisible to the cycle-end
+			// banner, writeAffectedCyclesSection, and the -p stop-on-
+			// difference gate — a genuinely noteworthy event that could
+			// silently pass through an entire -p run.
+			for _, decision := range newlyChanged {
+				reason := decision.KeptReason + decision.SkipReason
+				recordCycleChange(fmt.Sprintf("PCIe classification changed for %s: now %s (%s)", decision.BDF, decisionLabel(decision), reason))
 			}
 		}
-		sort.Strings(removed)
-		if len(changed) == 0 && len(removed) == 0 {
-			fmt.Fprintf(logFp, "%s %sPCIe classification matches baseline.\n", getCurrentTimestamp(), cycleTag())
-		} else {
-			fmt.Fprintf(logFp, "\n%s===== PCIe classification changes from baseline =====\n", cycleTag())
-			if len(changed) > 0 {
-				printClassificationReport(logFp, changed)
-				// A classification change (e.g. KEEP -> SKIP, or an LnkCap value
-				// shift) is a real topology/link-capability difference, exactly
-				// like the NEW/REMOVED Device handling in processPCIDevices().
-				// Without this, the change was written to reboot.log but never
-				// entered changedCycles, so it was invisible to the cycle-end
-				// banner, writeAffectedCyclesSection, and the -p stop-on-
-				// difference gate — a genuinely noteworthy event that could
-				// silently pass through an entire -p run.
-				for _, decision := range changed {
-					reason := decision.KeptReason + decision.SkipReason
-					recordCycleChange(fmt.Sprintf("PCIe classification changed for %s: now %s (%s)", decision.BDF, decisionLabel(decision), reason))
-				}
-			}
-			for _, bdf := range removed {
-				fmt.Fprintf(logFp, "%s Removed: %s\n", getCurrentTimestamp(), bdf)
-				recordCycleChange(fmt.Sprintf("PCIe classification entry removed for %s", bdf))
-			}
-			// Rebase CLASSIFY_STATE_FILE to this cycle's snapshot now that
-			// every change/removal has been logged and recorded. Without
-			// this, CLASSIFY_STATE_FILE was only ever written once (in the
-			// "no previous baseline" branch above) and NEVER updated again,
-			// so a device that disappeared or changed classification once
-			// would keep comparing against the ORIGINAL, now-stale baseline
-			// forever: the same "changed"/"removed" entries would be
-			// rediscovered and re-recorded via recordCycleChange on every
-			// subsequent cycle for the rest of the run, permanently pinning
-			// the cycle-end banner to "changes detected" long after the
-			// classification had actually stabilised. This mirrors the
-			// identical baseline-rebase fix applied to processPCIDevices()
-			// (lspci Dev/Lnk _init.txt) and compareDeviceConfigs()
-			// (initial.bin).
-			if err := writeClassificationBaseline(current); err != nil {
-				return fmt.Errorf("rebase classification baseline: %w", err)
-			}
+	}
+	for _, bdf := range removed {
+		if reported.Removed[bdf] {
+			continue
 		}
+		reported.Removed[bdf] = true
+		reportedDirty = true
+		fmt.Fprintf(logFp, "%s Removed: %s\n", getCurrentTimestamp(), bdf)
+		recordCycleChange(fmt.Sprintf("PCIe classification entry removed for %s", bdf))
+	}
+	if reportedDirty {
+		saveClassifyReportedState(reported)
 	}
 	return nil
 }

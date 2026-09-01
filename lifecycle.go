@@ -401,7 +401,7 @@ func resetClassificationBaseline() error {
 	// cli_main.go); without this reset, a brand-new run would silently
 	// merge its own events with whatever a previous, unrelated run left
 	// behind.
-	for _, path := range []string{CLEAN_STREAK_STATE_FILE, CHANGE_LOG_FILE, TEST_STATS_FILE, LPOTSCAN_LOG} {
+	for _, path := range []string{CLEAN_STREAK_STATE_FILE, CHANGE_LOG_FILE, TEST_STATS_FILE, LPOTSCAN_LOG, TOPOLOGY_STATE_FILE, UNAVAILABLE_STATE_FILE, CLASSIFY_REPORTED_STATE_FILE} {
 		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
 			return rmErr
 		}
@@ -433,8 +433,13 @@ func prepareTestCycleLimit(limit int) (bool, error) {
 	return current-start >= target, nil
 }
 
+// cycleTargetForReboots converts the operator-specified -tm n ("run exactly
+// n cycles, with at most n-1 reboots in between") into the cycle-count
+// target compared against in prepareTestCycleLimit/fixedCycleLimitReached.
+// It used to return reboots+1, which silently ran n+1 cycles and n reboots
+// for -tm n (Issue #18); the fixed-cycle target is simply n.
 func cycleTargetForReboots(reboots int) int {
-	return reboots + 1
+	return reboots
 }
 
 func readOptionalInteger(path string) (int, error) {

@@ -185,7 +185,7 @@ function render(d) {
   document.getElementById('reason').textContent=d.message||'';
   document.getElementById('run').textContent='Run '+(d.run_id||'unknown')+' | Updated '+(d.updated_at||'unknown');
   document.getElementById('metrics').innerHTML=[['Total cycles',d.total_cycles],['Completed',d.completed_cycles],['Successful',d.successful_cycles],['Failed',d.failed_cycles],['Config changes',(d.checks?.config_space?.noteworthy_changes||0)+(d.checks?.config_noise?.benign_changes||0)]].map(x=>'<div class="metric"><b>'+esc(x[1])+'</b><span>'+x[0]+'</span></div>').join('');
-  const checks=[['Topology',d.checks?.topology],['lspci',d.checks?.lspci],['Config space',d.checks?.config_space],['Config noise',d.checks?.config_noise]];
+  const checks=[['Topology',d.checks?.topology],['lspci',d.checks?.lspci],['Config space',d.checks?.config_space],['Config noise',d.checks?.config_noise],['Availability',d.checks?.availability]];
   document.getElementById('checks').innerHTML=checks.map(x=>'<div class="check"><span>'+x[0]+'<small style="display:block;color:var(--muted)">'+esc(x[1]?.message||'')+'</small></span>'+badge(x[1]?.status||'UNKNOWN')+'</div>').join('');
   document.getElementById('info').innerHTML='<div class="check"><span>Started</span><code>'+esc(d.started_at||'-')+'</code></div><div class="check"><span>Finished</span><code>'+esc(d.finished_at||'-')+'</code></div><div class="check"><span>Checkpoint</span><code>'+esc(d.checkpoint)+'</code></div>';
   const cl=d.classification||{};

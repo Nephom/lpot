@@ -16,38 +16,68 @@ import (
 // cycleChange is a single line-item emitted at the end of a test summarising
 // what went wrong in a given cycle. Multiple entries per cycle are allowed.
 //
-// Noteworthy distinguishes genuinely concerning changes (device topology and
-// lspci capability changes) from benign config-space byte noise (vendor
-// registers a controller re-initialises to the same value on every boot).
-// Only noteworthy changes flip the cycle-end banner to "changes detected";
-// pure config-space noise leaves the cycle labelled "clean (config noise)".
+// Severity distinguishes three kinds of records:
+//   - severityFail: genuinely concerning changes (device topology, lspci
+//     capability changes). Always flips the cycle-end banner to
+//     "changes detected" and always satisfies the -p stop condition.
+//   - severityNotice: changes that need a human to look, but are not by
+//     themselves confirmed evidence of a hardware regression (a raw
+//     config-space byte change that hasn't yet been confirmed as recurring
+//     boot-time noise, or a device that could not be read this cycle).
+//     Flips the cycle-end banner to "changes detected (notice)" and still
+//     satisfies the -p stop condition, but does not by itself fail the run.
+//   - severityInfo: benign config-space byte noise (a vendor register that
+//     resets to the same value on every boot). Leaves the cycle-end banner
+//     at "clean (config noise)" and does not satisfy the -p stop condition.
+//
+// Noteworthy is retained only so a pre-existing CHANGE_LOG_FILE line written
+// before this field existed (Severity == "") can still be interpreted
+// correctly by loadPersistedCycleChanges; new records always set Severity.
 type cycleChange struct {
 	Cycle      int64
 	Time       time.Time
 	Reason     string
+	Severity   string
 	Noteworthy bool
 }
 
-// recordCycleChange appends a noteworthy change record (topology / lspci) for
-// the final summary. It is safe to call concurrently from any
+const (
+	severityFail   = "FAIL"
+	severityNotice = "NOTICE"
+	severityInfo   = "INFO"
+)
+
+// recordCycleChange appends a FAIL-severity change record (topology / lspci)
+// for the final summary. It is safe to call concurrently from any
 // reboot-processing goroutine.
 func recordCycleChange(reason string) {
-	appendCycleChange(reason, true)
+	appendCycleChange(reason, severityFail)
 }
 
-// recordCycleNoise appends a non-noteworthy change record (config-space byte
-// noise). It is still listed in the final summary for completeness but does
-// not flip the cycle-end banner to "changes detected".
+// recordCycleNotice appends a NOTICE-severity change record: worth a human's
+// attention and worth stopping future reboots under -p, but not by itself
+// confirmed evidence that the run must be marked FAIL (e.g. a config-space
+// change not yet confirmed as recurring boot-time noise, or a device that
+// could not be read this cycle).
+func recordCycleNotice(reason string) {
+	appendCycleChange(reason, severityNotice)
+}
+
+// recordCycleNoise appends an INFO-severity change record (config-space byte
+// noise confirmed to recur on nearly every boot). It is still listed in the
+// final summary for completeness but does not flip the cycle-end banner away
+// from "clean (config noise)" and does not satisfy the -p stop condition.
 func recordCycleNoise(reason string) {
-	appendCycleChange(reason, false)
+	appendCycleChange(reason, severityInfo)
 }
 
-func appendCycleChange(reason string, noteworthy bool) {
+func appendCycleChange(reason string, severity string) {
 	entry := cycleChange{
 		Cycle:      currentCycle.Load(),
 		Time:       time.Now(),
 		Reason:     reason,
-		Noteworthy: noteworthy,
+		Severity:   severity,
+		Noteworthy: severity != severityInfo,
 	}
 	changedCyclesMu.Lock()
 	changedCycles = append(changedCycles, entry)
@@ -71,6 +101,7 @@ type persistedCycleChange struct {
 	Cycle      int64  `json:"cycle"`
 	Time       string `json:"time"`
 	Reason     string `json:"reason"`
+	Severity   string `json:"severity,omitempty"`
 	Noteworthy bool   `json:"noteworthy"`
 }
 
@@ -88,6 +119,7 @@ func appendChangeLogEntry(entry cycleChange) error {
 		Cycle:      entry.Cycle,
 		Time:       entry.Time.Format(logTimeFormat),
 		Reason:     entry.Reason,
+		Severity:   entry.Severity,
 		Noteworthy: entry.Noteworthy,
 	})
 	if err != nil {
@@ -128,16 +160,33 @@ func loadPersistedCycleChanges() []cycleChange {
 		// with time.Local matches the writer's timezone and keeps this
 		// round-trip lossless.
 		t, _ := time.ParseInLocation(logTimeFormat, p.Time, time.Local)
-		out = append(out, cycleChange{Cycle: p.Cycle, Time: t, Reason: p.Reason, Noteworthy: p.Noteworthy})
+		severity := p.Severity
+		if severity == "" {
+			// Back-compat for a line persisted before Severity existed: map
+			// the old two-valued Noteworthy bool onto the new three-valued
+			// Severity (there is no way to recover a NOTICE distinction for
+			// these old lines, so they degrade to FAIL/INFO exactly as they
+			// behaved before this change).
+			if p.Noteworthy {
+				severity = severityFail
+			} else {
+				severity = severityInfo
+			}
+		}
+		out = append(out, cycleChange{Cycle: p.Cycle, Time: t, Reason: p.Reason, Severity: severity, Noteworthy: p.Noteworthy})
 	}
 	return out
 }
 
 // cycleChangeKind reports what kind of change records exist for the
 // currently-running cycle, used to label the cycle-end banner:
-//   - noteworthy: a topology / lspci change was recorded (genuinely concerning)
-//   - configNoise: only config-space byte changes were recorded (benign)
-func cycleChangeKind() (noteworthy, configNoise bool) {
+//   - fail: a FAIL-severity change was recorded (topology / lspci / a
+//     config-space change not yet confirmed as recurring noise)
+//   - notice: a NOTICE-severity change was recorded (e.g. a device that
+//     could not be read this cycle) and no FAIL-severity change was
+//   - noise: only INFO-severity (confirmed benign config-space noise)
+//     changes were recorded
+func cycleChangeKind() (fail, notice, noise bool) {
 	changedCyclesMu.Lock()
 	defer changedCyclesMu.Unlock()
 	cycle := currentCycle.Load()
@@ -145,26 +194,37 @@ func cycleChangeKind() (noteworthy, configNoise bool) {
 		if c.Cycle != cycle {
 			continue
 		}
-		if c.Noteworthy {
-			noteworthy = true
-		} else {
-			configNoise = true
+		switch c.Severity {
+		case severityFail:
+			fail = true
+		case severityNotice:
+			notice = true
+		default:
+			noise = true
 		}
 	}
-	return noteworthy, configNoise
+	return fail, notice, noise
 }
 
 // cycleEndStatus is the single source of truth for how a cycle is labelled
 // at its end banner ('===== Cycle N END (<status>) ====='). It is also the
-// only place that decides whether a cycle counts as "noteworthy" for the -p
-// stop-on-difference gate, so the banner text and the -p behaviour can never
-// diverge again: a cycle that reads "clean (config noise)" in reboot.log by
-// definition does not trigger -p, because both consult this function.
-func cycleEndStatus(noteworthy, configNoise bool) string {
+// only place that decides whether a cycle counts as requiring a stop for the
+// -p stop-on-difference gate, so the banner text and the -p behaviour can
+// never diverge again: a cycle that reads "clean (config noise)" in
+// reboot.log by definition does not trigger -p, because both consult this
+// function (via cycleRequiresStop below).
+//
+// "changes detected (notice)" is a DISTINCT status from plain "changes
+// detected": result_helpers.go's buildResultReport must check for the
+// "(notice)" suffix BEFORE the bare "changes detected" substring, since the
+// latter is a substring of the former.
+func cycleEndStatus(fail, notice, noise bool) string {
 	switch {
-	case noteworthy:
+	case fail:
 		return "changes detected"
-	case configNoise:
+	case notice:
+		return "changes detected (notice)"
+	case noise:
 		return "clean (config noise)"
 	default:
 		return "clean"
@@ -172,12 +232,13 @@ func cycleEndStatus(noteworthy, configNoise bool) string {
 }
 
 // cycleRequiresStop reports whether -p should stop and disable the service
-// for the current cycle. Only genuinely noteworthy changes (topology, lspci
-// capability, or a classification change from writeClassificationReportToLog)
-// qualify; benign config-space reboot-noise alone does not, matching the
+// for the current cycle. Both FAIL and NOTICE severity changes qualify
+// (topology, lspci capability, a classification change, a not-yet-confirmed
+// config-space change, or a device that could not be read this cycle);
+// benign confirmed config-space reboot-noise alone does not, matching the
 // banner's "clean (config noise)" label produced by cycleEndStatus above.
-func cycleRequiresStop(noteworthy, configNoise bool) bool {
-	return noteworthy
+func cycleRequiresStop(fail, notice, noise bool) bool {
+	return fail || notice
 }
 
 // cycleTag returns a "[Cycle N] " prefix when a cycle number is set, and an
@@ -293,16 +354,59 @@ func vendorDeviceFromLspciDump(path string) (vendor, device uint16, ok bool) {
 	return uint16(v), uint16(d), true
 }
 
-// processPCIDevices processes all PCI devices and checks for changes
+// processPCIDevices processes all PCI devices and checks for changes.
+//
+// Baseline immutability (Issue #21): <bdf>_init.txt is the one-time,
+// immutable comparison baseline for the lifetime of the run. It is:
+//   - created exactly once, the first cycle a genuinely new BDF is seen;
+//   - NEVER deleted (a device going absent does not erase its baseline);
+//   - NEVER rewritten to the latest observed value after a detected change
+//     (a Dev/Lnk field that trains down once and stays there is reported
+//     as a deviation from baseline on EVERY subsequent cycle, not silently
+//     adopted as the new normal).
+//
+// Present/absent transition dedup is instead tracked in a small separate
+// state file (topologyState, device_state.go) so a device that stays
+// absent for many cycles is reported exactly once ("REMOVED") rather than
+// on every cycle, and a device that comes back is reported exactly once
+// ("REAPPEARED") — without ever touching the baseline file itself.
+//
+// Per-device comparison independence (Issue #22): every KEEP device with a
+// valid baseline and a valid this-cycle snapshot is compared for Dev/Lnk
+// field changes, regardless of whether some OTHER device had a topology
+// event (NEW/REMOVED/REAPPEARED/UNAVAILABLE) this same cycle. A topology
+// anomaly on one BDF must never suppress the comparison of any other BDF.
+//
+// Read-failure handling (Issue #23): a BDF that is still enumerated this
+// cycle (present in bdfs) but whose lspci snapshot fails is retried a
+// bounded number of times before being recorded as UNAVAILABLE (distinct
+// from REMOVED, which means the BDF is no longer enumerated at all). An
+// UNAVAILABLE event is NOTICE severity, so -p stops future reboots after
+// finishing this cycle's bookkeeping exactly like a FAIL-severity change.
 func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
-	newDevices := []string{}
-	removedDevices := []string{}
+	var newDevices []string
+	var removedDevices []string
+	var reappearedDevices []string
 
-	// Read existing init files
+	// Read existing init files (the set of BDFs that have EVER had a
+	// baseline established, including ones currently absent, since baselines
+	// are never deleted).
 	initFiles, err := filepath.Glob(filepath.Join(TMP_DIR, "*_init.txt"))
 	if err != nil {
 		return fmt.Errorf("error finding init files: %v", err)
 	}
+
+	bdfSet := make(map[string]bool, len(bdfs))
+	for _, bdf := range bdfs {
+		bdfSet[normalizeBDF(bdf)] = true
+	}
+
+	topoState := loadTopologyState()
+	topoStateDirty := false
+	unavailState := loadUnavailableState()
+	unavailStateDirty := false
+	nowTs := time.Now()
+	currentCycleNum := currentCycle.Load()
 
 	// Step 1: Generate this cycle's current device snapshot (<bdf>.txt) for
 	// every bdf FIRST, before checking for removed devices. This ordering is
@@ -312,61 +416,110 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 	// the "removed device" check below ran BEFORE this snapshot step, it
 	// would always find last cycle's already-deleted <bdf>.txt missing and
 	// misreport every single device as REMOVED on every cycle after the
-	// first — silently disabling the lspci Dev/Lnk comparison entirely
-	// (allUnchanged would never be true) and, under -p, stopping the test on
-	// the very second cycle. Do not reorder these two steps.
+	// first. Do not reorder these two steps.
 	//
-	// snapshotFailedBDFs collects devices whose current-cycle lspci snapshot
-	// could not be captured (e.g. a transient link reset or lspci timeout).
-	// This is a per-device, non-fatal condition: one flaky device must not
-	// abort the whole cycle (and with it, potentially the rest of a 48h run).
-	// It is recorded as a plain warning only — it does not affect this
-	// cycle's PASS/FAIL verdict, since the device may simply have been mid-
-	// reset when queried and could be perfectly stable a moment later.
+	// Each bdf gets up to deviceReadRetryAttempts tries, deviceReadRetryInterval
+	// apart, before its snapshot is treated as failed for this cycle (Issue
+	// #23): a single transient lspci timeout or link reset must not
+	// immediately masquerade as a topology change, but persistent
+	// unavailability must still be visible and still able to satisfy -p.
 	var snapshotFailedBDFs []string
 	for _, bdf := range bdfs {
-		if err := executeLspci(bdf, ".txt"); err != nil {
+		var lastErr error
+		succeeded := false
+		for attempt := 1; attempt <= deviceReadRetryAttempts; attempt++ {
+			// stopFlag is checked only BETWEEN attempts (below), never before
+			// attempt 1: a stop signal received while a PREVIOUS bdf in this
+			// same loop was retrying must not cause every remaining bdf to
+			// skip its first, normal attempt and be falsely recorded as
+			// UNAVAILABLE. Only the retry WAIT is interruptible.
+			if err := executeLspci(bdf, ".txt"); err != nil {
+				lastErr = err
+				if attempt < deviceReadRetryAttempts && !stopFlag.Load() {
+					if rootCtx != nil {
+						if !sleepInterruptible(rootCtx, deviceReadRetryInterval) {
+							break
+						}
+					} else {
+						time.Sleep(deviceReadRetryInterval)
+					}
+				}
+				continue
+			}
+			succeeded = true
+			break
+		}
+		if !succeeded {
 			snapshotFailedBDFs = append(snapshotFailedBDFs, bdf)
-			logWarnFp(logFp, "could not capture this cycle's lspci snapshot for %s (%v); this device is skipped from lspci comparison this cycle only and does not affect the pass/fail result", bdf, err)
+			unavailDesc := unavailableMark(&unavailState, topologyNamespaceLspci, normalizeBDF(bdf), currentCycleNum, nowTs)
+			unavailStateDirty = true
+			fmt.Fprintf(logFp, "%s %sUNAVAILABLE Device: %s (lspci read failed after %d attempt(s): %v; %s)\n",
+				getCurrentTimestamp(), cycleTag(), bdf, deviceReadRetryAttempts, lastErr, unavailDesc)
+			recordCycleNotice(fmt.Sprintf("device unreadable (lspci): %s (%s)", bdf, unavailDesc))
+		} else if recovered := unavailableClear(&unavailState, topologyNamespaceLspci, normalizeBDF(bdf), nowTs); recovered != "" {
+			unavailStateDirty = true
+			fmt.Fprintf(logFp, "%s %sDevice %s is readable again (lspci) — %s\n", getCurrentTimestamp(), cycleTag(), bdf, recovered)
 		}
 	}
-
-	// Step 2: Check for removed devices, now that every reachable bdf's
-	// <bdf>.txt has been (re)created above. Removed devices cannot be
-	// queried via sysfs (they're gone), so we only emit the BDF; lspci dump
-	// for this BDF is already in *_init.txt and is appended to the log by
-	// filterLpotscanErrors. A device whose snapshot failed this cycle
-	// (snapshotFailedBDFs) is NOT treated as removed: a transient lspci
-	// timeout is not evidence the device disappeared from sysfs, and
-	// conflating the two would turn a flaky read into a false topology
-	// alarm.
 	failedThisCycle := make(map[string]bool, len(snapshotFailedBDFs))
 	for _, bdf := range snapshotFailedBDFs {
 		failedThisCycle[normalizeBDF(bdf)] = true
 	}
+
+	// Step 2: Determine each previously-baselined BDF's topology transition
+	// this cycle: still present, freshly removed, still (dedup) absent, or
+	// reappeared. A BDF whose snapshot failed this cycle (failedThisCycle) is
+	// UNAVAILABLE, not REMOVED — it is still enumerated in bdfs, only its
+	// read failed — and is fully handled in Step 1 above; it is skipped here
+	// so a flaky read is never turned into a false topology alarm.
 	for _, initFile := range initFiles {
 		filename := filepath.Base(initFile)
 		bdf := strings.TrimSuffix(filename, "_init.txt")
-		if failedThisCycle[normalizeBDF(bdf)] {
+		normBdf := normalizeBDF(bdf)
+		if failedThisCycle[normBdf] {
 			continue
 		}
 		currentFile := filepath.Join(TMP_DIR, bdf+".txt")
+		presentNow := bdfSet[normBdf] && fileExists(currentFile)
+		wasAbsent := topologyIsAbsent(topoState, topologyNamespaceLspci, normBdf)
 
-		if !fileExists(currentFile) {
+		switch {
+		case !presentNow && !wasAbsent:
 			removedDevices = append(removedDevices, bdf)
 			fmt.Fprintf(logFp, "%s %sREMOVED Device: %s\n", getCurrentTimestamp(), cycleTag(), bdf)
 			recordCycleChange(fmt.Sprintf("device removed: %s", bdf))
+			topologyMarkAbsent(&topoState, topologyNamespaceLspci, normBdf)
+			topoStateDirty = true
+			// A device that is now fully gone from sysfs is no longer merely
+			// "unavailable" (it can never leave failedThisCycle, since it will
+			// no longer be in bdfs at all); clear any stale UNAVAILABLE marker
+			// left over from a prior cycle so it does not linger forever.
+			if unavailableClear(&unavailState, topologyNamespaceLspci, normBdf, nowTs) != "" {
+				unavailStateDirty = true
+			}
+		case presentNow && wasAbsent:
+			reappearedDevices = append(reappearedDevices, bdf)
+			fmt.Fprintf(logFp, "%s %sREAPPEARED Device: %s (comparing against original baseline)\n", getCurrentTimestamp(), cycleTag(), bdf)
+			recordCycleChange(fmt.Sprintf("device reappeared: %s", bdf))
+			topologyMarkPresent(&topoState, topologyNamespaceLspci, normBdf)
+			topoStateDirty = true
+			// Deliberately no baseline rebase here (Issue #21): the device
+			// keeps comparing against the SAME <bdf>_init.txt it always has,
+			// so a present -> absent -> present flap around a different
+			// steady state is still visible as a deviation, not silently
+			// absorbed as the new normal.
+		default:
+			// presentNow && !wasAbsent (steady state), or !presentNow &&
+			// wasAbsent (still absent, already recorded once) — nothing to do.
 		}
 	}
 
-	// Step 3: Check for new devices. New devices are present in sysfs, so
-	// enrich the log line with vendor/device/class to help identify which
-	// hardware appeared without requiring a separate lspci. Skip bdfs whose
-	// snapshot failed this cycle: without a <bdf>.txt there is nothing to
-	// compare, and the device may simply not have been captured rather than
-	// genuinely be new.
+	// Step 3: Check for genuinely new devices — BDFs with no baseline ever
+	// established. This is the only case that creates a NEW <bdf>_init.txt;
+	// a REAPPEARED device already has one and must not get it overwritten.
 	for _, bdf := range bdfs {
-		if failedThisCycle[normalizeBDF(bdf)] {
+		normBdf := normalizeBDF(bdf)
+		if failedThisCycle[normBdf] {
 			continue
 		}
 		initFile := filepath.Join(TMP_DIR, bdf+"_init.txt")
@@ -377,14 +530,14 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 		}
 	}
 
-	allUnchanged := (len(newDevices) == 0 && len(removedDevices) == 0)
+	topologyEventThisCycle := len(newDevices) > 0 || len(removedDevices) > 0 || len(reappearedDevices) > 0
 	overallSuccess := true
 
 	// Best-effort match a removed BDF with a new BDF that reports the same
 	// vendor:device ID, and add one extra clarifying log line. This does not
 	// change whether -p stops the service: both BDFs are already recorded as
-	// noteworthy changes above (REMOVED Device / NEW Device), so this note is
-	// purely a readability aid for the common "device relocated to a
+	// FAIL-severity changes above (REMOVED Device / NEW Device), so this note
+	// is purely a readability aid for the common "device relocated to a
 	// different slot/BDF" case.
 	if len(removedDevices) > 0 && len(newDevices) > 0 {
 		// consumedNewBDF tracks which new BDFs have already been matched to an
@@ -412,33 +565,11 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 		}
 	}
 
-	// Rebase the lspci-text topology baseline for every REMOVED/NEW device
-	// found this cycle, so the SAME disappearance/appearance is not
-	// rediscovered and re-reported on every subsequent cycle for the rest
-	// of the run. Without this, a device that disappears once would leave
-	// its stale <bdf>_init.txt in place forever, so every later cycle's
-	// removed-device check (Step 2 above) would find its <bdf>.txt missing
-	// again and re-flag it as REMOVED — permanently keeping allUnchanged
-	// false and silently disabling the lspci Dev/Lnk comparison
-	// (the `if allUnchanged` branch below) for the rest of the run.
-	// Symmetrically, a device that appears once would never get an
-	// <bdf>_init.txt baseline of its own, so every later cycle would find it
-	// still missing and re-flag it as NEW forever.
-	for _, bdf := range removedDevices {
-		// The device is gone from sysfs; there is nothing to rebase to, so
-		// simply retire its stale baseline. os.Remove is used (not a rename)
-		// because vendorDeviceFromLspciDump() above has already consumed
-		// this file for this cycle's relocation-note best-effort match; nothing
-		// downstream needs it again once this cycle's decisions are logged.
-		if err := os.Remove(filepath.Join(TMP_DIR, bdf+"_init.txt")); err != nil && !os.IsNotExist(err) {
-			logWarnFp(logFp, "could not retire stale topology baseline for removed device %s: %v", bdf, err)
-		}
-	}
+	// Establish a baseline for every genuinely NEW device found this cycle.
+	// REMOVED devices keep their existing baseline untouched (Issue #21); a
+	// REAPPEARED device already has one and is excluded from newDevices
+	// above, so this loop can never overwrite an existing baseline.
 	for _, bdf := range newDevices {
-		// The device is now present; adopt this cycle's snapshot as its new
-		// baseline so the NEXT cycle compares against "the device as it
-		// looked when it first appeared" instead of re-discovering the same
-		// appearance forever.
 		src := filepath.Join(TMP_DIR, bdf+".txt")
 		dst := filepath.Join(TMP_DIR, bdf+"_init.txt")
 		data, err := os.ReadFile(src)
@@ -451,93 +582,103 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 		}
 	}
 
-	// Track device topology changes. A topology change always interrupts any
-	// active "clean streak" summary that may have been aggregating.
-	if !allUnchanged {
+	if topoStateDirty {
+		saveTopologyState(topoState)
+	}
+	if unavailStateDirty {
+		saveUnavailableState(unavailState)
+	}
+
+	// A topology event always interrupts any active "clean streak" summary
+	// that may have been aggregating; it happens immediately (before the
+	// per-device comparison below runs) so the streak-ending line appears
+	// next to the event that ended it.
+	if topologyEventThisCycle {
 		flushCleanStreak(logFp)
 	}
 
-	if allUnchanged {
-		// Load ignore list for lpotscan
-		ignoreSet, err := loadIgnoreList(IGNORE_LIST_FILE)
-		if err != nil {
-			logWarn("could not load ignore list: %v", err)
-			ignoreSet = make(map[string]bool)
+	// Per-device Dev/Lnk comparison (Issue #22): this now ALWAYS runs for
+	// every KEEP device with both a baseline and a valid this-cycle snapshot,
+	// independent of whether any OTHER device had a topology event this same
+	// cycle. A device whose snapshot failed this cycle (failedThisCycle) or
+	// that has no baseline yet (freshly NEW this cycle, nothing to compare
+	// against yet) is simply skipped for comparison, exactly as before.
+	ignoreSet, err := loadIgnoreList(IGNORE_LIST_FILE)
+	if err != nil {
+		logWarn("could not load ignore list: %v", err)
+		ignoreSet = make(map[string]bool)
+	}
+
+	lpotscanFile, err := openSecureAppend(LPOTSCAN_LOG, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open %s: %w", LPOTSCAN_LOG, err)
+	}
+	defer lpotscanFile.Close()
+
+	var fieldChanges []DeviceFieldChange
+	for _, bdf := range bdfs {
+		normBdf := normalizeBDF(bdf)
+		if ignoreSet[normBdf] || failedThisCycle[normBdf] {
+			continue
+		}
+		initFile := filepath.Join(TMP_DIR, bdf+"_init.txt")
+		currentFile := filepath.Join(TMP_DIR, bdf+".txt")
+
+		if !fileExists(initFile) || !fileExists(currentFile) {
+			continue
 		}
 
-		// Compare each device using lpotscan logic
-		lpotscanFile, err := openSecureAppend(LPOTSCAN_LOG, 0644)
-		if err != nil {
-			return fmt.Errorf("failed to open %s: %w", LPOTSCAN_LOG, err)
+		result := compareDeviceFiles(initFile, currentFile, ignoreSet, lpotscanFile)
+		fieldChanges = append(fieldChanges, result.Changes...)
+		if result.HasDifferences {
+			overallSuccess = false
+			// Deliberately NOT rebased (Issue #21): initFile stays anchored to
+			// the original, immutable baseline for the lifetime of the run,
+			// exactly like compareDeviceConfigs()' raw config-space baseline.
+			// A link that trains down once and stays there must keep being
+			// reported as a deviation from baseline on every later cycle, not
+			// be silently adopted as the new expected state.
 		}
-		defer lpotscanFile.Close()
-
-		var fieldChanges []DeviceFieldChange
-		for _, bdf := range bdfs {
-			if ignoreSet[normalizeBDF(bdf)] {
-				continue
+		if result.Error != nil {
+			logWarnFp(logFp, "comparison error for %s: %v", bdf, result.Error)
+			// Issue #24: a comparison error (including the six-required-field
+			// check in compareDevices) must never be silently treated as a
+			// clean pass for this BDF. Record it as a NOTICE so -p still stops
+			// future reboots after finishing this cycle's bookkeeping, and the
+			// final verdict is never PERFECT for a cycle that had an
+			// incomplete comparison.
+			recordCycleNotice(fmt.Sprintf("lspci comparison incomplete for %s: %v", bdf, result.Error))
+			if stopService {
+				recordDeviceFieldChanges(fieldChanges)
+				return result.Error
 			}
-			initFile := filepath.Join(TMP_DIR, bdf+"_init.txt")
-			currentFile := filepath.Join(TMP_DIR, bdf+".txt")
-
-			if !fileExists(initFile) || !fileExists(currentFile) {
-				continue
-			}
-
-			result := compareDeviceFiles(initFile, currentFile, ignoreSet, lpotscanFile)
-			fieldChanges = append(fieldChanges, result.Changes...)
-			if result.HasDifferences {
-				overallSuccess = false
-				// Rebase this device's Dev/Lnk baseline to the value just
-				// logged as changed. Without this, a link that trains down
-				// once (e.g. x8 -> x4) and then stays stable at x4 would be
-				// re-reported as "changed" on every subsequent cycle for
-				// the rest of the run, because _init.txt would forever keep
-				// comparing against the ORIGINAL x8 value instead of the
-				// device's current, stable state. Rebasing after logging
-				// the difference means a genuinely new change (e.g. a
-				// later x4 -> x2 drop, or recovering back to x8) is still
-				// correctly detected and logged exactly once, mirroring
-				// the topology baseline rebase for NEW/REMOVED devices
-				// above and compareDeviceConfigs()' initial.bin rebase.
-				if data, err := os.ReadFile(currentFile); err != nil {
-					logWarnFp(logFp, "could not read snapshot to rebase Dev/Lnk baseline for %s: %v", bdf, err)
-				} else if err := writeFileNoFollow(initFile, data, 0644); err != nil {
-					logWarnFp(logFp, "could not rebase Dev/Lnk baseline for %s: %v", bdf, err)
-				}
-			}
-			if result.Error != nil {
-				logWarnFp(logFp, "comparison error for %s: %v", bdf, result.Error)
-				if stopService {
-					recordDeviceFieldChanges(fieldChanges)
-					return result.Error
-				}
-			}
 		}
+	}
 
-		// Persist all Dev/Lnk statistics for this cycle in one read-modify-write.
-		recordDeviceFieldChanges(fieldChanges)
+	// Persist all Dev/Lnk statistics for this cycle in one read-modify-write.
+	recordDeviceFieldChanges(fieldChanges)
 
-		timeStr := getCurrentTimestamp()
-		logFile, err := openSecureAppend(REBOOT_LOG, 0644)
-		if err != nil {
-			return fmt.Errorf("failed to open log file: %v", err)
-		}
-		defer logFile.Close()
+	timeStr := getCurrentTimestamp()
+	logFile, err := openSecureAppend(REBOOT_LOG, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %v", err)
+	}
+	defer logFile.Close()
 
-		if !overallSuccess {
-			flushCleanStreak(logFile)
-			fmt.Fprintf(logFile, "%s %sHad devices changed\n", timeStr, cycleTag())
-			logFile.Sync()
-			recordCycleChange("lspci differences detected")
-			filterLpotscanErrors(LPOTSCAN_LOG, logFile)
-			logFile.Sync()
-		} else {
-			// "No devices changed" is repeated every cycle; collapse
-			// consecutive clean cycles into a single line with a running
-			// counter so the log stays readable across 48 h runs.
-			noteCleanCycle(logFile, timeStr)
-		}
+	if !overallSuccess {
+		flushCleanStreak(logFile)
+		fmt.Fprintf(logFile, "%s %sHad devices changed\n", timeStr, cycleTag())
+		logFile.Sync()
+		recordCycleChange("lspci differences detected")
+		filterLpotscanErrors(LPOTSCAN_LOG, logFile)
+		logFile.Sync()
+	} else if !topologyEventThisCycle {
+		// "No devices changed" is repeated every cycle; collapse
+		// consecutive clean cycles into a single line with a running
+		// counter so the log stays readable across 48 h runs. Only a cycle
+		// with NEITHER a topology event NOR an lspci field change counts as
+		// clean for this streak.
+		noteCleanCycle(logFile, timeStr)
 	}
 
 	return nil

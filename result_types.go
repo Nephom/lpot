@@ -49,10 +49,11 @@ type classificationDevice struct {
 }
 
 type resultChecks struct {
-	Topology    resultCheck `json:"topology"`
-	LSPCI       resultCheck `json:"lspci"`
-	ConfigSpace resultCheck `json:"config_space"`
-	ConfigNoise resultCheck `json:"config_noise"`
+	Topology     resultCheck `json:"topology"`
+	LSPCI        resultCheck `json:"lspci"`
+	ConfigSpace  resultCheck `json:"config_space"`
+	ConfigNoise  resultCheck `json:"config_noise"`
+	Availability resultCheck `json:"availability"`
 }
 
 type resultCheck struct {

@@ -100,8 +100,17 @@ func main() {
 		}
 		return
 	}
-	if *testCycles < 0 {
-		fmt.Fprintln(os.Stderr, "-tm must be greater than zero when provided")
+	// -tm is a cycle-count mode and must be >= 1 whenever the operator
+	// explicitly supplies it. testCycles == 0 is ambiguous on its own: it is
+	// both flag.Int's zero value (meaning "-tm was not provided") and the
+	// one value a user could type by hand as "-tm 0". tmRequested
+	// (flagWasProvided, evaluated before flag.Parse mutates nothing else)
+	// disambiguates the two, so an explicit -tm 0 is rejected outright
+	// instead of silently falling through to the -t timestamp/hour-based
+	// path below (Issue #19).
+	if tmRequested && *testCycles < 1 {
+		fmt.Fprintln(os.Stderr, "-tm must be at least 1 when provided.")
+		fmt.Fprintln(os.Stderr, "Suggestion: use a value such as `-tm 10`, or omit -tm entirely for the -t hour-based mode.")
 		os.Exit(1)
 	}
 	if *testCycles > 0 {
@@ -442,8 +451,8 @@ func main() {
 			"review /lpot/reboot.log and verify that pciutils can query every link-capable device")
 	}
 	if *stopService {
-		noteworthy, configNoise := cycleChangeKind()
-		if cycleRequiresStop(noteworthy, configNoise) {
+		fail, notice, noise := cycleChangeKind()
+		if cycleRequiresStop(fail, notice, noise) {
 			fmt.Fprintf(logFp, "%s %s-p detected a comparison difference; stopping and disabling future reboot cycles.\n",
 				getCurrentTimestamp(), cycleTag())
 			logFp.Sync()
@@ -467,8 +476,8 @@ func main() {
 	// cycleEndStatus is the same classifier cycleRequiresStop (above) consults,
 	// so a cycle can never be labelled "clean (config noise)" here while also
 	// having triggered -p above.
-	noteworthy, configNoise := cycleChangeKind()
-	cycleStatus := cycleEndStatus(noteworthy, configNoise)
+	fail, notice, noise := cycleChangeKind()
+	cycleStatus := cycleEndStatus(fail, notice, noise)
 	logCycleEnd(logFp, rebootCount, cycleStatus)
 	if err := writeResultReport(true); err != nil {
 		fatalOperation("Cycle failed: cannot write the result checkpoint before reboot wait", err,
@@ -483,6 +492,27 @@ func main() {
 			logFp.Sync()
 			generateFinalSummary("")
 			disableFixedCycleService()
+			return
+		}
+	}
+
+	// Time-mode (-t) only: re-check the expiration timestamp now that this
+	// cycle's scan/comparison work is actually done, instead of only at
+	// process startup. The startup check (above, before setupSystemdService)
+	// can pass while the timestamp is still in the future, but PCI scanning
+	// and comparison for this cycle can take long enough that the deadline
+	// passes before we reach the reboot-wait step below. Rebooting anyway at
+	// that point would start a cycle nothing will ever inspect, so this cycle
+	// is finalized as complete instead of triggering one more reboot
+	// (Issue #20). -tm (cycle-count) mode has no timestamp and is unaffected
+	// (guarded by *testCycles == 0, matching the startup check's own guard).
+	if *testCycles == 0 && fileExists(TIMESTAMP_FILE) {
+		if timestamp, err := readTimestamp(); err != nil {
+			logWarn("could not re-check the test expiration timestamp before reboot: %v", err)
+		} else if !time.Now().Before(timestamp) {
+			fmt.Fprintf(logFp, "%s Timestamp expired after this cycle's work completed; finishing without another reboot.\n", getCurrentTimestamp())
+			logFp.Sync()
+			generateFinalSummary("")
 			return
 		}
 	}

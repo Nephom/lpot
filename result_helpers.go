@@ -172,6 +172,33 @@ func parseLspciResultChanges() []lspciResultChange {
 	return changes
 }
 
+// configChangeOccurrenceCounts re-derives the same per-(device, offset)
+// distinct-cycle occurrence counts buildResultReport() computes (via its own
+// cycleSets map), by re-reading CONFIG_CHANGES_LOG. It is the single shared
+// implementation so pci_config_scan.go's live, same-cycle severity decision
+// (rawConfigChangeIsNoteworthy, Issue #25) and result.json's after-the-fact
+// NOTICE/INFO classification always agree on what "count" means for a given
+// row: the number of DISTINCT cycles in which that (device, offset) pair was
+// seen to change, not the raw number of "Value at offset" lines (a single
+// device could in principle log the same offset more than once per cycle,
+// though in practice compareAndLogDeviceChanges only does so once).
+func configChangeOccurrenceCounts() map[string]int {
+	changes := parseConfigResultChanges()
+	cycleSets := make(map[string]map[int]struct{}, len(changes))
+	for _, change := range changes {
+		key := normalizeBDF(change.device) + "\x00" + change.offset
+		if cycleSets[key] == nil {
+			cycleSets[key] = make(map[int]struct{})
+		}
+		cycleSets[key][change.cycle] = struct{}{}
+	}
+	counts := make(map[string]int, len(cycleSets))
+	for key, cycles := range cycleSets {
+		counts[key] = len(cycles)
+	}
+	return counts
+}
+
 // writeAffectedCyclesSection emits a deduplicated per-cycle breakdown of every
 // recorded change, sorted by cycle number. If no changes were recorded the
 // section is reduced to a single line noting perfect stability, so summaries
@@ -253,6 +280,17 @@ func classifyConfigChangeRatio(count, totalCycles int) (ratio float64, noteworth
 	if totalCycles > 0 {
 		ratio = float64(count) / float64(totalCycles)
 	}
+	// Issue #25: fewer than 2 completed cycles is not enough evidence to call
+	// a change "recurring reboot-fixed noise" no matter how high the ratio
+	// comes out. A single cycle with one change always computes to a 100%
+	// occurrence ratio (count/totalCycles == 1/1), which would otherwise sit
+	// at or above rebootFixedThreshold and be misclassified as benign on the
+	// very first cycle it is ever seen — exactly the false-negative the
+	// issue calls out. At least 2 completed cycles are required before a
+	// ratio can be trusted to describe a genuinely recurring pattern.
+	if totalCycles < 2 {
+		return ratio, true
+	}
 	return ratio, ratio < rebootFixedThreshold
 }
 
@@ -270,16 +308,19 @@ const (
 // buildResultReport (result.json's top-level status/message), so the two
 // artifacts can never disagree about whether a run was a full pass, a
 // pass-with-notice, or a fail. cyclesWithChanges counts cycles where a
-// topology or lspci difference was recorded; noteworthyConfigChanges reports
-// whether any config-space change fell below the reboot-fixed threshold.
-func classifyFinalVerdict(cyclesWithChanges int, noteworthyConfigChanges bool) finalVerdictKind {
+// topology or lspci difference was recorded (a confirmed FAIL);
+// hasNoticeEvents reports whether any cycle recorded a NOTICE-severity event
+// (e.g. a device that could not be read — Issue #23) that never escalated to
+// a confirmed FAIL; noteworthyConfigChanges reports whether any config-space
+// change fell below the reboot-fixed threshold.
+func classifyFinalVerdict(cyclesWithChanges int, hasNoticeEvents bool, noteworthyConfigChanges bool) finalVerdictKind {
 	switch {
-	case cyclesWithChanges == 0 && !noteworthyConfigChanges:
-		return verdictPerfect
-	case cyclesWithChanges == 0 && noteworthyConfigChanges:
+	case cyclesWithChanges > 0:
+		return verdictFail
+	case hasNoticeEvents || noteworthyConfigChanges:
 		return verdictNotice
 	default:
-		return verdictFail
+		return verdictPerfect
 	}
 }
 
@@ -297,7 +338,7 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 	// (summary.go) is handed the identical number by generateFinalSummary(),
 	// so reboot.log's "Noteworthy changes" verdict and result.json's
 	// ConfigSpace check can never disagree about how many cycles actually ran.
-	_, completedCyclesFromLog, _, _, _ := parseRebootLogForStats()
+	_, completedCyclesFromLog, _, _, _, _ := parseRebootLogForStats()
 	var startedAt time.Time
 	totalCycles := 0
 	cyclesWithChanges := 0
@@ -345,23 +386,51 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 		if strings.Contains(line, "===== Cycle") && strings.Contains(line, " END (") {
 			completedCycles[current] = true
 			cycle.FinishedAt = lineTimestamp(line)
-			if strings.Contains(line, "changes detected") {
+			// "(notice)" must be checked BEFORE the bare "changes detected"
+			// substring match: cycleEndStatus (reboot_cycle.go) can print
+			// "changes detected (notice)", which also contains the plain
+			// "changes detected" substring. Checking the more specific marker
+			// first prevents a NOTICE-only cycle (e.g. a device that could not
+			// be read this cycle, with no topology/lspci FAIL) from being
+			// misclassified as FAIL here (Issue #25's "-p / severity must not
+			// collapse to FAIL or to clean" requirement, applied consistently
+			// to the per-cycle status too).
+			switch {
+			case strings.Contains(line, "changes detected (notice)"):
+				cycle.Status = "NOTICE"
+			case strings.Contains(line, "changes detected"):
 				cycle.Status = "FAIL"
-			} else if strings.Contains(line, "config noise") {
+			case strings.Contains(line, "config noise"):
 				cycle.Status = "INFO"
-			} else {
+			default:
 				cycle.Status = "PASS"
 			}
 		}
-		if strings.Contains(line, "NEW Device:") || strings.Contains(line, "REMOVED Device:") {
+		if strings.Contains(line, "NEW Device:") || strings.Contains(line, "REMOVED Device:") || strings.Contains(line, "REAPPEARED Device:") {
 			cycle.Topology = "FAIL"
 			problem := resultProblem{Severity: "FAIL", Category: "TOPOLOGY", Cycle: current, Timestamp: lineTimestamp(line), Message: line}
-			if strings.Contains(line, "NEW Device:") {
+			switch {
+			case strings.Contains(line, "NEW Device:"):
 				problem.BDF = parseBDFAfterMarker(line, "NEW Device:")
-			} else {
+			case strings.Contains(line, "REMOVED Device:"):
 				problem.BDF = parseBDFAfterMarker(line, "REMOVED Device:")
+			default:
+				problem.BDF = parseBDFAfterMarker(line, "REAPPEARED Device:")
 			}
 			problem.DetailsLog = REBOOT_LOG
+			cycle.Events = append(cycle.Events, problem)
+		}
+		if strings.Contains(line, "UNAVAILABLE Device:") {
+			// A device that could not be read this cycle (Issue #23): NOTICE
+			// severity, distinct from a confirmed TOPOLOGY FAIL. Only raises
+			// cycle.Status to NOTICE, never downgrades an existing FAIL.
+			if cycle.Status == "PASS" || cycle.Status == "RUNNING" || cycle.Status == "INFO" {
+				cycle.Status = "NOTICE"
+			}
+			problem := resultProblem{
+				Severity: "NOTICE", Category: "AVAILABILITY", Cycle: current, Timestamp: lineTimestamp(line),
+				BDF: parseBDFAfterMarker(line, "UNAVAILABLE Device:"), Message: line, DetailsLog: REBOOT_LOG,
+			}
 			cycle.Events = append(cycle.Events, problem)
 		}
 		if strings.Contains(line, "Had devices changed") {
@@ -373,6 +442,7 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 			// of a single generic line.
 		}
 	}
+	cyclesWithNotices := 0
 	for _, cycle := range cycles {
 		totalCycles++
 		if cycle.Topology == "FAIL" {
@@ -383,6 +453,9 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 		}
 		if cycle.Status == "FAIL" {
 			cyclesWithChanges++
+		}
+		if cycle.Status == "NOTICE" {
+			cyclesWithNotices++
 		}
 	}
 
@@ -491,7 +564,7 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 			// classifyFinalVerdict is the same classifier generateFinalSummary()
 			// (summary.go) uses for reboot.log's "Test Result:" line, so the two
 			// artifacts never disagree about pass/notice/fail for the same run.
-			switch classifyFinalVerdict(cyclesWithChanges, noteworthyConfig > 0) {
+			switch classifyFinalVerdict(cyclesWithChanges, cyclesWithNotices > 0, noteworthyConfig > 0) {
 			case verdictFail:
 				status = "FAIL"
 				message = "Noteworthy PCI topology, lspci, or config-space changes were detected"
@@ -539,10 +612,11 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 		SuccessfulCycles: completed - failed, FailedCycles: failed,
 		Classification: classification,
 		Checks: resultChecks{
-			Topology:    resultCheck{Status: resultStatus(topologyChanges), ChangedCycles: topologyChanges, Message: stabilityMessage("topology", topologyChanges)},
-			LSPCI:       resultCheck{Status: resultStatus(lspciChanges), ChangedCycles: lspciChanges, Message: stabilityMessage("Dev/Lnk", lspciChanges)},
-			ConfigSpace: resultCheck{Status: configSpaceResultStatus(noteworthyConfig), Noteworthy: noteworthyConfig, Message: configSpaceStabilityMessage(noteworthyConfig)},
-			ConfigNoise: resultCheck{Status: configNoiseStatus, BenignChanges: benignConfig, Message: fmt.Sprintf("%d recurring benign register change(s)", benignConfig)},
+			Topology:     resultCheck{Status: resultStatus(topologyChanges), ChangedCycles: topologyChanges, Message: stabilityMessage("topology", topologyChanges)},
+			LSPCI:        resultCheck{Status: resultStatus(lspciChanges), ChangedCycles: lspciChanges, Message: stabilityMessage("Dev/Lnk", lspciChanges)},
+			ConfigSpace:  resultCheck{Status: configSpaceResultStatus(noteworthyConfig), Noteworthy: noteworthyConfig, Message: configSpaceStabilityMessage(noteworthyConfig)},
+			ConfigNoise:  resultCheck{Status: configNoiseStatus, BenignChanges: benignConfig, Message: fmt.Sprintf("%d recurring benign register change(s)", benignConfig)},
+			Availability: resultCheck{Status: configSpaceResultStatus(cyclesWithNotices), Noteworthy: cyclesWithNotices, Message: fmt.Sprintf("%d cycle(s) had a device that could not be read", cyclesWithNotices)},
 		},
 		Cycles: orderedCycles, Problems: problems,
 		Artifacts: map[string]string{"result": RESULT_FILE, "summary": REBOOT_LOG, "lspci": LPOTSCAN_LOG, "config_space": CONFIG_CHANGES_LOG},

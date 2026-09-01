@@ -54,7 +54,7 @@ func generateFinalSummary(statusOverride string) {
 	flushCleanStreak(logFile)
 
 	// Parse the reboot.log to get accurate statistics
-	actualStartTime, actualTotalCycles, actualCyclesWithChanges, actualTopologyChanges, actualLspciChanges := parseRebootLogForStats()
+	actualStartTime, actualTotalCycles, actualCyclesWithChanges, actualTopologyChanges, actualLspciChanges, actualCyclesWithNotices := parseRebootLogForStats()
 
 	endTime := time.Now()
 	// A zero actualStartTime means parseRebootLogForStats() could not find or
@@ -128,6 +128,7 @@ func generateFinalSummary(statusOverride string) {
 	fmt.Fprintf(logFile, "\n")
 	fmt.Fprintf(logFile, "%s   Device topology changes: %d cycles\n", ts, actualTopologyChanges)
 	fmt.Fprintf(logFile, "%s   lspci capability changes: %d cycles\n", ts, actualLspciChanges)
+	fmt.Fprintf(logFile, "%s   Cycles with an unreadable device (notice): %d cycles\n", ts, actualCyclesWithNotices)
 	classification := classificationReportFromBaseline()
 	rawConfigStatus := "STABLE"
 	if stats.CyclesWithConfigChanges > 0 {
@@ -189,7 +190,7 @@ func generateFinalSummary(statusOverride string) {
 		fmt.Fprintf(logFile, "\n%s Test Result: INCOMPLETE\n", ts)
 		fmt.Fprintf(logFile, "%s The test stopped before the planned run completed. Review the recorded cycles and changes above.\n", ts)
 	} else {
-		switch classifyFinalVerdict(actualCyclesWithChanges, noteworthyConfigChanges) {
+		switch classifyFinalVerdict(actualCyclesWithChanges, actualCyclesWithNotices > 0, noteworthyConfigChanges) {
 		case verdictPerfect:
 			fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED SUCCESSFULLY - PERFECT STABILITY\n", ts)
 			if stats.CyclesWithConfigChanges > 0 {
@@ -224,24 +225,31 @@ func generateFinalSummary(statusOverride string) {
 	}
 }
 
-// parseRebootLogForStats parses the reboot.log file to extract accurate statistics
-func parseRebootLogForStats() (time.Time, int, int, int, int) {
+// parseRebootLogForStats parses the reboot.log file to extract accurate
+// statistics. The final return value, cyclesWithNotices, counts distinct
+// cycles that recorded an UNAVAILABLE Device event (Issue #23: a device that
+// is still enumerated but could not be read this cycle) — tracked separately
+// from cyclesWithChanges because an UNAVAILABLE-only cycle is NOTICE
+// severity, not a confirmed topology/lspci FAIL.
+func parseRebootLogForStats() (time.Time, int, int, int, int, int) {
 	var startTime time.Time
 	totalCycles := 0
 	cyclesWithChanges := 0
 	topologyChanges := 0
 	lspciChanges := 0
+	cyclesWithNotices := 0
 
 	data, err := os.ReadFile(REBOOT_LOG)
 	if err != nil {
 		logWarn("could not read reboot.log for stats: %v", err)
-		return time.Time{}, 0, 0, 0, 0
+		return time.Time{}, 0, 0, 0, 0, 0
 	}
 
 	lines := strings.Split(string(data), "\n")
 	cycleHasChanges := false
 	cycleHasTopologyChanges := false
 	cycleHasLspciChanges := false
+	cycleHasNotice := false
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -288,8 +296,8 @@ func parseRebootLogForStats() (time.Time, int, int, int, int) {
 			}
 		}
 
-		// Detect device topology changes (NEW/REMOVED devices)
-		if strings.Contains(line, "NEW Device:") || strings.Contains(line, "REMOVED Device:") {
+		// Detect device topology changes (NEW/REMOVED/REAPPEARED devices)
+		if strings.Contains(line, "NEW Device:") || strings.Contains(line, "REMOVED Device:") || strings.Contains(line, "REAPPEARED Device:") {
 			if !cycleHasTopologyChanges {
 				topologyChanges++
 				cycleHasTopologyChanges = true
@@ -312,11 +320,22 @@ func parseRebootLogForStats() (time.Time, int, int, int, int) {
 			}
 		}
 
+		// Detect NOTICE-severity device-unavailable events (Issue #23).
+		// Counted independently of cycleHasChanges: an UNAVAILABLE-only cycle
+		// must not be folded into cyclesWithChanges (which callers treat as a
+		// confirmed FAIL), but still needs to surface somewhere so it is not
+		// silently invisible in the final summary.
+		if strings.Contains(line, "UNAVAILABLE Device:") && !cycleHasNotice {
+			cyclesWithNotices++
+			cycleHasNotice = true
+		}
+
 		// Reset flags at start of new cycle
 		if strings.Contains(line, "#########Start to test#########") && totalCycles > 0 {
 			cycleHasChanges = false
 			cycleHasTopologyChanges = false
 			cycleHasLspciChanges = false
+			cycleHasNotice = false
 		}
 	}
 
@@ -325,7 +344,7 @@ func parseRebootLogForStats() (time.Time, int, int, int, int) {
 	// duration as if it were measured is worse than admitting the duration is
 	// unknown. Callers must check startTime.IsZero() before using it (see
 	// generateFinalSummary).
-	return startTime, totalCycles, cyclesWithChanges, topologyChanges, lspciChanges
+	return startTime, totalCycles, cyclesWithChanges, topologyChanges, lspciChanges, cyclesWithNotices
 }
 
 // generateConfigSpaceSummary generates the PCI config space analysis summary.

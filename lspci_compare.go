@@ -180,6 +180,14 @@ func leadingWhitespace(line string) int {
 	return count
 }
 
+// isComparedLspciField lists the 11 Dev/Lnk fields this codebase knows how
+// to compare. Whichever of these lspci actually printed for a given device
+// is compared (via the union logic in compareDevices below); a field lspci
+// did not print for a device at all — whether one of the six commonly-seen
+// v1 fields or one of the five v2/Gen4+ fields — is simply not present in
+// that device's DevLnkFields map and is skipped, since its presence depends
+// entirely on what capabilities lspci actually discovered for that specific
+// piece of hardware, not on a fixed required set.
 func isComparedLspciField(field string) bool {
 	switch field {
 	case "DevCap", "DevCtl", "DevSta", "LnkCap", "LnkCtl", "LnkSta",
@@ -190,7 +198,11 @@ func isComparedLspciField(field string) bool {
 	}
 }
 
-// compareDevices compares two devices and returns the comparison result
+// compareDevices compares two devices and returns the comparison result.
+// Only fields present in at least one of the two snapshots are compared
+// (the union, below); a field absent from BOTH snapshots is skipped
+// entirely, since which of the 11 known fields lspci prints depends on what
+// PCIe capabilities the specific device actually advertises.
 func compareDevices(device1, device2 Device, logFile *os.File) ComparisonResult {
 	result := ComparisonResult{HasDifferences: false}
 
