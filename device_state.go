@@ -25,6 +25,13 @@ import (
 const (
 	topologyNamespaceLspci     = "lspci"
 	topologyNamespaceRawConfig = "rawconfig"
+	// topologyNamespaceClassify tracks devices whose PCI config-space read
+	// failed specifically for link classification (writeClassificationReportToLog,
+	// pcie_classify.go). A device can fail this read independently of the
+	// lspci-text and raw config-space comparison paths, so it needs its own
+	// dedup/duration-tracking namespace in unavailableState, exactly like
+	// "lspci" and "rawconfig" already do for their own read paths.
+	topologyNamespaceClassify = "classify"
 )
 
 // topologyState records, per namespace, the set of BDFs currently believed

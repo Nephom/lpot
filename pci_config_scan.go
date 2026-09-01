@@ -405,13 +405,7 @@ func analyzeBitPatterns(samples [][]byte, offset int) (bool, string) {
 	return false, ""
 }
 
-// savePCIConfig saves PCI configuration space to file
-func savePCIConfig(outputFile string) error {
-	_, err := savePCIConfigReportingFailures(outputFile)
-	return err
-}
-
-// savePCIConfigReportingFailures is the implementation behind savePCIConfig.
+// savePCIConfigReportingFailures saves PCI configuration space to file.
 // It additionally returns the list of BDFs whose /sys/.../config read
 // failed, so callers that have a log file open (runConfigScan, via main())
 // can write an explicit reboot.log line naming the affected BDF and reason
@@ -463,11 +457,12 @@ func savePCIConfigReportingFailures(outputFile string) ([]string, error) {
 
 // writeDeviceConfigXXD appends one device's raw config bytes to buffer in
 // the XXD-like format splitDevices() parses back: a "# <short-bdf>" header
-// followed by 16-byte hex/ASCII rows. Shared by
-// savePCIConfigReportingFailures() (the original writer) and
-// rewriteInitialBinBaseline() (which rewrites initial.bin after a
-// NEW/REMOVED device topology event, so the same event is not
-// re-discovered and re-reported on every subsequent cycle).
+// followed by 16-byte hex/ASCII rows. Currently called only from
+// savePCIConfigReportingFailures(), which writes the immutable INITIAL_BIN_FILE
+// baseline exactly once (when it does not yet exist) and every cycle's
+// current-snapshot temp file; initial.bin itself is never rewritten again
+// after that first write (Issue #21: the raw config-space baseline, like the
+// lspci and classification baselines, must stay fixed for the run's lifetime).
 func writeDeviceConfigXXD(buffer *bytes.Buffer, shortBDF string, configData []byte) {
 	buffer.WriteString(fmt.Sprintf("# %s\n", shortBDF))
 	for i := 0; i < len(configData); i += 16 {
@@ -632,7 +627,9 @@ func saveIgnoreBits(filePath string, ignoreBits map[string]DeviceIgnoreBits) err
 // namespace), completely independent of the baseline file's contents.
 //
 // Read-failure handling (Issue #23): a baselined BDF that is still
-// enumerated (endpointFilterAllows) but has no stable sample this cycle is
+// enumerated in sysfs (pciDeviceEnumeratedInSysfs, a direct os.Stat check —
+// NOT this cycle's link classification, which can drop a still-present
+// device for one bad cycle) but has no stable sample this cycle is
 // distinguished from one that has genuinely left sysfs, and reported as
 // UNAVAILABLE (NOTICE severity, retried by collectStableConfig's own
 // sampling) rather than REMOVED.
@@ -732,10 +729,16 @@ func compareDeviceConfigs(initialFile, reportFile string, logFp *os.File) error 
 		}
 		stableCfg, exists := stableConfigs[busID]
 		if !exists {
-			stillEnumerated := endpointFilterAllows(busID)
+			// A genuine presence check against sysfs itself, NOT this cycle's
+			// link classification (endpointFilterAllows would conflate "read
+			// looked bad this cycle" with "device is gone" whenever a
+			// still-present device's link speed/width happens to decode as
+			// invalid mid-retrain — see pciDeviceEnumeratedInSysfs's doc
+			// comment).
+			stillEnumerated := pciDeviceEnumeratedInSysfs(busID)
 			if stillEnumerated {
-				// Present in sysfs (still in the KEEP set) but no stable
-				// sample this cycle: UNAVAILABLE, not REMOVED. This mirrors
+				// Present in sysfs but no stable sample this cycle:
+				// UNAVAILABLE, not REMOVED. This mirrors
 				// processPCIDevices()' lspci-side UNAVAILABLE handling but is
 				// evaluated independently, since a device's raw config-space
 				// sample and its lspci snapshot can fail independently of

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // describePCIBDF returns a short human-readable description of the device at
@@ -102,6 +103,30 @@ func readSysfsConfig(bdf string, n int) []byte {
 		}
 	}
 	return nil
+}
+
+// pciDeviceEnumeratedInSysfs reports whether bdf still has a device
+// directory under SYS_PCI_DEVICES, trying both the short and long BDF forms
+// exactly like readSysfsConfig above. This is a genuine presence check
+// (os.Stat on the directory itself), independent of this cycle's link
+// classification result: a device that is still physically enumerated but
+// whose link speed/width happened to read as invalid this cycle (mid link
+// retrain, a transient config-space glitch, etc.) must be reported as
+// UNAVAILABLE, not REMOVED. Checking classification (KEEP/SKIP) instead of
+// sysfs presence would conflate "this cycle's read looked bad" with "this
+// device is gone", turning a transient read failure into a false topology
+// FAIL.
+func pciDeviceEnumeratedInSysfs(bdf string) bool {
+	candidates := []string{bdf}
+	if shortBDFRegex.MatchString(bdf) {
+		candidates = append(candidates, "0000:"+bdf)
+	}
+	for _, b := range candidates {
+		if info, err := os.Stat(filepath.Join(SYS_PCI_DEVICES, b)); err == nil && info.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 // readPCIDeviceInfo extracts the header / class / capability data needed for
@@ -687,11 +712,49 @@ func persistClassificationConfigDumps(decisions []deviceClassification) error {
 }
 
 func writeClassificationReportToLog(logFp *os.File, decisions []deviceClassification) error {
-	current := classificationSnapshot{Devices: make(map[string]string, len(decisions))}
-	report := buildClassificationReport(decisions)
-	if report.Unverified > 0 {
-		return fmt.Errorf("classification baseline not updated: %d device(s) are unverified", report.Unverified)
+	// A device whose config-space read failed this cycle (InfoOK == false) is
+	// tracked as UNAVAILABLE, exactly like the lspci-text and raw config-space
+	// comparison paths (reboot_cycle.go / pci_config_scan.go), instead of
+	// aborting classification for every OTHER device on the system. Before
+	// this fix, a single transient read failure (e.g. mid link-retrain) made
+	// buildClassificationReport() report Unverified > 0, which made this
+	// function return an error, which made main() call fatalOperation() and
+	// os.Exit(1) — permanently killing the whole multi-hour run, since
+	// lpot.service has Restart=no. That single-device transient glitch must
+	// only ever produce a NOTICE for this cycle, not terminate the test.
+	unavailState := loadUnavailableState()
+	unavailStateDirty := false
+	nowTs := time.Now()
+	currentCycleNum := currentCycle.Load()
+	verifiedDecisions := make([]deviceClassification, 0, len(decisions))
+	for _, decision := range decisions {
+		if !decision.InfoOK {
+			unavailDesc := unavailableMark(&unavailState, topologyNamespaceClassify, decision.BDF, currentCycleNum, nowTs)
+			unavailStateDirty = true
+			fmt.Fprintf(logFp, "%s %sUNAVAILABLE Device: %s (PCI config-space read failed for link classification; %s)\n",
+				getCurrentTimestamp(), cycleTag(), decision.BDF, unavailDesc)
+			recordCycleNotice(fmt.Sprintf("device unreadable (classification): %s (%s)", decision.BDF, unavailDesc))
+			continue
+		}
+		if recovered := unavailableClear(&unavailState, topologyNamespaceClassify, decision.BDF, nowTs); recovered != "" {
+			unavailStateDirty = true
+			fmt.Fprintf(logFp, "%s %sDevice %s is readable again (classification) — %s\n", getCurrentTimestamp(), cycleTag(), decision.BDF, recovered)
+		}
+		verifiedDecisions = append(verifiedDecisions, decision)
 	}
+	if unavailStateDirty {
+		saveUnavailableState(unavailState)
+	}
+
+	// Every comparison and baseline decision below operates on
+	// verifiedDecisions only: a device unreadable THIS cycle keeps whatever
+	// baseline/reported state it already had (it is simply absent from
+	// `current` below, exactly like a REMOVED device would be), and is picked
+	// back up automatically once it becomes readable again — it is never
+	// silently dropped from the baseline, and its absence this cycle is never
+	// misreported as "classification changed" or "removed".
+	current := classificationSnapshot{Devices: make(map[string]string, len(verifiedDecisions))}
+	report := buildClassificationReport(verifiedDecisions)
 	for _, item := range report.Devices {
 		encoded, err := json.Marshal(item)
 		if err != nil {
@@ -708,8 +771,17 @@ func writeClassificationReportToLog(logFp *os.File, decisions []deviceClassifica
 		}
 	}
 	if readErr != nil || len(previous.Devices) == 0 {
-		fmt.Fprintf(logFp, "\n%s===== Complete PCI link classification (%d devices) =====\n", cycleTag(), len(decisions))
-		printClassificationReport(logFp, decisions)
+		if len(current.Devices) == 0 {
+			// Every device failed to read this cycle (already reported as
+			// UNAVAILABLE above): there is nothing verified yet to establish a
+			// baseline from. Wait for a future cycle where at least one device
+			// is readable, exactly like processPCIDevices()/compareDeviceConfigs()
+			// wait for a device's first successful snapshot before creating its
+			// <bdf>_init.txt / initial.bin entry.
+			return nil
+		}
+		fmt.Fprintf(logFp, "\n%s===== Complete PCI link classification (%d devices) =====\n", cycleTag(), len(verifiedDecisions))
+		printClassificationReport(logFp, verifiedDecisions)
 		// Written exactly once, the first cycle a valid classification baseline
 		// exists (Issue #21): CLASSIFY_STATE_FILE is never rebased again after
 		// this, so every later cycle keeps comparing against this SAME
@@ -721,16 +793,46 @@ func writeClassificationReportToLog(logFp *os.File, decisions []deviceClassifica
 	}
 
 	changed := make([]deviceClassification, 0)
-	for _, decision := range decisions {
+	for _, decision := range verifiedDecisions {
 		if previous.Devices[decision.BDF] != current.Devices[decision.BDF] {
 			changed = append(changed, decision)
 		}
 	}
+	// allBDFsThisCycle covers every BDF classifyDevices() saw THIS cycle,
+	// including ones whose read failed (InfoOK == false) — unlike
+	// current.Devices, which only holds verifiedDecisions. This is the
+	// correct signal for "genuinely gone from sysfs" (fetchPCIBDFs simply
+	// stopped listing it, so it is absent from decisions entirely) versus
+	// "still enumerated but unreadable this cycle" (present in decisions,
+	// just with InfoOK == false).
+	allBDFsThisCycle := make(map[string]bool, len(decisions))
+	for _, decision := range decisions {
+		allBDFsThisCycle[decision.BDF] = true
+	}
+
 	removed := make([]string, 0)
 	for bdf := range previous.Devices {
-		if _, ok := current.Devices[bdf]; !ok {
-			removed = append(removed, bdf)
+		if _, ok := current.Devices[bdf]; ok {
+			continue
 		}
+		if allBDFsThisCycle[bdf] {
+			// Still enumerated this cycle (its UNAVAILABLE Device line and
+			// unavailableMark/recordCycleNotice were already handled in the
+			// verification loop above); reporting it "removed" here too would
+			// duplicate that event with a second, contradictory "classification
+			// entry removed" line for the exact same transient read failure.
+			continue
+		}
+		// Genuinely gone from sysfs: clear any stale UNAVAILABLE marker left
+		// over from when it was still enumerated but failing to read, so it
+		// does not linger in unavailableState forever.
+		if unavailableClear(&unavailState, topologyNamespaceClassify, bdf, nowTs) != "" {
+			unavailStateDirty = true
+		}
+		removed = append(removed, bdf)
+	}
+	if unavailStateDirty {
+		saveUnavailableState(unavailState)
 	}
 	sort.Strings(removed)
 

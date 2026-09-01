@@ -67,12 +67,16 @@ may de-duplicate persistent transition messages, but it must not change the
 comparison baseline. A device disappearing and later returning are two
 separate changes; a BDF change is recorded as removal plus addition.
 
-Without `-p`, an unreadable device is recorded as an incomplete observation
-and the reboot cycle continues. With `-p`, the current cycle is recorded and
-future reboots stop. Raw config-space changes with unchanged same-BDF lspci
-capability fields are NOTICE; topology changes and changes to required lspci
-fields are FAIL. The six required fields are `DevCap`, `DevCtl`, `DevSta`,
-`LnkCap`, `LnkCtl`, and `LnkSta`; `*2` fields are optional.
+An unreadable-but-still-enumerated device (UNAVAILABLE) is distinct from one
+that has genuinely left sysfs (REMOVED); see architecture.md's "Reboot Cycle"
+section. Without `-p`, either kind is recorded and the reboot cycle continues.
+With `-p`, the current cycle is recorded and future reboots stop after either
+a FAIL or a NOTICE event — not just a FAIL. An unconfirmed raw config-space
+change and an UNAVAILABLE device are NOTICE; topology changes and lspci
+Dev/Lnk capability field changes are FAIL. None of the 11 known lspci Dev/Lnk
+fields (`DevCap`, `DevCtl`, `DevSta`, `LnkCap`, `LnkCtl`, `LnkSta`, and the
+optional `*2`/Gen4+ variants) is required to be present; whichever fields a
+device's `lspci -vv` output actually contains are compared.
 
 Behavior changes, bugs, security fixes, parser limitations, and future
 host-manager or dashboard work belong in GitHub Issues. Keep this directory

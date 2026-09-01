@@ -2,7 +2,8 @@
 
 This is a focused guide to the functions that define the program's behavior.
 It is not generated API documentation; the source remains the authoritative
-reference.
+reference. For the complete, generated, per-function caller/callee index and
+flow diagrams, see [`call-graph.md`](call-graph.md).
 
 The implementation is intentionally still `package main`; the files are split
 by responsibility first so behavior can be verified before introducing
@@ -10,14 +11,10 @@ by responsibility first so behavior can be verified before introducing
 
 ## Lifecycle and Signals
 
-- `main` (`cli_main.go`, build tag `!simulate`): validates the host, parses
-  flags — rejecting `-t`/`-tm` used together and invalid `-tm` counts —
-  initializes state, executes one cycle, and schedules the next cycle through
-  systemd. `-tm n` means n cycles and at most n-1 reboots.
-- `main` (`simulate_main.go`, build tag `simulate`): drives an offline
-  10-cycle simulation against a synthetic PCI device model, calling the
-  same production comparison/reporting functions `cli_main.go`'s `main`
-  does; see `architecture.md`.
+- `main` (`cli_main.go`): validates the host, parses flags — rejecting
+  `-t`/`-tm` used together and invalid `-tm` counts — initializes state,
+  executes one cycle, and schedules the next cycle through systemd. `-tm n`
+  means n cycles and at most n-1 reboots.
 - `setupSignalHandlers`: turns SIGINT/SIGTERM into `stopFlag` and context
   cancellation.
 - `sleepInterruptible`: waits for a duration while responding to context
@@ -59,8 +56,6 @@ by responsibility first so behavior can be verified before introducing
 - `logWarnFp`: writes the same warning to stderr and, with a timestamp and
   cycle tag, to an open cycle log file. Used for warnings that happen during
   a reboot cycle and should also be visible in `reboot.log`.
-- `warnIncompleteReport`: the single call site for "could not save the
-  incomplete test report" on every early-exit path in `main()`.
 - `fatalOperation` (in `runtime.go`): prints an operation, the underlying
   error, and an optional operator suggestion, then exits with status 1. Every
   fatal startup/mode error in `main()` funnels through this helper.
@@ -70,23 +65,33 @@ by responsibility first so behavior can be verified before introducing
 - `fetchPCIBDFs`: discovers PCI devices from sysfs.
 - `readPCIDeviceInfo`: reads vendor, class, header, and capability metadata.
 - `classifyDevices`: applies endpoint rules and user overrides.
-- `filterEndpoints`: returns devices to compare and records skipped devices.
+- `filterClassifiedEndpoints`: partitions an already-classified device list
+  into the KEEP set (returned) and the SKIP set (recorded for the report),
+  from an existing classification report rather than reclassifying.
 - `normalizeBDF`: unifies `0000:` and short BDF forms on single-domain hosts.
 - `printClassificationReport`: renders deterministic classification output.
 
 ## Scanning and Comparison
 
 - `scanAndGenerateIgnoreBits`: detects recurring volatile configuration bytes.
-- `savePCIConfig` / `compareDeviceConfigs`: persist and compare binary PCI
-  configuration snapshots.
+- `savePCIConfigReportingFailures` / `compareDeviceConfigs`: persist and
+  compare binary PCI configuration snapshots. A baselined BDF that is still
+  enumerated in sysfs (`pciDeviceEnumeratedInSysfs`) but has no stable sample
+  this cycle is reported as UNAVAILABLE (NOTICE); one that has genuinely left
+  sysfs is reported as REMOVED (FAIL). Neither ever rewrites `initial.bin`.
 - `executeLspci`: captures one device's `lspci -vv` output.
 - `processPCIDevices`: compares topology and per-device text snapshots against
   immutable first-valid-cycle baselines; opens `lpotscan.log` once per cycle
   and passes it to `compareDeviceFiles`/`compareDevices`. Separate observation
   state de-duplicates persistent transitions without changing the baseline.
-- `isComparedLspciField`: the six required `Dev`/`Lnk` capability fields
-  (`DevCap`, `DevCtl`, `DevSta`, `LnkCap`, `LnkCtl`, `LnkSta`) plus optional
-  `*2` fields, which are compared when present.
+  The same UNAVAILABLE-vs-REMOVED distinction `compareDeviceConfigs` makes
+  applies here too, via the same `pciDeviceEnumeratedInSysfs` sysfs check.
+- `isComparedLspciField`: the 11 known `Dev`/`Lnk` capability fields (`DevCap`,
+  `DevCtl`, `DevSta`, `LnkCap`, `LnkCtl`, `LnkSta`, and the optional
+  `*2`/Gen4+ variants). Whichever of these a specific device's `lspci -vv`
+  output actually contains is compared (a union of both snapshots); a field
+  absent from BOTH snapshots is simply skipped, since not every device
+  advertises every field.
 - `compareDeviceFiles` / `compareDevices`: apply the ignore list and diff the
   selected `lspci` text fields between an `_init.txt` baseline and the current
   snapshot; each difference is written as one compact `<BDF> | <field>
@@ -106,18 +111,30 @@ by responsibility first so behavior can be verified before introducing
 
 ## Reporting
 
-- `recordCycleChange` / `recordCycleNoise`: classify cycle observations and
+- `recordCycleChange` / `recordCycleNotice` / `recordCycleNoise`: classify
+  cycle observations into one of three severities — FAIL (topology/lspci
+  changes, always), NOTICE (unconfirmed config-space changes, unreadable
+  devices), or INFO (confirmed recurring benign config-space noise) — and
   persist each one as a JSON line to `change_log.jsonl`
   (`appendChangeLogEntry`) so the whole-run "Affected Cycles" summary
-  survives the brand-new process each reboot cycle runs in.
+  survives the brand-new process each reboot cycle runs in. `cycleChangeKind`/
+  `cycleEndStatus`/`cycleRequiresStop` (`reboot_cycle.go`) are the single
+  shared classifiers both the cycle-end banner and the `-p` stop condition
+  consult, so the two can never disagree.
 - `loadPersistedCycleChanges`: reads every event ever recorded across the
   run from `change_log.jsonl`; the sole data source for
   `writeAffectedCyclesSection`.
-- `recordConfigSpaceChangeCycle` / `recordDeviceFieldChange`: persist
+- `recordConfigSpaceChangeCycle` / `recordDeviceFieldChanges`: persist
   whole-run counters (cycles with config-space changes; per-device and
   per-field lspci change tallies) to `test_stats.json`
   (`loadTestStats`/`saveTestStats`), for the same brand-new-process-per-cycle
   reason as `change_log.jsonl`.
+- `topologyState` / `unavailableState` / `classifyReportedState`
+  (`device_state.go`): small persisted JSON files that dedupe repeated
+  present/absent and read-failure log lines across many cycles WITHOUT ever
+  touching the immutable comparison baselines (`<bdf>_init.txt`,
+  `initial.bin`, the classification baseline). See `call-graph.md`'s Flow
+  Diagrams for exactly where each one is consulted.
 - `noteCleanCycle` / `flushCleanStreak`: compact repeated clean-cycle output.
 - `generateFinalSummary`: writes aggregate results and affected-cycle details.
 - `parseRebootLogForStats`: derives summary counters from the persisted log.

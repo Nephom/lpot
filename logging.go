@@ -22,10 +22,3 @@ func logWarnFp(logFp *os.File, format string, args ...interface{}) {
 		fmt.Fprintf(logFp, "%s %sWarning: %s\n", getCurrentTimestamp(), cycleTag(), msg)
 	}
 }
-
-// warnIncompleteReport reports that an incomplete test result report could
-// not be saved. It is called from several places along main()'s early-exit
-// paths, all of which previously duplicated this exact message.
-func warnIncompleteReport(err error) {
-	logWarn("could not save the incomplete test report: %v", err)
-}

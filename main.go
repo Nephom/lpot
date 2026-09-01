@@ -9,10 +9,8 @@ import (
 
 // Path variables. All persistent state lives under LPOT_DIR so behaviour is
 // independent of the caller's working directory. These are declared as var
-// (not const) solely so setSimulationRoot() (simulate_main.go, built only
-// under the "simulate" build tag) can redirect every path under a throwaway
-// test directory for offline simulation runs; the normal (non-simulate)
-// binary never reassigns them and they behave exactly like constants.
+// rather than const for historical reasons only; no code in this repository
+// ever reassigns them, so in practice they behave exactly like constants.
 var (
 	LPOT_DIR            = "/lpot"
 	PERSISTENT_BINARY   = "/lpot/lpot"
@@ -59,10 +57,10 @@ var (
 	// but transiently unreadable); conflating the two would misreport a
 	// flaky read as a topology change or vice versa.
 	UNAVAILABLE_STATE_FILE = "/lpot/device_unavailable_state.json"
-	// INITIAL_BIN_FILE is the one-time raw config-space baseline snapshot
-	// (compareDeviceConfigs' initialFile). Named/centralised here instead of
-	// three separate "/lpot/initial.bin" string literals so setSimulationRoot
-	// can redirect it along with every other runtime path.
+	// INITIAL_BIN_FILE is the one-time, never-rewritten raw config-space
+	// baseline snapshot (compareDeviceConfigs' initialFile). Named/centralised
+	// here instead of repeating the "/lpot/initial.bin" string literal at
+	// every call site.
 	INITIAL_BIN_FILE = "/lpot/initial.bin"
 	// CLEAN_STREAK_STATE_FILE persists the in-progress "consecutive clean
 	// cycles" counter across reboots. Each reboot cycle runs in a brand-new
@@ -162,9 +160,9 @@ var (
 	changedCycles   []cycleChange
 
 	// endpointFilterSet, when non-nil, restricts every PCI-touching path
-	// (savePCIConfig, compareDeviceConfigs, processPCIDevices) to the set of
-	// short BDFs it contains. nil means "no filter" so unit tests and the
-	// legacy code path keep working unchanged.
+	// (savePCIConfigReportingFailures, compareDeviceConfigs, processPCIDevices)
+	// to the set of short BDFs it contains. nil means "no filter" so unit
+	// tests and the legacy code path keep working unchanged.
 	endpointFilterSet       map[string]bool
 	classifiedDevicesGlobal []deviceClassification
 )

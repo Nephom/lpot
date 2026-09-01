@@ -153,8 +153,20 @@ All persistent state is stored under `/lpot`:
   comparison baseline.
 - `result.json`: structured cycle checkpoint and final test report.
 - `pci_devices_classify_state.json`: first-valid-cycle classification baseline;
-  it is not rewritten when a classification changes. Separate observation
-  state records present/absent and classification transitions.
+  it is not rewritten when a classification changes.
+- `pci_devices_classify_reported.json`: dedup cache tracking which
+  classification deviation was last reported for each device, so a device
+  that deviates from the baseline once and stays at that same deviated value
+  is logged exactly once, not on every subsequent cycle. This is separate
+  from the baseline above and never affects it.
+- `topology_state.json`: per-tracking-path (lspci-text / raw config-space)
+  record of which BDFs are currently believed absent, so a REMOVED/REAPPEARED
+  event is logged exactly once per transition instead of on every cycle a
+  device stays absent. Never affects the immutable baseline files.
+- `device_unavailable_state.json`: per-tracking-path record of which
+  still-enumerated BDFs are currently unreadable (UNAVAILABLE), with the
+  cycle/time each one was first seen unavailable, so "how long has this been
+  unavailable" can be reported accurately.
 - `change_log.jsonl`: one JSON line per recorded topology/lspci/config-space
   change event, accumulated for the entire run. Because each reboot cycle
   runs in a brand-new process, this file (not an in-memory list) is what lets
@@ -163,6 +175,9 @@ All persistent state is stored under `/lpot`:
 - `test_stats.json`: persisted whole-run counters ("Most affected device",
   "Most changed field", and whether any raw config-space change occurred),
   for the same brand-new-process-per-cycle reason as `change_log.jsonl`.
+- `clean_streak_state.json`: the in-progress "N consecutive clean cycles"
+  counter, persisted so it survives the reboot between cycles instead of
+  resetting to 1 every cycle.
 - `command_user_custom.log`: stdout and stderr from the optional background
   command configured with `-c`.
 
@@ -177,13 +192,19 @@ inspection. Reboot controls remain root-only: `/lpot/lpot` and
 reboot wait begins, and again as the final aggregated report when the test
 expires. Writes use a temporary file, `fsync`, and atomic rename so the
 dashboard never intentionally reads a partially written JSON document.
-Its top-level status is `RUNNING` for a checkpoint, `PASS` only when the
-completed test has no changes, `NOTICE` when raw config-space changed but the
-same-BDF lspci capability fields did not, `FAIL` when topology or required
-lspci capability fields changed, and `INCOMPLETE` when the planned run is
-stopped before completion. A read failure is recorded as an incomplete
-observation; without `-p` the next reboot cycle still proceeds, while `-p`
-stops future reboots after the current cycle is recorded. Every interrupted,
-stop-requested, or failed-reboot exit also appends a final `Test Session Summary`
-to `reboot.log`; the summary is marked `INCOMPLETE` and contains all statistics
-available from the cycles recorded before the interruption.
+Its top-level status is `RUNNING` for a checkpoint, `FAIL` when any topology
+or lspci Dev/Lnk capability field changed in at least one cycle,
+`INCOMPLETE` when the planned run is stopped before completion, and `PASS`
+otherwise — `PASS`'s accompanying `message` distinguishes a fully clean run
+from one where an unconfirmed raw config-space change and/or one or more
+UNAVAILABLE-device cycles still need review (see the `checks.config_space`
+and `checks.availability` sections for the exact counts). An unreadable
+device is recorded as UNAVAILABLE — NOTICE severity if it is still
+enumerated, or REMOVED (FAIL severity) if it has genuinely left sysfs; see
+architecture.md's "Reboot Cycle" section. Without `-p` the next reboot cycle
+still proceeds after either kind of event, while `-p` stops future reboots
+after the current cycle is recorded for either a FAIL or a NOTICE event.
+Every interrupted, stop-requested, or failed-reboot exit also appends a final
+`Test Session Summary` to `reboot.log`; the summary is marked `INCOMPLETE`
+and contains all statistics available from the cycles recorded before the
+interruption.

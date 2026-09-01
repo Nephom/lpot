@@ -1,5 +1,3 @@
-//go:build !simulate
-
 package main
 
 import (
@@ -12,6 +10,14 @@ import (
 	"time"
 )
 
+// main is the process entry point for every LPOT mode: -h/-r/-scan/-classify/-ui
+// (each returns early without entering the reboot-cycle path), and the normal
+// -t/-tm reboot-test path, which runs exactly one cycle (PCI discovery,
+// classification, raw config-space scan, lspci Dev/Lnk comparison, result
+// checkpoint) then either reboots and lets systemd re-exec this same binary
+// for the next cycle, or finalizes the run when the cycle/time limit or a
+// stop condition is reached. See architecture.md's "Startup Flow" and
+// "Reboot Cycle" sections for the full sequence this function implements.
 func main() {
 	// Parse flags before requiring root or resolving Linux-only tools. This keeps
 	// `./lpot` and `./lpot -h` useful from a development machine and makes the
@@ -160,8 +166,12 @@ func main() {
 				"check /lpot/config_dump permissions and PCI sysfs access")
 		}
 		if report := buildClassificationReport(decisions); report.Unverified > 0 {
-			fatalOperation("Classification failed", fmt.Errorf("%d PCI devices could not be verified", report.Unverified),
-				"run -classify to review the report and check /lpot/pcie_filter.txt")
+			// The report above (stdout and CLASSIFY_LOG) already lists exactly
+			// which BDF(s) could not be read; a warning here — not
+			// fatalOperation/os.Exit(1) — avoids telling the operator the
+			// command "failed" immediately after successfully printing a
+			// complete, readable report.
+			logWarn("%d device(s) could not be verified this run; see the Verification column above", report.Unverified)
 		}
 		return
 	}
@@ -350,19 +360,23 @@ func main() {
 			"fix PCI config-space access and verify the classification baseline file")
 	}
 	logFp.Sync()
-	if report := buildClassificationReport(decisions); report.Unverified > 0 {
-		fatalOperation("Startup failed: PCI link classification is unverified",
-			fmt.Errorf("%d device(s) could not be read", report.Unverified),
-			"fix PCI config-space access and rerun -classify")
-	}
+	// Issue #23: a device that fails its classification read this cycle is
+	// handled entirely INSIDE writeClassificationReportToLog above (bounded
+	// per-BDF UNAVAILABLE tracking + NOTICE, matching the lspci-text and raw
+	// config-space paths). This cycle must proceed to the next reboot exactly
+	// like those two paths do; it must never call fatalOperation()/os.Exit(1)
+	// here for a transient single-device read failure — lpot.service has
+	// Restart=no, so exiting here would permanently kill the entire multi-hour
+	// run instead of just flagging this cycle and continuing.
 	// Measure actual raw config-space readability instead of asserting a
 	// hardcoded 100%: a device whose /sys/.../config read returns fewer than
 	// the 64-byte minimum PCI header is not truly "covered" even though it is
-	// present in bdfs. This is the same readability test savePCIConfig() and
-	// parsePCIConfig() apply, so this line and the later per-device warnings
-	// (see savePCIConfig) describe the same underlying measurement. Coverage is
-	// measured only over the KEEP set (bdfs, already filtered above), since
-	// SKIP devices are intentionally excluded from every later comparison.
+	// present in bdfs. This is the same readability test
+	// savePCIConfigReportingFailures() and parsePCIConfig() apply, so this line
+	// and the later per-device warnings describe the same underlying
+	// measurement. Coverage is measured only over the KEEP set (bdfs, already
+	// filtered above), since SKIP devices are intentionally excluded from
+	// every later comparison.
 	readableConfigCount := 0
 	var unreadableConfigBDFs []string
 	for _, bdf := range bdfs {

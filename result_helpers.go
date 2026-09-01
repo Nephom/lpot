@@ -176,8 +176,8 @@ func parseLspciResultChanges() []lspciResultChange {
 // distinct-cycle occurrence counts buildResultReport() computes (via its own
 // cycleSets map), by re-reading CONFIG_CHANGES_LOG. It is the single shared
 // implementation so pci_config_scan.go's live, same-cycle severity decision
-// (rawConfigChangeIsNoteworthy, Issue #25) and result.json's after-the-fact
-// NOTICE/INFO classification always agree on what "count" means for a given
+// (compareDeviceConfigs' post-loop batch check, Issue #25) and result.json's
+// after-the-fact NOTICE/INFO classification always agree on what "count" means for a given
 // row: the number of DISTINCT cycles in which that (device, offset) pair was
 // seen to change, not the raw number of "Value at offset" lines (a single
 // device could in principle log the same offset more than once per cycle,
@@ -570,7 +570,20 @@ func buildResultReport(checkpoint bool, statusOverride string) resultReport {
 				message = "Noteworthy PCI topology, lspci, or config-space changes were detected"
 			case verdictNotice:
 				status = "PASS"
-				message = "PCI topology and lspci capability are stable; config-space notices require review"
+				// The message must name the ACTUAL source of the notice: it can be
+				// an unconfirmed raw config-space change, one or more cycles where
+				// a still-enumerated device could not be read (Issue #23), or
+				// both — pointing the operator only at "config-space" when the
+				// real cause was an unreadable device would send them to the
+				// wrong section of reboot.log.
+				switch {
+				case noteworthyConfig > 0 && cyclesWithNotices > 0:
+					message = "PCI topology and lspci capability are stable; config-space and device-availability notices require review"
+				case cyclesWithNotices > 0:
+					message = "PCI topology and lspci capability are stable; one or more cycles had a device that could not be read and require review"
+				default:
+					message = "PCI topology and lspci capability are stable; config-space notices require review"
+				}
 			default:
 				status = "PASS"
 				message = "PCI topology, lspci capability, and PCI config are stable"

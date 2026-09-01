@@ -481,6 +481,24 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 		}
 		currentFile := filepath.Join(TMP_DIR, bdf+".txt")
 		presentNow := bdfSet[normBdf] && fileExists(currentFile)
+
+		// A baselined BDF that this cycle's link classification excluded from
+		// bdfs (e.g. its link speed/width happened to decode as invalid mid
+		// retrain, dropping it out of the KEEP set for this cycle only) never
+		// even reaches Step 1's executeLspci call above, so !presentNow here
+		// does NOT by itself mean the device is gone. Check sysfs directly
+		// (pciDeviceEnumeratedInSysfs), exactly like the raw config-space path
+		// in compareDeviceConfigs(), so a still-physically-present device with
+		// one bad classification cycle is reported as UNAVAILABLE, not
+		// REMOVED.
+		if !presentNow && !bdfSet[normBdf] && pciDeviceEnumeratedInSysfs(bdf) {
+			unavailDesc := unavailableMark(&unavailState, topologyNamespaceLspci, normBdf, currentCycleNum, nowTs)
+			unavailStateDirty = true
+			fmt.Fprintf(logFp, "%s %sUNAVAILABLE Device: %s (excluded from this cycle's link-capable set but still present in sysfs; %s)\n",
+				getCurrentTimestamp(), cycleTag(), bdf, unavailDesc)
+			recordCycleNotice(fmt.Sprintf("device unreadable (lspci): %s (%s)", bdf, unavailDesc))
+			continue
+		}
 		wasAbsent := topologyIsAbsent(topoState, topologyNamespaceLspci, normBdf)
 
 		switch {

@@ -201,7 +201,21 @@ func generateFinalSummary(statusOverride string) {
 			}
 		case verdictNotice:
 			fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED WITH NOTICE\n", ts)
-			fmt.Fprintf(logFile, "%s The devices themselves did not change across %d reboots, but some settings changed in an unusual way. Please check the 'Noteworthy changes' section above.\n", ts, actualTotalCycles)
+			// Name the actual source of the notice, exactly like
+			// buildResultReport()'s equivalent message (result_helpers.go): an
+			// unconfirmed config-space change, one or more cycles with an
+			// unreadable device (Issue #23), or both. "some settings changed"
+			// alone would send the operator to the wrong section of this log
+			// when the actual cause was a device read failure, not a
+			// config-space byte change.
+			switch {
+			case noteworthyConfigChanges && actualCyclesWithNotices > 0:
+				fmt.Fprintf(logFile, "%s The devices themselves did not change across %d reboots, but some settings changed in an unusual way and %d cycle(s) had a device that could not be read. Please check the 'Noteworthy changes' section and the 'unreadable device' count above.\n", ts, actualTotalCycles, actualCyclesWithNotices)
+			case actualCyclesWithNotices > 0:
+				fmt.Fprintf(logFile, "%s The devices themselves did not change across %d reboots, but %d cycle(s) had a device that could not be read. Please check the 'Cycles with an unreadable device (notice)' count above.\n", ts, actualTotalCycles, actualCyclesWithNotices)
+			default:
+				fmt.Fprintf(logFile, "%s The devices themselves did not change across %d reboots, but some settings changed in an unusual way. Please check the 'Noteworthy changes' section above.\n", ts, actualTotalCycles)
+			}
 		default:
 			fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED - REVIEW NOTEWORTHY CHANGES\n", ts)
 			fmt.Fprintf(logFile, "%s Some devices changed or disappeared during the %d reboots. See 'Affected Cycles' above for details.\n", ts, actualTotalCycles)

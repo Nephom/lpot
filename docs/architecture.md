@@ -8,36 +8,31 @@ Linux sysfs, `lspci`, PCI configuration files, systemd, and reboot persistence.
 
 Current file boundaries are:
 
-- `main.go`: path variables (redirectable only by `simulate_main.go`, see
-  below), other constants, and package-level global state shared by every
-  build variant.
-- `cli_main.go`: `func main()` for the normal production binary (build tag
-  `!simulate`, the default): flag parsing, mode dispatch, and the top-level
-  startup/cycle/reboot-wait sequence.
-- `simulate_main.go`: `func main()` for an offline, root-free 10-cycle
-  simulation binary (build tag `simulate`, built with
-  `go build -tags simulate`). It exercises the same production comparison
-  and reporting functions used by `cli_main.go` (`classifyDevices`,
-  `runConfigScan`, `processPCIDevices`, `generateFinalSummary`,
-  `writeResultReport`) against a synthetic PCI device model and a fake
-  `lspci` script, entirely under a throwaway `./test` directory. It is a
-  verification/review tool only and is never installed on a real host.
+- `main.go`: path variables, other constants, and package-level global state.
+- `cli_main.go`: `func main()`, the single process entry point: flag parsing,
+  mode dispatch, and the top-level startup/cycle/reboot-wait sequence.
 - `bdf.go`: BDF regular expressions and `normalizeBDF()`.
 - `cli.go`: `-c` argument splitting and `-h` help text.
 - `lifecycle.go`: root/tool-path resolution, `/lpot` directory safety,
   persistent binary and reboot-script installation, systemd bookkeeping
   helpers, and reboot-count/timestamp/cycle-limit persistence.
-- `logging.go`: shared `logWarn`/`logWarnFp`/`warnIncompleteReport`
-  helpers so warning output shares one prefix and format.
-- `pcie_classify.go`: PCIe endpoint classification (KEEP/SKIP/UNVERIFIED),
-  link-capability decoding, and the classification report/baseline.
+- `logging.go`: shared `logWarn`/`logWarnFp` helpers so warning output shares
+  one prefix and format.
+- `pcie_classify.go`: PCIe endpoint classification (KEEP/SKIP), link-capability
+  decoding, the classification report/baseline, and per-device UNAVAILABLE
+  tracking for devices whose config-space read fails during classification.
 - `pci_config_scan.go`: raw PCI configuration-space sampling, volatile-byte
   detection, and `-scan`/config-space comparison against a fixed baseline.
-- `lspci_compare.go`: per-device `lspci -vv` text parsing and the selected
-  Dev/Lnk capability-field comparison against a fixed baseline.
+- `lspci_compare.go`: per-device `lspci -vv` text parsing and Dev/Lnk
+  capability-field comparison (union of whichever of the 11 known fields
+  either snapshot actually contains) against a fixed baseline.
+- `device_state.go`: small persisted JSON state files (`topologyState`,
+  `unavailableState`, `classifyReportedState`) that dedupe repeated
+  present/absent and read-failure log lines across many cycles WITHOUT ever
+  touching an immutable comparison baseline.
 - `reboot_cycle.go`: per-cycle orchestration (`processPCIDevices`), event
-  transition bookkeeping, cycle change/noise bookkeeping, and clean-streak log
-  compaction. Change/noise bookkeeping is persisted to
+  transition bookkeeping, three-tier cycle change/notice/noise bookkeeping,
+  and clean-streak log compaction. Bookkeeping is persisted to
   `change_log.jsonl` and `test_stats.json` so a multi-cycle summary survives
   the brand-new process each reboot cycle runs in.
 - `summary.go`: the final test summary and PCI config-space summary sections
@@ -49,16 +44,13 @@ Current file boundaries are:
 - `systemd.go`: systemd service, host policy preparation, and SELinux
   handling.
 - `runtime.go`: root-owned runtime file checks, safe writes, shell quoting,
-  and the `fatalOperation()` fatal-error helper. `simulationMode` (default
-  `false`, settable only from `simulate_main.go`) relaxes the root-ownership
-  check for offline simulation runs only; the default (non-simulate) build
-  never sets it, so production behaviour is unchanged.
+  and the `fatalOperation()` fatal-error helper.
 
 Every file is compiled into the same `package main`; the split only groups
 related declarations for readability, so cross-file calls behave exactly as
-if everything were still in one file (aside from `cli_main.go` and
-`simulate_main.go`, which are mutually exclusive build-tag-gated entry
-points and are never compiled together).
+if everything were still in one file. See [`call-graph.md`](call-graph.md)
+for the complete, generated function-level caller/callee index and flow
+diagrams.
 
 ## Startup Flow
 
@@ -98,10 +90,13 @@ KEEP set; after the retry limit, an empty set is reported as a startup failure.
 It then samples volatile bytes when needed and compares:
 
 - PCI device topology.
-- The six required PCIe `Dev/Lnk` capability fields (`DevCap`, `DevCtl`,
-  `DevSta`, `LnkCap`, `LnkCtl`, `LnkSta`) from per-device `lspci -vv` output;
-  optional `DevCap2`, `DevCtl2`, `LnkCap2`, `LnkCtl2`, and `LnkSta2` are compared
-  when present.
+- The 11 known PCIe `Dev/Lnk` capability fields (`DevCap`, `DevCtl`, `DevSta`,
+  `LnkCap`, `LnkCtl`, `LnkSta`, and the optional `*2`/Gen4+ variants
+  `DevCap2`, `DevCtl2`, `LnkCap2`, `LnkCtl2`, `LnkSta2`) from per-device
+  `lspci -vv` output. Whichever of these a specific device's output actually
+  contains is compared (a union of both snapshots); none of them is required
+  to be present, since which fields lspci prints depends entirely on what
+  capabilities that specific device advertises.
 - PCI configuration-space snapshots with ignored volatile offsets.
 
 The cycle writes a completion banner before the interruptible reboot delay. A
@@ -142,14 +137,32 @@ fact that the current cycle still differs from it. A later `absent -> present`
 transition is a separate event. A BDF change is recorded as the old BDF
 removed and the new BDF added, even if their vendor/device IDs match.
 
-The six required `lspci` fields are `DevCap`, `DevCtl`, `DevSta`, `LnkCap`,
-`LnkCtl`, and `LnkSta`; they must be present and comparable. The optional `*2`
-fields are compared when present and may be omitted when absent.
+The 11 known `lspci` Dev/Lnk fields are `DevCap`, `DevCtl`, `DevSta`, `LnkCap`,
+`LnkCtl`, `LnkSta`, and the optional `*2`/Gen4+ variants `DevCap2`, `DevCtl2`,
+`LnkCap2`, `LnkCtl2`, `LnkSta2`. None of them is required to be present on any
+given device; whichever fields a device's `lspci -vv` output actually contains
+are compared (a union of both snapshots), and a field absent from BOTH
+snapshots is simply skipped.
 
-When a device cannot be read during a cycle, LPOT records an incomplete
-observation and retries for a bounded period. Without `-p`, the cycle sequence
-continues to the next reboot cycle after recording the failure. With `-p`, the
-current cycle is recorded and future reboots are stopped.
+When a device cannot be read during a cycle, LPOT distinguishes two cases
+rather than treating them the same:
+
+- **UNAVAILABLE**: the device is still enumerated (present in sysfs / this
+  cycle's PCI device list, or still selected by this cycle's link
+  classification) but its lspci snapshot, raw config-space sample, or
+  classification read failed after a bounded number of retries. This is
+  NOTICE severity, tracked in `unavailableState` (`device_state.go`) with a
+  first-seen cycle/time so later log lines can report how long it has been
+  unavailable.
+- **REMOVED**: the device has genuinely left sysfs entirely (checked directly
+  via `pciDeviceEnumeratedInSysfs`, an `os.Stat` on its sysfs directory — not
+  by this cycle's link classification result, which can exclude a
+  still-present device for one bad cycle without it actually being gone).
+  This is FAIL severity.
+
+Without `-p`, the cycle sequence continues to the next reboot cycle after
+recording either kind of event. With `-p`, the current cycle is recorded and
+future reboots are stopped after either a FAIL or a NOTICE event.
 
 ## Persistence Across Reboots
 
