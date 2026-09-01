@@ -472,6 +472,7 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 		}
 		defer lpotscanFile.Close()
 
+		var fieldChanges []DeviceFieldChange
 		for _, bdf := range bdfs {
 			if ignoreSet[normalizeBDF(bdf)] {
 				continue
@@ -484,6 +485,7 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 			}
 
 			result := compareDeviceFiles(initFile, currentFile, ignoreSet, lpotscanFile)
+			fieldChanges = append(fieldChanges, result.Changes...)
 			if result.HasDifferences {
 				overallSuccess = false
 				// Rebase this device's Dev/Lnk baseline to the value just
@@ -507,10 +509,14 @@ func processPCIDevices(bdfs []string, logFp *os.File, stopService bool) error {
 			if result.Error != nil {
 				logWarnFp(logFp, "comparison error for %s: %v", bdf, result.Error)
 				if stopService {
+					recordDeviceFieldChanges(fieldChanges)
 					return result.Error
 				}
 			}
 		}
+
+		// Persist all Dev/Lnk statistics for this cycle in one read-modify-write.
+		recordDeviceFieldChanges(fieldChanges)
 
 		timeStr := getCurrentTimestamp()
 		logFile, err := openSecureAppend(REBOOT_LOG, 0644)
@@ -718,9 +724,9 @@ func loadTestStats() persistedTestStats {
 	return stats
 }
 
-// saveTestStats persists stats to TEST_STATS_FILE. Failures are logged but
-// not fatal: losing this file only degrades the final summary's "Most
-// affected device" / "Most changed field" / raw-config STABLE-vs-CHANGED
+// saveTestStats persists stats to TEST_STATS_FILE atomically. Failures are
+// logged but not fatal: losing this file only degrades the final summary's
+// "Most affected device" / "Most changed field" / raw-config STABLE-vs-CHANGED
 // lines, it never affects any cycle's PASS/FAIL verdict.
 func saveTestStats(stats persistedTestStats) {
 	data, err := json.Marshal(stats)
@@ -728,7 +734,7 @@ func saveTestStats(stats persistedTestStats) {
 		logWarn("could not encode test stats: %v", err)
 		return
 	}
-	if err := writeFileNoFollow(TEST_STATS_FILE, data, 0644); err != nil {
+	if err := writeFileAtomicNoFollow(TEST_STATS_FILE, data, 0644); err != nil {
 		logWarn("could not persist test stats to %s: %v", TEST_STATS_FILE, err)
 	}
 }
@@ -744,15 +750,19 @@ func recordConfigSpaceChangeCycle() {
 	saveTestStats(stats)
 }
 
-// recordDeviceFieldChange increments the persisted per-device and per-field
-// change counters for one lspci Dev/Lnk capability change. It is the
-// disk-backed equivalent of the old in-memory `deviceChangeStats[bdf]++`
-// (lspci_compare.go) plus the field tally generateFinalSummary() used to
-// recompute from a single cycle's lpotscan.log (which is truncated before
-// every reboot and therefore cannot hold whole-run history on its own).
-func recordDeviceFieldChange(bdf, field string) {
+// recordDeviceFieldChanges adds all lspci Dev/Lnk changes from one cycle to
+// the persisted counters in a single read-modify-write. The file is needed
+// because each reboot cycle runs in a brand-new process, but rewriting it for
+// every field would turn a cycle with N changes into N full-file rewrites.
+func recordDeviceFieldChanges(changes []DeviceFieldChange) {
+	if len(changes) == 0 {
+		return
+	}
+
 	stats := loadTestStats()
-	stats.DeviceChanges[normalizeBDF(bdf)]++
-	stats.FieldChanges[field]++
+	for _, change := range changes {
+		stats.DeviceChanges[normalizeBDF(change.BDF)]++
+		stats.FieldChanges[change.Field]++
+	}
 	saveTestStats(stats)
 }

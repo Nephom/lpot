@@ -145,7 +145,7 @@ func generateFinalSummary() {
 	}
 
 	// stats.DeviceChanges only counts lspci Dev/Lnk capability changes
-	// (recordDeviceFieldChange(), called from compareDevices() in
+	// (recordDeviceFieldChanges(), fed by compareDevices() in
 	// lspci_compare.go). It intentionally excludes raw config-space byte
 	// changes, which the dashboard's per-device "Config Changed" column and
 	// classification.devices[].config_change_count (parseConfigResultChanges,

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 )
@@ -74,6 +75,62 @@ func writeFileNoFollow(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	return f.Close()
+}
+
+// writeFileAtomicNoFollow publishes a complete file without exposing a
+// truncated or partially-written destination. The temporary file is created
+// in the destination directory so Rename remains atomic on the same
+// filesystem.
+func writeFileAtomicNoFollow(path string, data []byte, perm os.FileMode) error {
+	if err := verifyRootRegularFileIfPresent(path); err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	tmp, err := os.CreateTemp(dir, "."+base+".tmp-")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	keep = true
+
+	// Persist the directory entry as well, so the rename survives a sudden
+	// reboot as reliably as the file contents.
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := dirFile.Sync(); err != nil {
+		_ = dirFile.Close()
+		return err
+	}
+	return dirFile.Close()
 }
 
 func shellQuote(value string) string {

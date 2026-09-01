@@ -16,10 +16,17 @@ type Device struct {
 	}
 }
 
+// DeviceFieldChange identifies one changed Dev/Lnk field.
+type DeviceFieldChange struct {
+	BDF   string
+	Field string
+}
+
 // ComparisonResult for device comparison
 type ComparisonResult struct {
 	HasDifferences bool
 	Error          error
+	Changes        []DeviceFieldChange
 }
 
 // compareDeviceFiles compares two device files using lspci logic
@@ -218,15 +225,13 @@ func compareDevices(device1, device2 Device, logFile *os.File) ComparisonResult 
 		logEntry := fmt.Sprintf("%s %s%s | %s changed | before: %s | after: %s\n",
 			getCurrentTimestamp(), cycleTag(), device1.DeviceID, key, value1, value2)
 
-		// Track statistics. Persisted immediately (not an in-memory
-		// map increment) because generateFinalSummary()'s "Most affected
-		// device" / "Most changed field" lines must reflect the entire
-		// multi-cycle run, and each reboot cycle runs in a brand-new
-		// process. Keyed by normalizeBDF() so multi-domain hosts (where the
-		// same device might be seen in long or short form across different
-		// call paths) do not fragment this device's count across two
-		// different map keys.
-		recordDeviceFieldChange(device1.DeviceID, key)
+		// Return the change to the cycle-level collector. Statistics are
+		// persisted once after all devices have been compared, rather than
+		// rewriting test_stats.json once for every changed field.
+		result.Changes = append(result.Changes, DeviceFieldChange{
+			BDF:   device1.DeviceID,
+			Field: key,
+		})
 
 		fmt.Fprint(logFile, logEntry)
 		fmt.Print(logEntry)
