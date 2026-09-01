@@ -184,4 +184,7 @@ Its top-level status is `RUNNING` for a checkpoint, `PASS` when the completed
 test has no noteworthy changes, `NOTICE` when PCI topology and lspci
 capability are stable but a genuinely volatile (non-reboot-fixed) raw
 config-space change requires review, `FAIL` when a noteworthy change is
-found, and `INCOMPLETE` when the test is interrupted or reboot fails.
+found, and `INCOMPLETE` when the test is interrupted or reboot fails. Every interrupted,
+stop-requested, or failed-reboot exit also appends a final `Test Session Summary`
+to `reboot.log`; the summary is marked `INCOMPLETE` and contains all statistics
+available from the cycles recorded before the interruption.

@@ -38,8 +38,10 @@ func pciOffsetRegisterType(offsetHex string) string {
 	}
 }
 
-// generateFinalSummary generates the final test summary and appends to reboot.log
-func generateFinalSummary() {
+// generateFinalSummary generates the final test summary and appends to reboot.log.
+// A non-empty statusOverride is preserved in result.json and the summary when
+// the run ended before its planned completion (for example, INCOMPLETE).
+func generateFinalSummary(statusOverride string) {
 	logFile, err := openSecureAppend(REBOOT_LOG, 0644)
 	if err != nil {
 		fmt.Printf("Failed to open log file for summary: %v\n", err)
@@ -176,33 +178,36 @@ func generateFinalSummary() {
 	// volatile (irregular) register was seen.
 	noteworthyConfigChanges := generateConfigSpaceSummary(logFile, actualTotalCycles)
 
-	// Final result. classifyFinalVerdict is the same classifier
+	// Final result. A requested status override takes precedence over the
+	// normal PASS/NOTICE/FAIL classifier because an interrupted run must not be
+	// reported as completed merely because its recorded cycles were stable.
+	// Without an override, classifyFinalVerdict is the same classifier
 	// buildResultReport() (result_helpers.go) uses for result.json's top-level
 	// status/message, so reboot.log's "Test Result:" line and result.json's
-	// status can never disagree about whether a run was a full pass, a
-	// pass-with-notice, or a fail. A test is "perfect" only when there were no
-	// topology / lspci changes AND no noteworthy (irregular) config-space
-	// changes. Benign reboot-fixed register noise — vendor registers reset to
-	// the same value on every boot — does NOT downgrade the verdict, since it
-	// indicates stable, repeatable firmware behaviour rather than instability.
-	switch classifyFinalVerdict(actualCyclesWithChanges, noteworthyConfigChanges) {
-	case verdictPerfect:
-		fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED SUCCESSFULLY - PERFECT STABILITY\n", ts)
-		if stats.CyclesWithConfigChanges > 0 {
-			fmt.Fprintf(logFile, "%s No noteworthy config-space changes across %d reboot cycles.\n", ts, actualTotalCycles)
-			fmt.Fprintf(logFile, "%s Some hardware settings reset to the same value every reboot. This is normal and not a problem.\n", ts)
-		} else {
-			fmt.Fprintf(logFile, "%s All PCI devices stayed exactly the same across %d reboots. No issues found.\n", ts, actualTotalCycles)
+	// status remain consistent for completed runs.
+	if statusOverride == "INCOMPLETE" {
+		fmt.Fprintf(logFile, "\n%s Test Result: INCOMPLETE\n", ts)
+		fmt.Fprintf(logFile, "%s The test stopped before the planned run completed. Review the recorded cycles and changes above.\n", ts)
+	} else {
+		switch classifyFinalVerdict(actualCyclesWithChanges, noteworthyConfigChanges) {
+		case verdictPerfect:
+			fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED SUCCESSFULLY - PERFECT STABILITY\n", ts)
+			if stats.CyclesWithConfigChanges > 0 {
+				fmt.Fprintf(logFile, "%s No noteworthy config-space changes across %d reboot cycles.\n", ts, actualTotalCycles)
+				fmt.Fprintf(logFile, "%s Some hardware settings reset to the same value every reboot. This is normal and not a problem.\n", ts)
+			} else {
+				fmt.Fprintf(logFile, "%s All PCI devices stayed exactly the same across %d reboots. No issues found.\n", ts, actualTotalCycles)
+			}
+		case verdictNotice:
+			fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED WITH NOTICE\n", ts)
+			fmt.Fprintf(logFile, "%s The devices themselves did not change across %d reboots, but some settings changed in an unusual way. Please check the 'Noteworthy changes' section above.\n", ts, actualTotalCycles)
+		default:
+			fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED - REVIEW NOTEWORTHY CHANGES\n", ts)
+			fmt.Fprintf(logFile, "%s Some devices changed or disappeared during the %d reboots. See 'Affected Cycles' above for details.\n", ts, actualTotalCycles)
 		}
-	case verdictNotice:
-		fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED WITH NOTICE\n", ts)
-		fmt.Fprintf(logFile, "%s The devices themselves did not change across %d reboots, but some settings changed in an unusual way. Please check the 'Noteworthy changes' section above.\n", ts, actualTotalCycles)
-	default:
-		fmt.Fprintf(logFile, "\n%s Test Result: COMPLETED - REVIEW NOTEWORTHY CHANGES\n", ts)
-		fmt.Fprintf(logFile, "%s Some devices changed or disappeared during the %d reboots. See 'Affected Cycles' above for details.\n", ts, actualTotalCycles)
 	}
 	fmt.Fprintf(logFile, "%s ==========================================\n", ts)
-	if err := writeResultReport(false); err != nil {
+	if err := writeResultReportWithStatus(false, statusOverride); err != nil {
 		fatalOperation("Finalization failed: cannot publish /lpot/result.json", err,
 			"check /lpot permissions and available disk space before reviewing the report")
 	}

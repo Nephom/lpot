@@ -112,7 +112,7 @@ func main() {
 		}
 		if reached {
 			fmt.Printf("-tm reboot limit reached; no further reboot will start\n")
-			generateFinalSummary()
+			generateFinalSummary("")
 			disableFixedCycleService()
 			return
 		}
@@ -218,7 +218,7 @@ func main() {
 				}
 
 				// Generate final summary before exit
-				generateFinalSummary()
+				generateFinalSummary("")
 
 				os.Exit(1)
 			}
@@ -283,9 +283,8 @@ func main() {
 
 	if stopFlag.Load() {
 		fmt.Fprintf(logFp, "%s Received stop signal, exiting gracefully.\n", getCurrentTimestamp())
-		if err := writeResultReportWithStatus(false, "INCOMPLETE"); err != nil {
-			warnIncompleteReport(err)
-		}
+		logFp.Sync()
+		finalizeIncompleteRun()
 		return
 	}
 
@@ -452,10 +451,7 @@ func main() {
 				fatalOperation("Cycle failed: unable to stop test service after -p comparison failure", err,
 					"manually run systemctl stop and systemctl disable lpot.service")
 			}
-			if err := writeResultReportWithStatus(false, "INCOMPLETE"); err != nil {
-				warnIncompleteReport(err)
-			}
-			generateFinalSummary()
+			finalizeIncompleteRun()
 			return
 		}
 	}
@@ -485,7 +481,7 @@ func main() {
 		} else if reached {
 			fmt.Fprintf(logFp, "%s -tm reboot limit reached; reboot not started.\n", getCurrentTimestamp())
 			logFp.Sync()
-			generateFinalSummary()
+			generateFinalSummary("")
 			disableFixedCycleService()
 			return
 		}
@@ -497,9 +493,7 @@ func main() {
 	fmt.Fprintf(logFp, "%s Wait %d seconds for reboot SUT.\n", timestampStr, *waitSeconds)
 	logFp.Sync()
 	if !sleepInterruptible(rootCtx, time.Duration(*waitSeconds)*time.Second) {
-		if err := writeResultReportWithStatus(false, "INCOMPLETE"); err != nil {
-			warnIncompleteReport(err)
-		}
+		finalizeIncompleteRun()
 		return
 	}
 
@@ -510,9 +504,7 @@ func main() {
 	if stopFlag.Load() {
 		fmt.Fprintf(logFp, "%s Stop requested before reboot; skipping reboot.\n", getCurrentTimestamp())
 		logFp.Sync()
-		if err := writeResultReportWithStatus(false, "INCOMPLETE"); err != nil {
-			warnIncompleteReport(err)
-		}
+		finalizeIncompleteRun()
 		return
 	}
 
@@ -532,11 +524,15 @@ func main() {
 				fmt.Fprintf(logFp, "%s reboot command failed: %v\n", getCurrentTimestamp(), err)
 				logFp.Close()
 			}
-			if reportErr := writeResultReportWithStatus(false, "INCOMPLETE"); reportErr != nil {
-				warnIncompleteReport(reportErr)
-			}
+			finalizeIncompleteRun()
 		}
 	}
+}
+
+// finalizeIncompleteRun writes both the human-readable final summary and the
+// machine-readable INCOMPLETE result for every interrupted run path.
+func finalizeIncompleteRun() {
+	generateFinalSummary("INCOMPLETE")
 }
 
 // pciDiscoveryResult contains the latest complete discovery attempt. The

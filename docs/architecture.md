@@ -84,7 +84,10 @@ points and are never compiled together).
 8. The cycle state is recorded under `/lpot`.
 9. After each completed cycle, result aggregation writes an atomic
     `/lpot/result.json` checkpoint before the reboot wait starts. On expiration,
-    the same report is finalized with `PASS`, `FAIL`, or `INCOMPLETE`.
+    the same report is finalized with `PASS` or `FAIL`. If the run is
+    interrupted, explicitly stopped, or reboot fails, the finalization pipeline
+    still writes the complete `reboot.log` summary and atomically publishes
+    `result.json` with `INCOMPLETE`.
 
 ## Reboot Cycle
 
