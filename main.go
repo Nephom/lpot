@@ -78,6 +78,11 @@ const (
 	systemctlTimeout     = 15 * time.Second
 	configScanLogTimeout = 2 * time.Minute
 	rebootCmdTimeout     = 30 * time.Second
+	// PCI discovery is retried only during normal cycle startup. The bounded
+	// retry handles asynchronous enumeration without allowing boot to hang
+	// indefinitely when no link-capable device exists.
+	pciDiscoveryRetryAttempts = 5
+	pciDiscoveryRetryInterval = 2 * time.Second
 
 	// logTimeFormat is the single timestamp layout used across every log file
 	// (reboot.log, pci-config-changes.log, lpotscan echo). A unified format

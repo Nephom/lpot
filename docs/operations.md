@@ -27,6 +27,9 @@ records and two reboots.
 - Go 1.19 or newer for building.
 - `lspci` from `pciutils`.
 - `systemd` for persistence across reboots.
+- PCI discovery is performed after the `-d` driver-ready delay. If no
+  link-capable endpoint is visible, LPOT re-reads sysfs and reclassifies the
+  current device set a bounded number of times before reporting a failure.
 - Permission to disable firewall and mandatory access-control services on the
   dedicated test host.
 - A test host where repeated reboots are expected and safe.
@@ -74,9 +77,12 @@ cd /root
 
 The program copies the invoked binary to `/lpot/lpot` and creates
 `/lpot/reboot.sh`. The systemd service runs that fixed path after reboot, so
-the original current directory is irrelevant. Do not remove `/lpot/lpot`
-until the test is stopped. Run the updated binary with `-t` again when
-installing a new version.
+the original current directory is irrelevant. After boot, LPOT waits for the
+configured `-d` driver/device delay before taking its PCI snapshot. If PCI
+enumeration is still in progress and no link-capable endpoint is found, LPOT
+performs bounded fresh sysfs discovery retries rather than reusing the initial
+device list. Do not remove `/lpot/lpot` until the test is stopped. Run the
+updated binary with `-t` again when installing a new version.
 
 | Option | Description | Default |
 | --- | --- | --- |

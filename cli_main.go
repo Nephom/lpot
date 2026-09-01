@@ -269,14 +269,9 @@ func main() {
 	timestampStr := getCurrentTimestamp()
 	logInitialInfo(logFp, rebootCount)
 
-	// Get PCI device list
-	bdfs, err := fetchPCIBDFs()
-	if err != nil {
-		fatalOperation("Cycle failed: cannot enumerate PCI devices", err,
-			"verify that /sys/bus/pci/devices is mounted and readable on Linux")
-	}
-
-	// Wait for driver ready
+	// Wait for driver ready before taking the PCI snapshot. PCI enumeration can
+	// complete asynchronously after the service starts, so a snapshot taken
+	// before this wait could permanently miss devices for this cycle.
 	fmt.Fprintf(logFp, "%s Wait %d seconds for devices driver ready.\n", timestampStr, *standbyTime)
 	logFp.Sync()
 	fmt.Printf("%s Wait %d seconds for devices driver ready.\n", timestampStr, *standbyTime)
@@ -295,27 +290,45 @@ func main() {
 	}
 
 	// Classify only after the driver-ready wait so raw and lspci link evidence
-	// reflects the settled post-boot device state.
+	// reflects the settled post-boot device state. If PCI enumeration is still
+	// in progress, rediscover the sysfs entries rather than retrying a stale
+	// BDF slice.
 	overrides, err := loadPCIeFilterOverrides(PCIE_FILTER_FILE)
 	if err != nil {
 		fatalOperation("Startup failed: cannot read the optional PCI link filter", err,
 			"fix the permissions on /lpot/pcie_filter.txt or remove it to use automatic classification")
 	}
-	totalDiscoveredBDFs := len(bdfs)
-	decisions := classifyDevices(bdfs, overrides)
-	kept, skipped := filterClassifiedEndpoints(bdfs, decisions)
+	discovery, err := discoverPCIEndpointsWithRetry(
+		fetchPCIBDFs,
+		func(allBDFs []string) ([]string, []deviceClassification) {
+			decisions := classifyDevices(allBDFs, overrides)
+			kept, _ := filterClassifiedEndpoints(allBDFs, decisions)
+			return kept, decisions
+		},
+		pciDiscoveryRetryAttempts,
+		pciDiscoveryRetryInterval,
+		func() bool { return stopFlag.Load() },
+	)
+	if err != nil {
+		fatalOperation("Cycle failed: cannot enumerate PCI devices", err,
+			"verify that /sys/bus/pci/devices is mounted and readable on Linux")
+	}
+	if discovery.attempts > 1 {
+		fmt.Fprintf(logFp, "%s PCI discovery succeeded after %d attempts.\n", getCurrentTimestamp(), discovery.attempts)
+	}
+	bdfs := discovery.kept
+	decisions := discovery.decisions
+	totalDiscoveredBDFs := discovery.totalDiscovered
+	skipped := discovery.skipped
 	classifiedDevicesGlobal = decisions
-	endpointFilterSet = make(map[string]bool, len(kept))
-	for _, bdf := range kept {
+	endpointFilterSet = make(map[string]bool, len(bdfs))
+	for _, bdf := range bdfs {
 		endpointFilterSet[normalizeBDF(bdf)] = true
 	}
 	// Every PCI-touching path from this point on (raw config-space scanning,
 	// lspci Dev/Lnk comparison, topology tracking) must operate on only the
-	// KEEP set. Reassigning bdfs here (rather than leaving it as the full
-	// sysfs listing) is what makes endpointFilterSet and pcie_filter.txt's
-	// manual "-" excludes actually take effect for every later call that
-	// receives bdfs as an argument.
-	bdfs = kept
+	// KEEP set. The discovery result is already filtered so manual "-" excludes
+	// take effect for every later call that receives bdfs as an argument.
 	if err := persistClassificationReport(decisions); err != nil {
 		fatalOperation("Startup failed: cannot write the PCI link-capability report", err,
 			"check /lpot permissions and available disk space")
@@ -379,7 +392,7 @@ func main() {
 	}
 
 	if len(bdfs) == 0 {
-		fatalOperation("Cycle failed: no PCIe link-capable devices were found", errors.New("empty link-capable set"),
+		fatalOperation("Cycle failed: no PCIe link-capable devices were found", errors.New("empty link-capable set after bounded discovery retries"),
 			"run -classify to review Link Capabilities and check /lpot/pcie_filter.txt")
 	}
 
@@ -524,4 +537,75 @@ func main() {
 			}
 		}
 	}
+}
+
+// pciDiscoveryResult contains the latest complete discovery attempt. The
+// caller must use the returned KEEP list and classifications together: using
+// an older BDF list after a retry would reintroduce the startup race.
+type pciDiscoveryResult struct {
+	kept            []string
+	decisions       []deviceClassification
+	totalDiscovered int
+	skipped         []deviceClassification
+	attempts        int
+}
+
+// discoverPCIEndpointsWithRetry waits for PCI enumeration to become visible by
+// re-reading sysfs on every attempt. It retries only a bounded number of times;
+// an empty KEEP set is a valid final result and is not converted into fake
+// success. fetch and classify are injected so the retry state machine can be
+// tested without requiring Linux PCI hardware.
+func discoverPCIEndpointsWithRetry(
+	fetch func() ([]string, error),
+	classify func([]string) ([]string, []deviceClassification),
+	maxAttempts int,
+	interval time.Duration,
+	shouldStop func() bool,
+) (pciDiscoveryResult, error) {
+	if maxAttempts < 1 {
+		return pciDiscoveryResult{}, errors.New("PCI discovery retry limit must be at least one")
+	}
+	if shouldStop == nil {
+		shouldStop = func() bool { return false }
+	}
+
+	var result pciDiscoveryResult
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if shouldStop() {
+			return pciDiscoveryResult{}, errors.New("PCI discovery cancelled")
+		}
+
+		allBDFs, err := fetch()
+		if err != nil {
+			lastErr = err
+		} else {
+			kept, decisions := classify(allBDFs)
+			_, skipped := filterClassifiedEndpoints(allBDFs, decisions)
+			result = pciDiscoveryResult{
+				kept:            kept,
+				decisions:       decisions,
+				totalDiscovered: len(allBDFs),
+				skipped:         skipped,
+				attempts:        attempt,
+			}
+			if len(kept) > 0 || attempt == maxAttempts {
+				return result, nil
+			}
+		}
+
+		if attempt < maxAttempts {
+			if interval > 0 {
+				time.Sleep(interval)
+			}
+			if shouldStop() {
+				return pciDiscoveryResult{}, errors.New("PCI discovery cancelled")
+			}
+		}
+	}
+
+	if lastErr != nil {
+		return pciDiscoveryResult{}, lastErr
+	}
+	return result, nil
 }

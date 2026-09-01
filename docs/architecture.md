@@ -88,8 +88,13 @@ points and are never compiled together).
 
 ## Reboot Cycle
 
-Each cycle fetches PCI BDFs, applies endpoint classification and filter
-overrides, waits for drivers, samples volatile bytes when needed, and compares:
+Each cycle waits for the configured driver-ready delay, then fetches PCI BDFs
+and applies endpoint classification and filter overrides. Because PCI
+enumeration can remain asynchronous after service startup, an empty
+link-capable result causes a bounded sequence of fresh sysfs discovery and
+classification attempts. The cycle proceeds only with the latest successful
+KEEP set; after the retry limit, an empty set is reported as a startup failure.
+It then samples volatile bytes when needed and compares:
 
 - PCI device topology.
 - The eleven selected PCIe `Dev/Lnk` capability fields (`DevCap`, `DevCtl`,
