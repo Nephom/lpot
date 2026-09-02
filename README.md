@@ -154,6 +154,8 @@ flowchart TD
     X --> A
 ```
 
+The Detail flowchart: [`docs/call-graph.md`](docs/call-graph.md)
+
 ## Host Policy Preparation
 
 On normal runs the program performs distribution-aware host preparation.
