@@ -58,18 +58,15 @@ The command above can be run from macOS or another development host. The
 resulting executable depends on Linux sysfs, PCI utilities, systemd, and
 root-only operations, so it must be deployed and run on Linux.
 
-No unit-test suite is maintained for this system-level executable. The required
-local verification is a successful Linux-target compilation. Optional static
-analysis can be run in a compatible Go environment with:
+The required local verification includes the generated offline tests and a
+successful Linux-target compilation. Optional static analysis can be run in a
+compatible Go environment with:
 
 ```bash
 go vet ./...
 BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 go build -trimpath -ldflags="-s -w -X main.buildTime=${BUILD_TIME}" -o lpot .
 ```
-
-Install the resulting binary on a Linux test host as appropriate for your
-environment. The default `.gitignore` excludes generated reports and artifacts.
 
 ## Usage
 
