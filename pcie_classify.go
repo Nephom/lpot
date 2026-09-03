@@ -214,7 +214,7 @@ func pciExpressLinkStatusWidth(cfg []byte) byte {
 
 func lspciSpeedCode(value string) (byte, bool) {
 	value = strings.TrimSuffix(strings.TrimSpace(value), ",")
-	value = strings.TrimSuffix(value, "GT/s")
+	value = strings.TrimSpace(strings.TrimSuffix(value, "GT/s"))
 	speed, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		return 0, false

@@ -2140,9 +2140,10 @@ func logCycleEnd(logFp *os.File, rebootCount int, status string)
 ```
 
 logCycleEnd emits the matching cycle-end banner. status is one of "clean",
-"clean (config noise)", or "changes detected" so `grep '===== Cycle.*END'`
-gives a per-cycle verdict without having to parse the intervening event
-stream. Only "changes detected" marks a genuinely concerning cycle.
+"clean (config noise)", "changes detected (notice)", or "changes detected"
+so `grep '===== Cycle.*END'` gives a per-cycle verdict without having to parse
+the intervening event stream. FAIL and NOTICE are both concerning for `-p`,
+while "clean (config noise)" remains informational only.
 
 **Called by:** `main`
 
